@@ -1,0 +1,69 @@
+# Anytype VTODO exporter — example configuration.
+# The API key is NOT stored here; it is read from the ANYTYPE_API_KEY
+# environment variable.
+
+[anytype]
+url = "http://127.0.0.1:31009"
+# A 59-character id starting with "bafyrei", optionally with a ".<hash>" suffix.
+space_id = "bafyrei...REPLACE..."
+# Type whose objects become VTODOs. Override if your space uses a custom
+# or localized task type.
+type_key = "task"
+# A refresh that would exceed this fails instead of running unbounded.
+max_objects = 5000
+
+[properties]
+# Each selector is "key:<stable-key>" or "id:<opaque-id>".
+# If a selector matches nothing, the refresh fails and every property the
+# type actually offers is logged, which is how you discover the right values.
+scheduled = "key:scheduled"
+deadline  = "key:due_date"
+done      = "key:done"
+# Optional. A select/multi-select property whose option *names* are durations
+# ("15m", "2h", "1d"): each chosen option becomes one reminder for that task.
+# Anytype snake_cases option keys, so the name is what gets parsed. Tasks that
+# leave it empty use reminders.lead_time below.
+# reminder = "id:<opaque-id>"
+
+[calendar]
+timezone = "Europe/Saratov"
+name = "Anytype Tasks"
+# Timezone in which a value is tested for midnight to classify it as all-day.
+# Defaults to `timezone`. Set to "UTC" if Anytype turns out to persist
+# date-only values as midnight UTC.
+date_only_timezone = "Europe/Saratov"
+
+[server]
+listen = "127.0.0.1:8080"
+# Path the feed is served at. The feed is unauthenticated by design, so on any
+# bind reachable from outside this machine an unguessable path is what protects
+# it — the same approach Google, Apple and Fastmail use for calendar feeds.
+# Generate one with:  openssl rand -hex 16
+# feed_path = "/f/REPLACE-WITH-32-RANDOM-HEX/todos.ics"
+request_timeout = "10s"
+# Requests inside this window are served from cache without contacting Anytype.
+min_refresh_interval = "30s"
+# Origins allowed to read the feed from a browser. Required for Calino.
+# An empty list emits no CORS headers; "*" is refused.
+allowed_origins = ["https://calino.io"]
+
+[reminders]
+# A VALARM on each open task. Only data: a client must be running to fire it.
+enabled = true
+# How long before a timed deadline the alarm fires.
+lead_time = "30m"
+# All-day tasks start at midnight, so they alarm at this local time instead.
+all_day_time = "09:00"
+
+# Optional server-side Web Push delivery. On iOS the site must first be added
+# to the Home Screen and subscribed from there.
+# [push]
+# enabled = true
+# Keep this key stable: replacing it invalidates existing subscriptions.
+# private_key_file = "~/.config/vapid_private.pem"
+# Contains subscription encryption keys and handled reminder identities.
+# Keep it private and back it up together with the VAPID key.
+# state_file = "~/.local/share/anytype-task-exporter/state.sqlite3"
+# poll_interval = "30s"
+# Reminders missed during shorter downtime are sent late; older ones are skipped.
+# late_window = "1h"
