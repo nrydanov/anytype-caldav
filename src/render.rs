@@ -34,20 +34,13 @@ enum Schedule {
         start: DatePerhapsTime,
         due: DatePerhapsTime,
     },
-    /// Work planned after its deadline: the plan is written and the deadline is
-    /// described in words, because the pair cannot be written literally.
-    Overdue {
-        start: Option<DatePerhapsTime>,
+    /// The deadline cannot be written beside the plan — either the work is
+    /// planned after it, or it is a whole day the plan already sits inside — so
+    /// the plan is written and the deadline is described in words.
+    Described {
         due: DatePerhapsTime,
         deadline: String,
     },
-}
-
-/// A planned date split into the day a client files it under and the hour it is
-/// drawn at.
-struct Planned {
-    start: Option<DatePerhapsTime>,
-    due: DatePerhapsTime,
 }
 
 pub struct VTodoRenderer {
@@ -121,14 +114,7 @@ impl VTodoRenderer {
             Schedule::Both { start, due } => {
                 todo.starts(start).due(due);
             }
-            Schedule::Overdue {
-                start,
-                due,
-                deadline,
-            } => {
-                if let Some(start) = start {
-                    todo.starts(start);
-                }
+            Schedule::Described { due, deadline } => {
                 todo.due(due).description(&deadline);
             }
         }
@@ -188,20 +174,12 @@ impl VTodoRenderer {
     ) -> Schedule {
         let (start, due) = match (scheduled, deadline) {
             (None, None) => return Schedule::Neither,
-            // A planned date with no deadline still has to reach `DUE`: Calino
-            // buckets tasks into days by that property alone, so a `DTSTART`-only
-            // task is parsed, kept, and then never drawn. `DTSTART` still earns
-            // its place — the day comes from `DUE`, the time of day from it.
-            (Some(start), None) => {
-                let planned = self.planned(start);
-                return match planned.start {
-                    Some(start) => Schedule::Both {
-                        start,
-                        due: planned.due,
-                    },
-                    None => Schedule::Due(planned.due),
-                };
-            }
+            // A planned date with no deadline is written as `DUE` alone. Calino
+            // buckets tasks into days by that property and by nothing else, so a
+            // `DTSTART`-only task is parsed, kept, and never drawn — while its
+            // parser reads `start` back off `DUE` when `DTSTART` is absent
+            // (`start = DTSTART || DUE`), so the hour survives the omission.
+            (Some(start), None) => return Schedule::Due(self.to_calendar_date(start)),
             (None, Some(due)) => return Schedule::Due(self.to_calendar_date(due)),
             (Some(start), Some(due)) => (start, due),
         };
@@ -213,10 +191,8 @@ impl VTodoRenderer {
         if self.begins(start) >= self.expires(due) {
             // The plan still has to supply a day, or a client that files tasks
             // by `DUE` drops it exactly as it dropped the invalid pair.
-            let planned = self.planned(start);
-            return Schedule::Overdue {
-                start: planned.start,
-                due: planned.due,
+            return Schedule::Described {
+                due: self.to_calendar_date(start),
                 deadline: self.describe(due),
             };
         }
@@ -232,6 +208,20 @@ impl VTodoRenderer {
                 start: self.to_calendar_date(start),
                 due: self.to_calendar_date(due),
             },
+            // A whole-day deadline on the day the work is planned says nothing
+            // the planned instant does not already say. Written literally the
+            // pair has to stretch the deadline to 23:59:59, and a client that
+            // files by `DUE` then shows that second while drawing the card at
+            // `DTSTART` — one task reading as two different times. Keep the
+            // instant that is actionable and describe the deadline.
+            (CalendarValue::Instant(_), CalendarValue::AllDay(day))
+                if self.begins(start).date() == day =>
+            {
+                Schedule::Described {
+                    due: self.to_calendar_date(start),
+                    deadline: self.describe(due),
+                }
+            }
             // Mixed value types with a sound order: express both as instants so
             // the deadline keeps its "by the end of that day" meaning instead of
             // collapsing onto midnight.
@@ -246,35 +236,6 @@ impl VTodoRenderer {
                 // A DST gap swallowed one of the civil times; the deadline alone
                 // is still valid and is the more important of the two.
                 _ => Schedule::Due(self.to_calendar_date(due)),
-            },
-        }
-    }
-
-    /// Expresses a planned date for a client that files tasks by `DUE`.
-    fn planned(&self, start: CalendarValue) -> Planned {
-        let CalendarValue::Instant(at) = start else {
-            // An all-day plan has no time to preserve, so `DTSTART` would only
-            // duplicate `DUE` — and an equal pair is invalid anyway.
-            return Planned {
-                start: None,
-                due: self.to_calendar_date(start),
-            };
-        };
-        let end_of_day = at
-            .with_timezone(&self.config.timezone)
-            .date_naive()
-            .and_hms_opt(23, 59, 59)
-            .expect("the last second of a day exists");
-        match self.instant(end_of_day) {
-            Some(due) if at < due => Planned {
-                start: Some(self.to_calendar_date(start)),
-                due: DatePerhapsTime::DateTime(CalendarDateTime::Utc(due)),
-            },
-            // Planned in that final second, or a DST gap ate it: the day still
-            // matters more than the hour.
-            _ => Planned {
-                start: None,
-                due: self.to_calendar_date(start),
             },
         }
     }
@@ -379,17 +340,20 @@ mod tests {
 
     /// Calino files tasks into days by `DUE` alone — a `DTSTART`-only task is
     /// parsed and then never drawn. 139 of 281 real tasks were invisible for
-    /// exactly this reason. The planned day therefore has to reach `DUE`, while
-    /// `DTSTART` keeps the time of day the task is drawn at.
+    /// exactly this reason. The plan therefore goes to `DUE`, and only there:
+    /// its parser reads `start = DTSTART || DUE`, so the hour survives, while a
+    /// second property could only disagree with the first.
     #[test]
-    fn a_planned_time_with_no_deadline_still_reaches_due() {
+    fn a_planned_time_with_no_deadline_is_written_as_due_alone() {
         let mut t = task("plan", "Записаться на обклейку электроники в гитаре");
         t.scheduled = date("2026-08-31T14:00:00+04:00");
 
         let ics = renderer().render(&[t]).unwrap();
 
-        assert!(ics.contains("DTSTART:20260831T100000Z"), "{ics}");
-        assert!(ics.contains("DUE:20260831T195959Z"), "{ics}");
+        assert!(ics.contains("DUE:20260831T100000Z"), "{ics}");
+        assert!(!ics.contains("DTSTART"), "{ics}");
+        // Nothing invents an end of day the source never gave.
+        assert!(!ics.contains("195959"), "{ics}");
     }
 
     /// An all-day plan has no hour worth keeping, and `DTSTART` equal to `DUE`
@@ -405,21 +369,25 @@ mod tests {
         assert!(!ics.contains("DTSTART"), "{ics}");
     }
 
-    /// Observed live: Anytype happily holds "planned today at noon, due today",
-    /// which is ordinary, but a date-only DUE reads as that day's *midnight* and
-    /// the pair then looks backwards. Calino refused to display five such tasks.
+    /// Observed live: Anytype happily holds "planned today at noon, due today".
+    /// A date-only DUE reads as that day's *midnight*, so the pair looks
+    /// backwards and Calino refused to display five such tasks; stretching the
+    /// deadline to 23:59:59 fixed that but made the card read 12:00 in the grid
+    /// and 23:59 when opened. The whole day adds nothing the noon does not, so
+    /// only the actionable instant is written.
     #[test]
-    fn a_date_only_deadline_runs_to_the_end_of_its_day() {
+    fn a_whole_day_deadline_around_the_plan_defers_to_it() {
         let mut t = task("ozon", "Проверить кредитку Ozon");
         t.scheduled = date("2026-08-28T12:00:00+04:00");
         t.deadline = date("2026-08-28T00:00:00+04:00");
 
         let ics = renderer().render(&[t]).unwrap();
 
-        // Both as instants, so the types match and the order is sound.
-        assert!(ics.contains("DTSTART:20260828T080000Z"), "{ics}");
-        assert!(ics.contains("DUE:20260828T195959Z"), "{ics}");
-        assert!(!ics.contains("VALUE=DATE:20260828"), "{ics}");
+        assert!(ics.contains("DUE:20260828T080000Z"), "{ics}");
+        // No second time to contradict it, and the deadline is not lost.
+        assert!(!ics.contains("DTSTART"), "{ics}");
+        assert!(ics.contains("DESCRIPTION:Дедлайн: 28.08.2026"), "{ics}");
+        assert!(!ics.contains("195959"), "{ics}");
     }
 
     /// Missing a deadline and planning the work late is a real state, and one
@@ -433,10 +401,10 @@ mod tests {
 
         let ics = renderer().render(&[t]).unwrap();
 
-        assert!(ics.contains("DTSTART:20260728T150000Z"), "{ics}");
         // The day comes from the plan, so the task is filed where it can be
         // acted on instead of vanishing.
-        assert!(ics.contains("DUE:20260728T195959Z"), "{ics}");
+        assert!(ics.contains("DUE:20260728T150000Z"), "{ics}");
+        assert!(!ics.contains("DTSTART"), "{ics}");
         assert!(ics.contains("DESCRIPTION:Дедлайн: 15.07.2026"), "{ics}");
     }
 
@@ -530,7 +498,7 @@ mod tests {
         let mut t = task("a", "One");
         t.scheduled = date("2026-08-29T14:30:00+04:00");
         let ics = renderer().render(&[t]).unwrap();
-        assert!(ics.contains("DTSTART:20260829T103000Z"), "{ics}");
+        assert!(ics.contains("DUE:20260829T103000Z"), "{ics}");
     }
 
     #[test]
