@@ -445,6 +445,9 @@ mod writes {
         if let Some(value) = &patch.deadline {
             task.deadline = value.as_deref().and_then(AnytypeDate::parse);
         }
+        if let Some(tags) = &patch.tags {
+            task.tags = tags.clone();
+        }
         // Anytype bumps last-modified on every write, which changes DTSTAMP.
         task.last_modified = Some(Utc::now());
     }
@@ -621,6 +624,37 @@ mod writes {
         assert_eq!(new_etag.as_deref(), Some(fresh_etag.as_str()));
         assert_ne!(fresh_etag, etag);
         assert!(fresh.contains("STATUS:COMPLETED"), "{fresh}");
+    }
+
+    #[tokio::test]
+    async fn tags_set_in_the_client_are_written_and_kept() {
+        let (router, store) = writable();
+        let (etag, ics) = current(&router, "bafyreiaaa").await;
+        // Calino writes one CATEGORIES property with a comma list.
+        let tagged = ics.replace("CATEGORIES:Финансы", "CATEGORIES:Финансы,Дом");
+        let (status, _) = put(
+            &router,
+            "/dav/calendars/tasks/bafyreiaaa.ics",
+            Some(("If-Match", &etag)),
+            &tagged,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let task = store.tasks.lock().unwrap()[0].clone();
+        assert_eq!(task.tags, vec!["Финансы".to_string(), "Дом".to_string()]);
+
+        // Sent back unchanged, in another order: nothing to write.
+        let (etag, ics) = current(&router, "bafyreiaaa").await;
+        let before = store.patches.lock().unwrap().len();
+        let (status, _) = put(
+            &router,
+            "/dav/calendars/tasks/bafyreiaaa.ics",
+            Some(("If-Match", &etag)),
+            &ics,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(store.patches.lock().unwrap().len(), before);
     }
 
     #[tokio::test]

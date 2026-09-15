@@ -25,6 +25,8 @@ pub struct Incoming {
     pub done: bool,
     pub start: Option<DatePerhapsTime>,
     pub due: Option<DatePerhapsTime>,
+    /// CATEGORIES values.
+    pub categories: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -45,12 +47,15 @@ pub struct Patch {
     /// RFC 3339 UTC, in the shape Anytype stores (date-only = local midnight).
     pub scheduled: Option<Option<String>>,
     pub deadline: Option<Option<String>>,
+    /// Option names for the tag property; an empty list clears the tags.
+    pub tags: Option<Vec<String>>,
 }
 
 impl Patch {
     pub fn is_empty(&self) -> bool {
         self.name.is_none()
             && self.done.is_none()
+            && self.tags.is_none()
             && self.scheduled.is_none()
             && self.deadline.is_none()
     }
@@ -82,6 +87,7 @@ pub fn parse(body: &str) -> Result<Incoming, WriteError> {
         done,
         start: todo.get_start(),
         due: todo.get_due(),
+        categories: crate::events::categories(todo),
     })
 }
 
@@ -173,6 +179,7 @@ pub fn for_update(
     if incoming.done != current.done {
         patch.done = Some(incoming.done);
     }
+    patch.tags = crate::events::tags_patch(&current.tags, &incoming.categories);
 
     let now_start = wire.start.as_ref().and_then(|(d, _)| moment(d, tz));
     let now_due = wire.due.as_ref().and_then(|(d, _)| moment(d, tz));
@@ -241,6 +248,7 @@ pub fn for_create(incoming: &Incoming, config: &CalendarConfig) -> Patch {
         done: Some(incoming.done),
         scheduled: scheduled.map(|v| to_anytype(v, date_tz)),
         deadline: deadline.map(|v| to_anytype(v, date_tz)),
+        tags: (!incoming.categories.is_empty()).then(|| incoming.categories.clone()),
     }
 }
 

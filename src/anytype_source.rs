@@ -162,6 +162,9 @@ impl TaskWriter for AnytypeTaskSource {
         for property in patch_properties(patch) {
             request = request.add_property(property);
         }
+        if let Some(tags) = self.tag_property(patch).await? {
+            request = request.add_property(tags);
+        }
         info!(object_id, ?patch, "anytype update task started");
         request.update().await.map_err(|err| {
             error!(object_id, ?patch, error = %err, error_debug = ?err, "anytype update task failed");
@@ -184,6 +187,9 @@ impl TaskWriter for AnytypeTaskSource {
             .set_text("ical_uid", uid);
         for property in patch_properties(patch) {
             request = request.add_property(property);
+        }
+        if let Some(tags) = self.tag_property(patch).await? {
+            request = request.add_property(tags);
         }
         info!(uid, ?patch, "anytype create task started");
         let object = request.create().await.map_err(|err| {
@@ -229,6 +235,33 @@ fn patch_properties(patch: &Patch) -> Vec<serde_json::Value> {
 }
 
 impl AnytypeTaskSource {
+    /// The tag property of a patch, by the key the configured tags selector
+    /// names. Tags are written only when a selector is configured.
+    async fn tag_property(&self, patch: &Patch) -> Result<Option<serde_json::Value>, SourceError> {
+        let (Some(names), Some(selector)) = (&patch.tags, &self.properties.tags) else {
+            return Ok(None);
+        };
+        let key = match selector {
+            PropertySelector::Key(key) => key.clone(),
+            PropertySelector::Id(id) => self
+                .client
+                .properties(&self.config.space_id)
+                .list()
+                .await
+                .map_err(|err| SourceError::Transport(err.to_string()))?
+                .collect_all()
+                .await
+                .map_err(|err| SourceError::Transport(err.to_string()))?
+                .into_iter()
+                .find(|property| &property.id == id)
+                .map(|property| property.key)
+                .ok_or_else(|| SourceError::Schema(format!("tags property {id} not found")))?,
+        };
+        let ids =
+            crate::events::option_ids(&self.client, &self.config.space_id, &key, names).await?;
+        Ok(Some(serde_json::json!({ "key": key, "multi_select": ids })))
+    }
+
     /// Fails loudly when a configured selector matches nothing.
     ///
     /// A selector that silently resolves to nothing produces a feed where every
