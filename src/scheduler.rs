@@ -113,7 +113,7 @@ impl PushScheduler {
     /// Reminder moments of every event with leads, as tasks planned at the
     /// event's start. A failed read skips events for this pass and keeps the
     /// task reminders going.
-    async fn event_entries(&self) -> Vec<(Task, Vec<ReminderMoment>)> {
+    async fn event_entries(&self, now: DateTime<Utc>) -> Vec<(Task, Vec<ReminderMoment>)> {
         let Some(store) = &self.events else {
             return Vec::new();
         };
@@ -133,17 +133,41 @@ impl PushScheduler {
             .iter()
             .filter_map(|event| {
                 let task = event_as_task(event);
-                if task.reminder_leads.is_empty() {
-                    return None;
-                }
-                let moments: Vec<ReminderMoment> =
-                    reminders_for(&task, &self.calendar, &self.reminders)
-                        .into_iter()
-                        .map(|moment| ReminderMoment {
-                            anchor: ReminderAnchor::Start,
-                            ..moment
-                        })
-                        .collect();
+                let longest = task.reminder_leads.iter().max().copied()?;
+                // A start at or after its trigger: occurrences from the start
+                // of the late window up to the longest lead ahead (plus a day
+                // for all-day events, reminded at `all_day_time`) cover every
+                // trigger that can be due now.
+                let replaced: Vec<DateTime<Utc>> = events
+                    .iter()
+                    .filter(|other| other.series.as_deref() == Some(event.object_id.as_str()))
+                    .filter_map(|other| other.occurrence.as_ref())
+                    .map(|occurrence| occurrence.parsed.with_timezone(&Utc))
+                    .collect();
+                let starts = match crate::events::occurrences_between(
+                    event,
+                    self.calendar.timezone,
+                    &replaced,
+                    now - self.late_window,
+                    now + longest + chrono::Duration::days(1),
+                ) {
+                    Ok(starts) => starts,
+                    Err(err) => {
+                        warn!(object_id = %event.object_id, event = %event.name, error = %err, "event recurrence unreadable; no reminders");
+                        return None;
+                    }
+                };
+                let moments: Vec<ReminderMoment> = starts
+                    .into_iter()
+                    .flat_map(|start| {
+                        let occurrence = Task { scheduled: Some(start), ..task.clone() };
+                        reminders_for(&occurrence, &self.calendar, &self.reminders)
+                    })
+                    .map(|moment| ReminderMoment {
+                        anchor: ReminderAnchor::Start,
+                        ..moment
+                    })
+                    .collect();
                 Some((task, moments))
             })
             .collect()
@@ -195,7 +219,7 @@ impl PushScheduler {
                 )
             })
             .collect();
-        entries.extend(self.event_entries().await);
+        entries.extend(self.event_entries(now).await);
         for (task, moments) in &entries {
             // A task can carry several lead times, each claimed on its own.
             for &moment in moments {
@@ -673,6 +697,12 @@ mod tests {
         async fn update(&self, _: &str, _: &crate::events::EventPatch) -> Result<(), SourceError> {
             unreachable!()
         }
+        async fn create_replacement(
+            &self,
+            _: &crate::events::EventPatch,
+        ) -> Result<String, SourceError> {
+            unreachable!()
+        }
         async fn archive(&self, _: &str) -> Result<(), SourceError> {
             unreachable!()
         }
@@ -691,7 +721,86 @@ mod tests {
             ical_uid: None,
             object_url: None,
             last_modified: None,
+            rrule: None,
+            exdates: Vec::new(),
+            series: None,
+            occurrence: None,
         }
+    }
+
+    struct Events(Vec<Event>);
+
+    #[async_trait]
+    impl EventStore for Events {
+        async fn list(&self) -> Result<Vec<Event>, SourceError> {
+            Ok(self.0.clone())
+        }
+        async fn get(&self, _: &str) -> Result<Option<Event>, SourceError> {
+            unreachable!()
+        }
+        async fn create(
+            &self,
+            _: &str,
+            _: &crate::events::EventPatch,
+        ) -> Result<String, SourceError> {
+            unreachable!()
+        }
+        async fn update(&self, _: &str, _: &crate::events::EventPatch) -> Result<(), SourceError> {
+            unreachable!()
+        }
+        async fn create_replacement(
+            &self,
+            _: &crate::events::EventPatch,
+        ) -> Result<String, SourceError> {
+            unreachable!()
+        }
+        async fn archive(&self, _: &str) -> Result<(), SourceError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_weekly_event_reminds_of_this_weeks_occurrence_unless_excluded_or_replaced() {
+        // Weekly from 2 August, 10:00 Saratov; now is 15 minutes before the
+        // occurrence of 30 August.
+        let now = Utc.with_ymd_and_hms(2026, 8, 30, 5, 45, 10).unwrap();
+        let mut weekly = event("weekly", &["15m"]);
+        weekly.start = AnytypeDate::parse("2026-08-02T06:00:00Z");
+        weekly.rrule = Some("FREQ=WEEKLY".into());
+
+        let (scheduler, sink, _, _directory) = build_scheduler(vec![SourceStep::Tasks(Vec::new())]);
+        let scheduler = scheduler.with_events(Arc::new(Events(vec![weekly.clone()])));
+        scheduler.check_at(now).await.unwrap();
+        let sent = sink.notifications();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].body.contains("10:00"), "{}", sent[0].body);
+        assert_eq!(sent[0].day, chrono::NaiveDate::from_ymd_opt(2026, 8, 30));
+
+        let mut excluded = weekly.clone();
+        excluded.exdates = vec![AnytypeDate::parse("2026-08-30T06:00:00Z").unwrap()];
+        let (scheduler, sink, _, _directory) = build_scheduler(vec![SourceStep::Tasks(Vec::new())]);
+        let scheduler = scheduler.with_events(Arc::new(Events(vec![excluded])));
+        scheduler.check_at(now).await.unwrap();
+        assert!(sink.notifications().is_empty());
+
+        // Moved to 12:00 that day: the master stays silent, the replacement
+        // reminds at its own time.
+        let mut moved = event("moved", &["15m"]);
+        moved.name = "Семинар (перенесён)".into();
+        moved.start = AnytypeDate::parse("2026-08-30T08:00:00Z");
+        moved.series = Some("weekly".into());
+        moved.occurrence = AnytypeDate::parse("2026-08-30T06:00:00Z");
+        let (scheduler, sink, _, _directory) = build_scheduler(vec![SourceStep::Tasks(Vec::new())]);
+        let scheduler = scheduler.with_events(Arc::new(Events(vec![weekly, moved])));
+        scheduler.check_at(now).await.unwrap();
+        assert!(sink.notifications().is_empty());
+        scheduler
+            .check_at(Utc.with_ymd_and_hms(2026, 8, 30, 7, 45, 10).unwrap())
+            .await
+            .unwrap();
+        let sent = sink.notifications();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].title, "Семинар (перенесён)");
     }
 
     #[tokio::test]

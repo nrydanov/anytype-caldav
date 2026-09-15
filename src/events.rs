@@ -9,12 +9,14 @@
 
 use std::{
     collections::BTreeMap,
+    str::FromStr,
     sync::{Arc, Mutex},
     time::{Duration as StdDuration, Instant},
 };
 
 use anytype::{client::AnytypeClient, objects::Object, properties::SetProperty};
 use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use futures::StreamExt;
 use icalendar::{
     Alarm, Calendar, CalendarDateTime, Component, DatePerhapsTime, EventLike, Property, Trigger,
@@ -48,6 +50,15 @@ pub struct Event {
     pub ical_uid: Option<String>,
     pub object_url: Option<String>,
     pub last_modified: Option<DateTime<Utc>>,
+    /// RRULE value without the `RRULE:` prefix; set on the master of a series.
+    pub rrule: Option<String>,
+    /// Occurrences removed from the series, in Anytype's date shape (`exdate`,
+    /// one value per line).
+    pub exdates: Vec<AnytypeDate>,
+    /// Set on an object that replaces one occurrence: the master's object id.
+    pub series: Option<String>,
+    /// The occurrence it replaces (its RECURRENCE-ID).
+    pub occurrence: Option<AnytypeDate>,
 }
 
 impl Event {
@@ -74,13 +85,110 @@ impl Event {
     }
 }
 
+// ------------------------------------------------------------------ recurrence
+
+/// Starts of a series' occurrences within `[from, to]`, in Anytype's date
+/// shape so they classify like a stored start. The rule is expanded in local
+/// time (`DTSTART;TZID=`), so a daylight-saving change keeps the wall clock.
+/// Excluded dates and occurrences in `replaced` are left out; an event
+/// without a rule yields its own start when it falls in the window.
+pub fn occurrences_between(
+    event: &Event,
+    tz: Tz,
+    replaced: &[DateTime<Utc>],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<Vec<AnytypeDate>, String> {
+    let Some(start) = &event.start else {
+        return Ok(Vec::new());
+    };
+    let Some(rule) = &event.rrule else {
+        let at = start.parsed.with_timezone(&Utc);
+        return Ok((from <= at && at <= to)
+            .then(|| start.clone())
+            .into_iter()
+            .collect());
+    };
+    let (local, all_day) = match start.classify(tz) {
+        CalendarValue::AllDay(day) => (day.and_time(NaiveTime::MIN), true),
+        CalendarValue::Instant(at) => (at.with_timezone(&tz).naive_local(), false),
+    };
+    let text = format!(
+        "DTSTART;TZID={}:{}\nRRULE:{}",
+        tz.name(),
+        local.format("%Y%m%dT%H%M%S"),
+        rule.trim()
+    );
+    let set = rrule::RRuleSet::from_str(&text).map_err(|err| format!("{rule:?}: {err}"))?;
+    let skipped: Vec<DateTime<Utc>> = event
+        .exdates
+        .iter()
+        .map(|d| d.parsed.with_timezone(&Utc))
+        .chain(replaced.iter().copied())
+        .collect();
+    let found = set
+        .after(from.with_timezone(&rrule::Tz::UTC))
+        .before(to.with_timezone(&rrule::Tz::UTC))
+        .all(1000);
+    Ok(found
+        .dates
+        .into_iter()
+        .map(|occurrence| {
+            if all_day {
+                let day = occurrence.with_timezone(&tz).date_naive();
+                tz.from_local_datetime(&day.and_time(NaiveTime::MIN))
+                    .earliest()
+                    .map(|t| t.with_timezone(&Utc))
+                    .unwrap_or_else(|| occurrence.with_timezone(&Utc))
+            } else {
+                occurrence.with_timezone(&Utc)
+            }
+        })
+        .filter(|at| !skipped.contains(at))
+        .filter_map(|at| AnytypeDate::parse(&at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)))
+        .collect())
+}
+
 // ------------------------------------------------------------------ rendering
 
-fn wire_date(value: CalendarValue) -> DatePerhapsTime {
-    match value {
-        CalendarValue::AllDay(day) => DatePerhapsTime::Date(day),
-        CalendarValue::Instant(at) => DatePerhapsTime::DateTime(CalendarDateTime::Utc(at)),
+/// A value on the wire. `zone` writes an instant as local wall-clock time with
+/// `TZID`, which a recurring rule needs to expand across daylight-saving
+/// changes; otherwise instants are UTC.
+fn wire_value(value: CalendarValue, zone: Option<Tz>) -> DatePerhapsTime {
+    match (value, zone) {
+        (CalendarValue::AllDay(day), _) => DatePerhapsTime::Date(day),
+        (CalendarValue::Instant(at), None) => DatePerhapsTime::DateTime(CalendarDateTime::Utc(at)),
+        (CalendarValue::Instant(at), Some(tz)) => {
+            DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone {
+                date_time: at.with_timezone(&tz).naive_local(),
+                tzid: tz.name().to_string(),
+            })
+        }
     }
+}
+
+/// `DATE`, `TZID=…:local` or UTC text of a value, for properties the library
+/// has no typed setter for (EXDATE, RECURRENCE-ID).
+fn date_property(key: &str, value: CalendarValue, zone: Option<Tz>) -> Property {
+    let mut property = match wire_value(value, zone) {
+        DatePerhapsTime::Date(day) => {
+            let mut p = Property::new(key, day.format("%Y%m%d").to_string());
+            p.add_parameter("VALUE", "DATE");
+            p
+        }
+        DatePerhapsTime::DateTime(CalendarDateTime::WithTimezone { date_time, tzid }) => {
+            let mut p = Property::new(key, date_time.format("%Y%m%dT%H%M%S").to_string());
+            p.add_parameter("TZID", &tzid);
+            p
+        }
+        DatePerhapsTime::DateTime(CalendarDateTime::Utc(at)) => {
+            Property::new(key, at.format("%Y%m%dT%H%M%SZ").to_string())
+        }
+        DatePerhapsTime::DateTime(CalendarDateTime::Floating(local)) => {
+            Property::new(key, local.format("%Y%m%dT%H%M%S").to_string())
+        }
+    };
+    property.done()
 }
 
 /// DTSTART and DTEND as a client sees them. `None` without a start: a VEVENT
@@ -88,6 +196,14 @@ fn wire_date(value: CalendarValue) -> DatePerhapsTime {
 pub fn wire_dates(
     event: &Event,
     config: &CalendarConfig,
+) -> Option<(DatePerhapsTime, Option<DatePerhapsTime>)> {
+    zoned_dates(event, config, None)
+}
+
+fn zoned_dates(
+    event: &Event,
+    config: &CalendarConfig,
+    zone: Option<Tz>,
 ) -> Option<(DatePerhapsTime, Option<DatePerhapsTime>)> {
     let tz = config.date_only_timezone;
     let start = event.start.as_ref()?.classify(tz);
@@ -97,23 +213,26 @@ pub fn wire_dates(
         (_, Some(CalendarValue::AllDay(last))) => {
             Some(DatePerhapsTime::Date(last + Duration::days(1)))
         }
-        (_, Some(end @ CalendarValue::Instant(_))) => Some(wire_date(end)),
+        (_, Some(end @ CalendarValue::Instant(_))) => Some(wire_value(end, zone)),
         (CalendarValue::AllDay(day), None) => Some(DatePerhapsTime::Date(day + Duration::days(1))),
         (CalendarValue::Instant(_), None) => None,
     };
-    Some((wire_date(start), dtend))
+    Some((wire_value(start, zone), dtend))
 }
 
-pub fn render_event(
+/// One VEVENT. `uid` is the series' UID for a replaced occurrence.
+fn vevent_for(
     event: &Event,
+    uid: &str,
     config: &CalendarConfig,
     fallback: DateTime<Utc>,
-) -> Option<String> {
-    let (start, end) = wire_dates(event, config)?;
+    zone: Option<Tz>,
+) -> Option<icalendar::Event> {
+    let (start, end) = zoned_dates(event, config, zone)?;
     let modified = event.last_modified.unwrap_or(fallback);
     let mut vevent = icalendar::Event::new();
     vevent
-        .uid(&event.uid())
+        .uid(uid)
         .summary(&event.name)
         .timestamp(modified)
         .sequence(sequence_for(modified))
@@ -133,31 +252,83 @@ pub fn render_event(
     }
     // Calino reads only `-PT…` durations (`parseTriggerDuration` in
     // `icalTypeMapping.ts`), so days and weeks are written as minutes.
-    let uid = event.uid();
+    let alarm_owner = format!("{uid}-{}", event.object_id);
     for (index, lead) in event.leads().into_iter().enumerate() {
         let mut alarm = Alarm::display(&event.name, Trigger::before_start(lead));
         alarm.append_property(Property::new(
             "TRIGGER",
             format!("-PT{}M", lead.num_minutes()),
         ));
-        vevent.alarm(stable_alarm(alarm.done(), &uid, index, modified));
+        vevent.alarm(stable_alarm(alarm.done(), &alarm_owner, index, modified));
+    }
+    Some(vevent)
+}
+
+/// A standalone event, or a series: the master with RRULE and EXDATE, then
+/// one VEVENT with RECURRENCE-ID per replaced occurrence, all in one resource
+/// as RFC 4791 §4.1 requires for one UID.
+pub fn render_series(
+    master: &Event,
+    replacements: &[&Event],
+    config: &CalendarConfig,
+    fallback: DateTime<Utc>,
+) -> Option<String> {
+    let uid = master.uid();
+    let recurring = master.rrule.is_some();
+    let zone = recurring.then_some(config.timezone);
+    let mut first = vevent_for(master, &uid, config, fallback, zone)?;
+    let mut components = Vec::new();
+    if let Some(rule) = &master.rrule {
+        first.append_property(Property::new("RRULE", rule.trim()));
+        let tz = config.date_only_timezone;
+        for excluded in &master.exdates {
+            first.append_multi_property(date_property("EXDATE", excluded.classify(tz), zone));
+        }
+        let mut replacements: Vec<&&Event> = replacements.iter().collect();
+        replacements.sort_by_key(|r| r.occurrence.as_ref().map(|o| o.parsed));
+        for replacement in replacements {
+            let Some(occurrence) = &replacement.occurrence else {
+                continue;
+            };
+            let Some(mut vevent) = vevent_for(replacement, &uid, config, fallback, zone) else {
+                continue;
+            };
+            vevent.append_property(date_property(
+                "RECURRENCE-ID",
+                occurrence.classify(tz),
+                zone,
+            ));
+            components.push(vevent);
+        }
     }
     let mut calendar = Calendar::new();
     calendar
         .name(&config.name)
         .timezone(config.timezone.name())
-        .push(vevent);
+        .push(first);
+    for component in components {
+        calendar.push(component);
+    }
     Some(calendar.to_string())
 }
 
-pub fn resource_for(
+pub fn render_event(
     event: &Event,
     config: &CalendarConfig,
     fallback: DateTime<Utc>,
+) -> Option<String> {
+    render_series(event, &[], config, fallback)
+}
+
+pub fn resource_for(
+    master: &Event,
+    replacements: &[&Event],
+    config: &CalendarConfig,
+    fallback: DateTime<Utc>,
 ) -> Option<Resource> {
-    let ics = render_event(event, config, fallback)?;
+    let ics = render_series(master, replacements, config, fallback)?;
     Some(Resource {
-        object_id: event.object_id.clone(),
+        object_id: master.object_id.clone(),
         etag: etag_for(&ics),
         ics: Arc::from(ics.as_str()),
     })
@@ -174,6 +345,22 @@ pub struct IncomingEvent {
     pub location: Option<String>,
     /// Minutes before the start, from relative VALARM triggers.
     pub leads: Vec<Duration>,
+    /// CATEGORIES values.
+    pub categories: Vec<String>,
+    /// RRULE value, on the master of a series.
+    pub rrule: Option<String>,
+    /// EXDATE values, one per date even when the client joined them.
+    pub exdates: Vec<DatePerhapsTime>,
+    /// RECURRENCE-ID, on a component replacing one occurrence.
+    pub recurrence_id: Option<DatePerhapsTime>,
+}
+
+/// A PUT body: the master (or a plain event) and the components replacing
+/// single occurrences.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncomingSeries {
+    pub master: IncomingEvent,
+    pub replacements: Vec<IncomingEvent>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -184,6 +371,16 @@ pub struct EventPatch {
     pub location: Option<Option<String>>,
     /// Option names for `reminder_lead`.
     pub reminders: Option<Vec<String>>,
+    /// Option names for `tag`; an empty list clears the tags.
+    pub tags: Option<Vec<String>>,
+    /// `Some(None)` removes the recurrence.
+    pub rrule: Option<Option<String>>,
+    /// Anytype-shaped dates; an empty list clears `exdate`.
+    pub exdates: Option<Vec<String>>,
+    /// Only on create: the master this object replaces an occurrence of.
+    pub series: Option<String>,
+    /// Only on create, beside `series`.
+    pub occurrence: Option<String>,
 }
 
 impl EventPatch {
@@ -193,6 +390,11 @@ impl EventPatch {
             && self.end.is_none()
             && self.location.is_none()
             && self.reminders.is_none()
+            && self.tags.is_none()
+            && self.rrule.is_none()
+            && self.exdates.is_none()
+            && self.series.is_none()
+            && self.occurrence.is_none()
     }
 }
 
@@ -202,25 +404,15 @@ pub enum EventWriteError {
     NotCalendar(String),
     #[error("body carries no VEVENT")]
     NoEvent,
-    #[error("body carries {0} VEVENTs; recurrence overrides are not supported")]
-    Overrides(usize),
-    #[error("recurring events are not supported; Anytype has no recurrence for events")]
-    Recurring,
+    #[error("body carries {0} VEVENTs without RECURRENCE-ID; one resource holds one event")]
+    SeveralMasters(usize),
+    #[error("body carries only replaced occurrences; the series itself is required")]
+    NoMaster,
+    #[error("RDATE is not supported")]
+    Rdate,
 }
 
-pub fn parse_event(body: &str) -> Result<IncomingEvent, EventWriteError> {
-    let calendar: Calendar = terminated(body)
-        .parse()
-        .map_err(EventWriteError::NotCalendar)?;
-    let events: Vec<&icalendar::Event> = calendar.events().collect();
-    let event = match events.as_slice() {
-        [] => return Err(EventWriteError::NoEvent),
-        [one] => *one,
-        many => return Err(EventWriteError::Overrides(many.len())),
-    };
-    if event.property_value("RRULE").is_some() || event.property_value("RDATE").is_some() {
-        return Err(EventWriteError::Recurring);
-    }
+fn incoming(event: &icalendar::Event) -> IncomingEvent {
     let mut leads: Vec<Duration> = event
         .components()
         .iter()
@@ -230,7 +422,24 @@ pub fn parse_event(body: &str) -> Result<IncomingEvent, EventWriteError> {
         .collect();
     leads.sort();
     leads.dedup();
-    Ok(IncomingEvent {
+    let exdates = event
+        .multi_properties()
+        .get("EXDATE")
+        .into_iter()
+        .flatten()
+        .flat_map(|property| {
+            // Parsing accepts comma lists (RFC 5545 §3.8.5.1); each value
+            // keeps the property's VALUE and TZID parameters.
+            property.value().split(',').filter_map(move |value| {
+                let mut single = Property::new("EXDATE", value.trim());
+                for parameter in property.params().values() {
+                    single.append_parameter(parameter.clone());
+                }
+                DatePerhapsTime::from_property(&single.done())
+            })
+        })
+        .collect();
+    IncomingEvent {
         uid: event.get_uid().map(str::to_string),
         summary: event
             .get_summary()
@@ -243,7 +452,50 @@ pub fn parse_event(body: &str) -> Result<IncomingEvent, EventWriteError> {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
         leads,
-    })
+        categories: categories(event),
+        rrule: event
+            .property_value("RRULE")
+            .map(|rule| rule.trim().to_string())
+            .filter(|rule| !rule.is_empty()),
+        exdates,
+        recurrence_id: event.get_recurrence_id(),
+    }
+}
+
+pub fn parse_series(body: &str) -> Result<IncomingSeries, EventWriteError> {
+    let calendar: Calendar = terminated(body)
+        .parse()
+        .map_err(EventWriteError::NotCalendar)?;
+    let events: Vec<&icalendar::Event> = calendar.events().collect();
+    if events.is_empty() {
+        return Err(EventWriteError::NoEvent);
+    }
+    if events.iter().any(|e| e.property_value("RDATE").is_some()) {
+        return Err(EventWriteError::Rdate);
+    }
+    let (masters, replacements): (Vec<IncomingEvent>, Vec<IncomingEvent>) = events
+        .into_iter()
+        .map(incoming)
+        .partition(|e| e.recurrence_id.is_none());
+    let mut masters = masters.into_iter();
+    match (masters.next(), masters.len()) {
+        (None, _) => Err(EventWriteError::NoMaster),
+        (Some(master), 0) => Ok(IncomingSeries {
+            // A replaced occurrence of a series without a rule means nothing.
+            replacements: if master.rrule.is_some() {
+                replacements
+            } else {
+                Vec::new()
+            },
+            master,
+        }),
+        (Some(_), more) => Err(EventWriteError::SeveralMasters(more + 1)),
+    }
+}
+
+/// The master of a body; kept for callers that handle plain events only.
+pub fn parse_event(body: &str) -> Result<IncomingEvent, EventWriteError> {
+    parse_series(body).map(|series| series.master)
 }
 
 /// `-PT15M`, `-P1D`, `-PT1H30M`, `-P1W`, `-PT0M` → the lead before the start.
@@ -361,11 +613,17 @@ pub fn event_patch_for_update(
     if names != current_names {
         patch.reminders = Some(names);
     }
+    patch.tags = tags_patch(&current.tags, &incoming.categories);
     patch
 }
 
 pub fn event_patch_for_create(incoming: &IncomingEvent, config: &CalendarConfig) -> EventPatch {
     EventPatch {
+        tags: (!incoming.categories.is_empty()).then(|| incoming.categories.clone()),
+        rrule: None,
+        exdates: None,
+        series: None,
+        occurrence: None,
         name: Some(
             incoming
                 .summary
@@ -389,6 +647,149 @@ pub fn event_patch_for_create(incoming: &IncomingEvent, config: &CalendarConfig)
     }
 }
 
+/// What a PUT of a series changes in Anytype.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SeriesPlan {
+    pub master: EventPatch,
+    /// Existing replacement objects and their patches.
+    pub update: Vec<(String, EventPatch)>,
+    /// New replacement objects; each patch carries `series` and `occurrence`.
+    pub create: Vec<EventPatch>,
+    /// Replacement objects the body no longer has.
+    pub archive: Vec<String>,
+}
+
+impl SeriesPlan {
+    pub fn is_empty(&self) -> bool {
+        self.master.is_empty()
+            && self.update.is_empty()
+            && self.create.is_empty()
+            && self.archive.is_empty()
+    }
+}
+
+/// An instant for a wire date, as stored in Anytype: the key replacements and
+/// exclusions are matched by, whatever form (TZID, UTC, floating) carried it.
+fn instant_of(value: &DatePerhapsTime, config: &CalendarConfig) -> Option<(String, DateTime<Utc>)> {
+    let stored = anytype_date(value, config)?;
+    let at = AnytypeDate::parse(&stored)?.parsed.with_timezone(&Utc);
+    Some((stored, at))
+}
+
+/// RRULE parts compare as a set: clients reorder them.
+fn same_rule(a: Option<&str>, b: Option<&str>) -> bool {
+    let parts = |rule: Option<&str>| {
+        let mut parts: Vec<String> = rule
+            .unwrap_or_default()
+            .split(';')
+            .map(|p| p.trim().to_ascii_uppercase())
+            .filter(|p| !p.is_empty())
+            .collect();
+        parts.sort();
+        parts
+    };
+    parts(a) == parts(b)
+}
+
+fn exdates_patch(
+    current: &[AnytypeDate],
+    incoming: &[DatePerhapsTime],
+    config: &CalendarConfig,
+) -> Option<Vec<String>> {
+    let mut wanted: Vec<(String, DateTime<Utc>)> = incoming
+        .iter()
+        .filter_map(|value| instant_of(value, config))
+        .collect();
+    wanted.sort_by_key(|(_, at)| *at);
+    wanted.dedup_by_key(|(_, at)| *at);
+    let mut have: Vec<DateTime<Utc>> = current
+        .iter()
+        .map(|d| d.parsed.with_timezone(&Utc))
+        .collect();
+    have.sort();
+    have.dedup();
+    let wanted_at: Vec<DateTime<Utc>> = wanted.iter().map(|(_, at)| *at).collect();
+    (wanted_at != have).then(|| wanted.into_iter().map(|(stored, _)| stored).collect())
+}
+
+pub fn plan_series_update(
+    current: &Event,
+    replacements: &[Event],
+    incoming: &IncomingSeries,
+    config: &CalendarConfig,
+) -> SeriesPlan {
+    let mut master = event_patch_for_update(current, &incoming.master, config);
+    if !same_rule(current.rrule.as_deref(), incoming.master.rrule.as_deref()) {
+        master.rrule = Some(incoming.master.rrule.clone());
+    }
+    master.exdates = exdates_patch(&current.exdates, &incoming.master.exdates, config);
+
+    let mut plan = SeriesPlan {
+        master,
+        ..SeriesPlan::default()
+    };
+    let mut matched: Vec<&str> = Vec::new();
+    for wanted in &incoming.replacements {
+        let Some((stored, at)) = wanted
+            .recurrence_id
+            .as_ref()
+            .and_then(|r| instant_of(r, config))
+        else {
+            continue;
+        };
+        let existing = replacements.iter().find(|r| {
+            r.occurrence.as_ref().map(|o| o.parsed.with_timezone(&Utc)) == Some(at)
+                && !matched.contains(&r.object_id.as_str())
+        });
+        match existing {
+            Some(existing) => {
+                matched.push(&existing.object_id);
+                let patch = event_patch_for_update(existing, wanted, config);
+                if !patch.is_empty() {
+                    plan.update.push((existing.object_id.clone(), patch));
+                }
+            }
+            None => {
+                let mut patch = event_patch_for_create(wanted, config);
+                patch.series = Some(current.object_id.clone());
+                patch.occurrence = Some(stored);
+                plan.create.push(patch);
+            }
+        }
+    }
+    plan.archive = replacements
+        .iter()
+        .filter(|r| !matched.contains(&r.object_id.as_str()))
+        .map(|r| r.object_id.clone())
+        .collect();
+    plan
+}
+
+/// A new series: the master's patch and the replacements created after it.
+pub fn plan_series_create(
+    incoming: &IncomingSeries,
+    config: &CalendarConfig,
+) -> (EventPatch, Vec<EventPatch>) {
+    let mut master = event_patch_for_create(&incoming.master, config);
+    master.rrule = incoming.master.rrule.clone().map(Some);
+    let exdates = exdates_patch(&[], &incoming.master.exdates, config);
+    master.exdates = exdates;
+    let replacements = incoming
+        .replacements
+        .iter()
+        .filter_map(|wanted| {
+            let (stored, _) = wanted
+                .recurrence_id
+                .as_ref()
+                .and_then(|r| instant_of(r, config))?;
+            let mut patch = event_patch_for_create(wanted, config);
+            patch.occurrence = Some(stored);
+            Some(patch)
+        })
+        .collect();
+    (master, replacements)
+}
+
 // ------------------------------------------------------------------ Anytype
 
 /// Where events are read from and written to; Anytype in production, memory
@@ -398,6 +799,9 @@ pub trait EventStore: Send + Sync {
     async fn list(&self) -> Result<Vec<Event>, SourceError>;
     async fn get(&self, object_id: &str) -> Result<Option<Event>, SourceError>;
     async fn create(&self, uid: &str, patch: &EventPatch) -> Result<String, SourceError>;
+    /// An object replacing one occurrence: no `ical_uid`, since it is served
+    /// inside its series' resource under the series' UID.
+    async fn create_replacement(&self, patch: &EventPatch) -> Result<String, SourceError>;
     async fn update(&self, object_id: &str, patch: &EventPatch) -> Result<(), SourceError>;
     async fn archive(&self, object_id: &str) -> Result<(), SourceError>;
 }
@@ -431,6 +835,15 @@ fn to_event(object: &Object) -> Event {
         last_modified: object
             .get_property_date("last_modified_date")
             .map(|d| d.with_timezone(&Utc)),
+        rrule: text(object, "rrule")
+            .map(|rule| rule.trim().trim_start_matches("RRULE:").to_string()),
+        exdates: text(object, "exdate")
+            .map(|values| values.lines().filter_map(AnytypeDate::parse).collect())
+            .unwrap_or_default(),
+        series: object
+            .get_property_array("series")
+            .and_then(|links| links.into_iter().next()),
+        occurrence: date(object, "occurrence"),
     }
 }
 
@@ -442,54 +855,6 @@ impl AnytypeEvents {
     pub fn new(client: AnytypeClient, space_id: String) -> Self {
         Self { client, space_id }
     }
-    /// Option ids of `reminder_lead` for `names`, creating missing options.
-    async fn reminder_ids(&self, names: &[String]) -> Result<Vec<String>, SourceError> {
-        if names.is_empty() {
-            return Ok(Vec::new());
-        }
-        let properties = self
-            .client
-            .properties(&self.space_id)
-            .list()
-            .await
-            .map_err(transport)?
-            .collect_all()
-            .await
-            .map_err(transport)?;
-        let property = properties
-            .iter()
-            .find(|p| p.key == "reminder_lead")
-            .ok_or_else(|| SourceError::Schema("space has no reminder_lead property".into()))?;
-        let tags = self
-            .client
-            .tags(&self.space_id, &property.id)
-            .list()
-            .await
-            .map_err(transport)?
-            .collect_all()
-            .await
-            .map_err(transport)?;
-        let mut ids = Vec::new();
-        for name in names {
-            match tags.iter().find(|t| t.name.trim() == name) {
-                Some(tag) => ids.push(tag.id.clone()),
-                None => {
-                    info!(%name, "creating reminder_lead option");
-                    let tag = self
-                        .client
-                        .new_tag(&self.space_id, &property.id)
-                        .name(name.as_str())
-                        .color(anytype::objects::Color::Grey)
-                        .create()
-                        .await
-                        .map_err(transport)?;
-                    ids.push(tag.id);
-                }
-            }
-        }
-        Ok(ids)
-    }
-
     async fn properties_for(
         &self,
         patch: &EventPatch,
@@ -504,8 +869,26 @@ impl AnytypeEvents {
             out.push(serde_json::json!({ "key": "address", "text": location.clone().unwrap_or_default() }));
         }
         if let Some(names) = &patch.reminders {
-            let ids = self.reminder_ids(names).await?;
+            let ids = option_ids(&self.client, &self.space_id, "reminder_lead", names).await?;
             out.push(serde_json::json!({ "key": "reminder_lead", "multi_select": ids }));
+        }
+        if let Some(tags) = &patch.tags {
+            let ids = option_ids(&self.client, &self.space_id, "tag", tags).await?;
+            out.push(serde_json::json!({ "key": "tag", "multi_select": ids }));
+        }
+        if let Some(rule) = &patch.rrule {
+            out.push(
+                serde_json::json!({ "key": "rrule", "text": rule.clone().unwrap_or_default() }),
+            );
+        }
+        if let Some(exdates) = &patch.exdates {
+            out.push(serde_json::json!({ "key": "exdate", "text": exdates.join("\n") }));
+        }
+        if let Some(series) = &patch.series {
+            out.push(serde_json::json!({ "key": "series", "objects": [series] }));
+        }
+        if let Some(occurrence) = &patch.occurrence {
+            out.push(serde_json::json!({ "key": "occurrence", "date": occurrence }));
         }
         Ok(out)
     }
@@ -583,6 +966,22 @@ impl EventStore for AnytypeEvents {
         Ok(object.id)
     }
 
+    async fn create_replacement(&self, patch: &EventPatch) -> Result<String, SourceError> {
+        let mut request = self
+            .client
+            .new_object(&self.space_id, EVENT_TYPE)
+            .name(patch.name.clone().unwrap_or_else(|| "(unnamed)".into()));
+        for property in self.properties_for(patch).await? {
+            request = request.add_property(property);
+        }
+        info!(?patch, "anytype create replaced occurrence");
+        let object = request.create().await.map_err(|err| {
+            error!(?patch, error = %err, "anytype create replaced occurrence failed");
+            transport(err)
+        })?;
+        Ok(object.id)
+    }
+
     async fn archive(&self, object_id: &str) -> Result<(), SourceError> {
         info!(object_id, "anytype archive event");
         self.client
@@ -637,7 +1036,10 @@ impl EventService {
         let mut objects = BTreeMap::new();
         let mut undated = 0;
         for event in &events {
-            match self.resource(event) {
+            if replaces_an_occurrence(event, &events) {
+                continue;
+            }
+            match self.resource(event, &replacements_of(&event.object_id, &events)) {
                 Some(resource) => {
                     objects.insert(event.resource_name(), resource);
                 }
@@ -661,8 +1063,31 @@ impl EventService {
         Ok(snapshot)
     }
 
-    pub fn resource(&self, event: &Event) -> Option<Resource> {
-        resource_for(event, &self.config, self.fallback)
+    pub fn resource(&self, master: &Event, replacements: &[&Event]) -> Option<Resource> {
+        resource_for(master, replacements, &self.config, self.fallback)
+    }
+
+    /// A fresh read of one resource: the object and, for a series, the
+    /// objects replacing its occurrences. Write preconditions use this, never
+    /// the snapshot.
+    pub async fn read_series(
+        &self,
+        object_id: &str,
+    ) -> Result<Option<(Event, Vec<Event>)>, SourceError> {
+        let Some(master) = self.source.get(object_id).await? else {
+            return Ok(None);
+        };
+        if master.rrule.is_none() {
+            return Ok(Some((master, Vec::new())));
+        }
+        let replacements = self
+            .source
+            .list()
+            .await?
+            .into_iter()
+            .filter(|event| event.series.as_deref() == Some(object_id))
+            .collect();
+        Ok(Some((master, replacements)))
     }
 
     pub fn invalidate(&self) {
@@ -674,6 +1099,107 @@ impl EventService {
     pub fn warn_unreachable(&self, err: &SourceError) {
         warn!(error = %err, "events unavailable");
     }
+}
+
+/// Option ids of the select property `key` for `names`, creating the options
+/// that do not exist yet.
+pub(crate) async fn option_ids(
+    client: &AnytypeClient,
+    space_id: &str,
+    key: &str,
+    names: &[String],
+) -> Result<Vec<String>, SourceError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let properties = client
+        .properties(space_id)
+        .list()
+        .await
+        .map_err(transport)?
+        .collect_all()
+        .await
+        .map_err(transport)?;
+    let property = properties
+        .iter()
+        .find(|p| p.key == key)
+        .ok_or_else(|| SourceError::Schema(format!("space has no {key} property")))?;
+    let options = client
+        .tags(space_id, &property.id)
+        .list()
+        .await
+        .map_err(transport)?
+        .collect_all()
+        .await
+        .map_err(transport)?;
+    let mut ids = Vec::new();
+    for name in names {
+        match options.iter().find(|t| t.name.trim() == name) {
+            Some(option) => ids.push(option.id.clone()),
+            None => {
+                info!(%name, key, "creating select option");
+                let option = client
+                    .new_tag(space_id, &property.id)
+                    .name(name.as_str())
+                    .color(anytype::objects::Color::Grey)
+                    .create()
+                    .await
+                    .map_err(transport)?;
+                ids.push(option.id);
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Every CATEGORIES value of a component: several lines, each a comma list.
+/// Trimmed, deduplicated, in order. The parser has already unescaped `\,`,
+/// so a tag whose name contains a comma comes back as two tags.
+pub(crate) fn categories(component: &impl Component) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for property in component
+        .multi_properties()
+        .get("CATEGORIES")
+        .into_iter()
+        .flatten()
+    {
+        for value in property.value().split(',') {
+            let value = value.trim().to_string();
+            if !value.is_empty() && !out.contains(&value) {
+                out.push(value);
+            }
+        }
+    }
+    out
+}
+
+/// Tags changed when the sets differ; order is not kept by Anytype.
+pub(crate) fn tags_patch(current: &[String], incoming: &[String]) -> Option<Vec<String>> {
+    let mut a: Vec<&String> = current.iter().collect();
+    let mut b: Vec<&String> = incoming.iter().collect();
+    a.sort();
+    b.sort();
+    (a != b).then(|| incoming.to_vec())
+}
+
+/// Objects replacing occurrences of `master_id`.
+pub fn replacements_of<'a>(master_id: &str, events: &'a [Event]) -> Vec<&'a Event> {
+    events
+        .iter()
+        .filter(|event| event.series.as_deref() == Some(master_id) && event.occurrence.is_some())
+        .collect()
+}
+
+/// Served inside its series' resource rather than on its own. An object whose
+/// series is gone or no longer recurs is served as a plain event, so it never
+/// disappears from the calendar.
+pub fn replaces_an_occurrence(event: &Event, events: &[Event]) -> bool {
+    event.occurrence.is_some()
+        && event.series.as_deref().is_some_and(|series| {
+            events
+                .iter()
+                .any(|other| other.object_id == series && other.rrule.is_some())
+        })
 }
 
 /// An instant for an event's start, for reminders.
@@ -718,6 +1244,10 @@ mod tests {
             ical_uid: None,
             object_url: None,
             last_modified: Some(Utc.with_ymd_and_hms(2026, 9, 15, 12, 0, 0).unwrap()),
+            rrule: None,
+            exdates: Vec::new(),
+            series: None,
+            occurrence: None,
         }
     }
 
@@ -813,6 +1343,63 @@ mod tests {
     fn a_body_without_a_final_line_break_is_read() {
         let body = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u\r\nDTSTART:20261001T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR";
         assert_eq!(parse_event(body).unwrap().uid.as_deref(), Some("u"));
+    }
+
+    #[test]
+    fn a_weekly_rule_keeps_the_wall_clock_across_a_daylight_saving_change() {
+        let berlin = chrono_tz::Europe::Berlin;
+        let mut ev = event(Some("2026-10-19T08:00:00Z"), None); // 10:00 CEST
+        ev.rrule = Some("FREQ=WEEKLY".into());
+        ev.exdates = vec![AnytypeDate::parse("2026-11-02T09:00:00Z").unwrap()];
+        let starts = occurrences_between(
+            &ev,
+            berlin,
+            &[],
+            Utc.with_ymd_and_hms(2026, 10, 18, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 11, 10, 0, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let raw: Vec<&str> = starts.iter().map(|s| s.raw.as_str()).collect();
+        // 26 October is after the switch to CET: still 10:00 local, 09:00 UTC.
+        assert_eq!(
+            raw,
+            [
+                "2026-10-19T08:00:00Z",
+                "2026-10-26T09:00:00Z",
+                "2026-11-09T09:00:00Z"
+            ]
+        );
+    }
+
+    #[test]
+    fn exdates_are_read_in_every_form_calino_writes() {
+        let body = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u\r\nDTSTART:20261001T100000Z\r\nRRULE:FREQ=DAILY\r\nEXDATE;TZID=Europe/Saratov:20261002T140000\r\nEXDATE:20261003T100000Z,20261004T100000Z\r\nEXDATE:20261005T140000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let series = parse_series(body).unwrap();
+        let ev = Event {
+            rrule: Some("FREQ=DAILY".into()),
+            ..event(Some("2026-10-01T10:00:00Z"), None)
+        };
+        let plan = plan_series_update(&ev, &[], &series, &config());
+        assert_eq!(
+            plan.master.exdates,
+            Some(vec![
+                "2026-10-02T10:00:00Z".to_string(),
+                "2026-10-03T10:00:00Z".to_string(),
+                "2026-10-04T10:00:00Z".to_string(),
+                // Floating, read as local time in the calendar's zone.
+                "2026-10-05T10:00:00Z".to_string(),
+            ])
+        );
+        assert!(plan.master.rrule.is_none(), "{plan:?}");
+    }
+
+    #[test]
+    fn a_reordered_rule_is_the_same_rule() {
+        assert!(same_rule(
+            Some("FREQ=WEEKLY;BYDAY=MO;UNTIL=20261228T195959Z"),
+            Some("UNTIL=20261228T195959Z;FREQ=WEEKLY;BYDAY=MO")
+        ));
+        assert!(!same_rule(Some("FREQ=WEEKLY"), None));
     }
 
     #[test]

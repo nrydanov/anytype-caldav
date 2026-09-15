@@ -336,6 +336,8 @@ fn precondition_failed(reason: &str) -> Response {
 }
 
 async fn put(state: &AppState, name: &str, headers: &HeaderMap, body: &str) -> Response {
+    // The whole body: what a client meant is only recoverable from it.
+    debug!(resource = name, body, "caldav put body");
     let writer = state.writer.as_ref().expect("routed only with a writer");
     let if_match = header_text(headers, header::IF_MATCH).filter(|v| v != "*");
     let if_none_match = header_text(headers, header::IF_NONE_MATCH);
@@ -639,7 +641,8 @@ async fn put_event(
 ) -> Response {
     let if_match = header_text(headers, header::IF_MATCH).filter(|v| v != "*");
     let if_none_match = header_text(headers, header::IF_NONE_MATCH);
-    let incoming = match ev::parse_event(body) {
+    debug!(resource = name, body, "caldav event put body");
+    let incoming = match ev::parse_series(body) {
         Ok(incoming) => incoming,
         Err(err) => {
             warn!(resource = name, error = %err, body_bytes = body.len(), "caldav event put: refused body");
@@ -666,8 +669,8 @@ async fn put_event(
         Ok(None) => return create_event(service, name, if_match, &incoming).await,
         Err(response) => return *response,
     };
-    let current = match service.source.get(&object_id).await {
-        Ok(Some(event)) => event,
+    let (current, replacements) = match service.read_series(&object_id).await {
+        Ok(Some(found)) => found,
         Ok(None) => {
             info!(resource = name, %object_id, "caldav event put: event vanished since the snapshot");
             service.invalidate();
@@ -679,7 +682,8 @@ async fn put_event(
         }
         Err(err) => return source_failure(&err),
     };
-    let current_etag = service.resource(&current).map(|r| r.etag);
+    let refs: Vec<&ev::Event> = replacements.iter().collect();
+    let current_etag = service.resource(&current, &refs).map(|r| r.etag);
     if if_none_match.as_deref() == Some("*") {
         warn!(resource = name, %object_id, "caldav event put: If-None-Match * on an existing resource");
         return precondition_failed("resource exists");
@@ -690,24 +694,51 @@ async fn put_event(
         warn!(resource = name, %object_id, client_etag = %expected, server_etag = ?current_etag, "caldav event put: stale etag");
         return precondition_failed("etag mismatch");
     }
-    let patch = ev::event_patch_for_update(&current, &incoming, &service.config);
-    if patch.is_empty() {
+    let plan = ev::plan_series_update(&current, &replacements, &incoming, &service.config);
+    if plan.is_empty() {
         info!(resource = name, %object_id, "caldav event put: nothing changed");
     } else {
-        info!(resource = name, %object_id, ?patch, "caldav event put: updating event");
-        if let Err(err) = service.source.update(&object_id, &patch).await {
+        info!(resource = name, %object_id, ?plan, "caldav event put: updating event");
+        let result = apply_plan(service, &object_id, &plan).await;
+        service.invalidate();
+        if let Err(err) = result {
             return source_failure(&err);
         }
-        service.invalidate();
     }
     event_written(service, &object_id, StatusCode::NO_CONTENT).await
+}
+
+/// Master first, then replacements. A failure part-way leaves the resource
+/// with a new ETag, so the client's retry re-reads and re-plans against what
+/// was written instead of repeating it.
+async fn apply_plan(
+    service: &EventService,
+    master_id: &str,
+    plan: &ev::SeriesPlan,
+) -> Result<(), SourceError> {
+    if !plan.master.is_empty() {
+        service.source.update(master_id, &plan.master).await?;
+    }
+    for (object_id, patch) in &plan.update {
+        info!(%master_id, %object_id, ?patch, "caldav event put: updating replaced occurrence");
+        service.source.update(object_id, patch).await?;
+    }
+    for patch in &plan.create {
+        info!(%master_id, ?patch, "caldav event put: creating replaced occurrence");
+        service.source.create_replacement(patch).await?;
+    }
+    for object_id in &plan.archive {
+        info!(%master_id, %object_id, "caldav event put: archiving replaced occurrence");
+        service.source.archive(object_id).await?;
+    }
+    Ok(())
 }
 
 async fn create_event(
     service: &EventService,
     name: &str,
     if_match: Option<String>,
-    incoming: &ev::IncomingEvent,
+    incoming: &ev::IncomingSeries,
 ) -> Response {
     if if_match.is_some() {
         info!(
@@ -716,7 +747,7 @@ async fn create_event(
         );
         return precondition_failed("resource does not exist");
     }
-    let Some(uid) = incoming.uid.clone() else {
+    let Some(uid) = incoming.master.uid.clone() else {
         warn!(resource = name, "caldav event put: new event without UID");
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
@@ -730,7 +761,7 @@ async fn create_event(
             .body(Body::from("resource name must be derived from the UID"))
             .expect("static response");
     }
-    if incoming.start.is_none() {
+    if incoming.master.start.is_none() {
         warn!(
             resource = name,
             "caldav event put: new event without DTSTART"
@@ -740,26 +771,37 @@ async fn create_event(
             .body(Body::from("VEVENT has no DTSTART"))
             .expect("static response");
     }
-    let patch = ev::event_patch_for_create(incoming, &service.config);
-    info!(resource = name, %uid, ?patch, "caldav event put: creating event");
+    let (patch, replacements) = ev::plan_series_create(incoming, &service.config);
+    info!(resource = name, %uid, ?patch, replacements = replacements.len(), "caldav event put: creating event");
     let object_id = match service.source.create(&uid, &patch).await {
         Ok(id) => id,
         Err(err) => return source_failure(&err),
     };
+    for mut replacement in replacements {
+        replacement.series = Some(object_id.clone());
+        info!(resource = name, %object_id, ?replacement, "caldav event put: creating replaced occurrence");
+        if let Err(err) = service.source.create_replacement(&replacement).await {
+            service.invalidate();
+            return source_failure(&err);
+        }
+    }
     service.invalidate();
     event_written(service, &object_id, StatusCode::CREATED).await
 }
 
 async fn event_written(service: &EventService, object_id: &str, code: StatusCode) -> Response {
     let mut builder = Response::builder().status(code);
-    match service.source.get(object_id).await {
-        Ok(Some(event)) => match service.resource(&event) {
-            Some(resource) => {
-                info!(%object_id, etag = %resource.etag, status = code.as_u16(), "caldav event write done");
-                builder = builder.header(header::ETAG, resource.etag);
+    match service.read_series(object_id).await {
+        Ok(Some((event, replacements))) => {
+            let refs: Vec<&ev::Event> = replacements.iter().collect();
+            match service.resource(&event, &refs) {
+                Some(resource) => {
+                    info!(%object_id, etag = %resource.etag, status = code.as_u16(), "caldav event write done");
+                    builder = builder.header(header::ETAG, resource.etag);
+                }
+                None => warn!(%object_id, "caldav event write done but the event has no start"),
             }
-            None => warn!(%object_id, "caldav event write done but the event has no start"),
-        },
+        }
         other => {
             warn!(%object_id, result = ?other.map(|e| e.is_some()), "caldav event write done but reading it back failed");
         }
@@ -777,23 +819,31 @@ async fn delete_event(service: &EventService, name: &str, headers: &HeaderMap) -
         }
         Err(response) => return *response,
     };
-    let current = match service.source.get(&object_id).await {
-        Ok(Some(event)) => event,
+    let (current, replacements) = match service.read_series(&object_id).await {
+        Ok(Some(found)) => found,
         Ok(None) => {
             service.invalidate();
             return status(StatusCode::NOT_FOUND);
         }
         Err(err) => return source_failure(&err),
     };
-    let current_etag = service.resource(&current).map(|r| r.etag);
+    let refs: Vec<&ev::Event> = replacements.iter().collect();
+    let current_etag = service.resource(&current, &refs).map(|r| r.etag);
     if let Some(expected) = &if_match
         && Some(expected) != current_etag.as_ref()
     {
         warn!(resource = name, %object_id, client_etag = %expected, server_etag = ?current_etag, "caldav event delete: stale etag");
         return precondition_failed("etag mismatch");
     }
-    info!(resource = name, %object_id, event = %current.name, "caldav event delete: archiving event");
+    info!(resource = name, %object_id, event = %current.name, replacements = replacements.len(), "caldav event delete: archiving event");
+    for replacement in &replacements {
+        if let Err(err) = service.source.archive(&replacement.object_id).await {
+            service.invalidate();
+            return source_failure(&err);
+        }
+    }
     if let Err(err) = service.source.archive(&object_id).await {
+        service.invalidate();
         return source_failure(&err);
     }
     service.invalidate();

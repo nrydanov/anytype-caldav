@@ -753,6 +753,24 @@ mod writes {
             if let Some(reminders) = &patch.reminders {
                 event.reminder_names = reminders.clone();
             }
+            if let Some(tags) = &patch.tags {
+                event.tags = tags.clone();
+            }
+            if let Some(rule) = &patch.rrule {
+                event.rrule = rule.clone();
+            }
+            if let Some(exdates) = &patch.exdates {
+                event.exdates = exdates
+                    .iter()
+                    .filter_map(|d| AnytypeDate::parse(d))
+                    .collect();
+            }
+            if let Some(series) = &patch.series {
+                event.series = Some(series.clone());
+            }
+            if let Some(occurrence) = &patch.occurrence {
+                event.occurrence = AnytypeDate::parse(occurrence);
+            }
             event.last_modified = Some(event.last_modified.unwrap() + chrono::Duration::seconds(1));
         }
 
@@ -777,6 +795,18 @@ mod writes {
                 event.ical_uid = Some(uid.into());
                 event.reminder_names.clear();
                 event.location = None;
+                apply(&mut event, patch);
+                let id = event.object_id.clone();
+                self.events.lock().unwrap().push(event);
+                Ok(id)
+            }
+            async fn create_replacement(&self, patch: &EventPatch) -> Result<String, SourceError> {
+                let mut next = self.next.lock().unwrap();
+                *next += 1;
+                let mut event = lecture(&format!("repl{next}"));
+                event.reminder_names.clear();
+                event.location = None;
+                event.tags.clear();
                 apply(&mut event, patch);
                 let id = event.object_id.clone();
                 self.events.lock().unwrap().push(event);
@@ -812,6 +842,10 @@ mod writes {
                 ical_uid: None,
                 object_url: None,
                 last_modified: Some(Utc.with_ymd_and_hms(2026, 9, 15, 12, 0, 0).unwrap()),
+                rrule: None,
+                exdates: Vec::new(),
+                series: None,
+                occurrence: None,
             }
         }
 
@@ -973,7 +1007,7 @@ mod writes {
         #[tokio::test]
         async fn an_event_created_in_the_client_lands_in_anytype_under_its_name() {
             let (router, events) = with_events();
-            let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:abc 1\r\nSUMMARY:Встреча\r\nDTSTART;VALUE=DATE:20261001\r\nDTEND;VALUE=DATE:20261003\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+            let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:abc 1\r\nSUMMARY:Встреча\r\nCATEGORIES:Аспирантура,Кафедра\r\nDTSTART;VALUE=DATE:20261001\r\nDTEND;VALUE=DATE:20261003\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             let (status, etag) = put(
                 &router,
                 "/dav/calendars/events/abc~201.ics",
@@ -985,23 +1019,180 @@ mod writes {
             let (served, _) = get_event(&router, "abc~201").await;
             assert_eq!(Some(served), etag);
             let stored = events.events.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(
+                stored.tags,
+                vec!["Аспирантура".to_string(), "Кафедра".to_string()]
+            );
             // All day, 1–2 October: last day inclusive in Anytype.
             assert_eq!(stored.start.unwrap().raw, "2026-09-30T20:00:00Z");
             assert_eq!(stored.end.unwrap().raw, "2026-10-01T20:00:00Z");
         }
 
+        /// Calino's bodies (0.32–0.33): TZID wall-clock times without
+        /// VTIMEZONE, one EXDATE per date, the whole group PUT to the master's
+        /// href with If-Match.
+        const SERIES: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Calino//EN\r\nBEGIN:VEVENT\r\nUID:9f1c0b7e-1d2a-4c55-8a36-5b8e2f4d7c10\r\nDTSTAMP:20260916T101500Z\r\nSEQUENCE:0\r\nDTSTART;TZID=Europe/Saratov:20260921T135000\r\nDTEND;TZID=Europe/Saratov:20260921T152000\r\nSUMMARY:Практика ЯП\r\nRRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261228T195959Z\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        const SERIES_PATH: &str = "/dav/calendars/events/9f1c0b7e-1d2a-4c55-8a36-5b8e2f4d7c10.ics";
+
+        fn master_block(body: &str) -> &str {
+            let start = body.find("BEGIN:VEVENT").unwrap();
+            let end =
+                body[start..].find("END:VEVENT\r\n").unwrap() + start + "END:VEVENT\r\n".len();
+            &body[start..end]
+        }
+
+        fn with_blocks(extra_master_lines: &str, replacement: &str) -> String {
+            let master = master_block(SERIES).replace(
+                "SEQUENCE:0\r\n",
+                &format!("SEQUENCE:1\r\n{extra_master_lines}"),
+            );
+            format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Calino//EN\r\n{master}{replacement}END:VCALENDAR\r\n"
+            )
+        }
+
+        const MOVED: &str = "BEGIN:VEVENT\r\nUID:9f1c0b7e-1d2a-4c55-8a36-5b8e2f4d7c10\r\nDTSTAMP:20260916T101600Z\r\nSEQUENCE:1\r\nDTSTART;TZID=Europe/Saratov:20260928T160000\r\nDTEND;TZID=Europe/Saratov:20260928T173000\r\nSUMMARY:Практика ЯП (перенос)\r\nRECURRENCE-ID;TZID=Europe/Saratov:20260928T135000\r\nEND:VEVENT\r\n";
+
         #[tokio::test]
-        async fn a_recurring_event_is_refused() {
-            let (router, _) = with_events();
-            let body = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:r\r\nSUMMARY:x\r\nDTSTART:20261001T100000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
-            let (status, _) = put(
+        async fn a_recurring_series_lives_through_calinos_edits() {
+            let (router, events) = with_events();
+            let count = || events.events.lock().unwrap().len();
+            let before = count();
+
+            // Create.
+            let (status, etag) =
+                put(&router, SERIES_PATH, Some(("If-None-Match", "*")), SERIES).await;
+            assert_eq!(status, StatusCode::CREATED);
+            let master = events.events.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(
+                master.rrule.as_deref(),
+                Some("FREQ=WEEKLY;BYDAY=MO;UNTIL=20261228T195959Z")
+            );
+            assert_eq!(master.start.as_ref().unwrap().raw, "2026-09-21T09:50:00Z");
+            let (served, ics) = get_event(&router, "9f1c0b7e-1d2a-4c55-8a36-5b8e2f4d7c10").await;
+            assert_eq!(Some(served.clone()), etag);
+            assert!(
+                ics.contains("DTSTART;TZID=Europe/Saratov:20260921T135000"),
+                "{ics}"
+            );
+            assert!(
+                ics.contains("RRULE:FREQ=WEEKLY;BYDAY=MO;UNTIL=20261228T195959Z"),
+                "{ics}"
+            );
+
+            // Edit only the occurrence of 28 September.
+            let body = with_blocks("", MOVED);
+            let (status, etag) =
+                put(&router, SERIES_PATH, Some(("If-Match", &served)), &body).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            assert_eq!(count(), before + 2);
+            let replacement = events.events.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(
+                replacement.series.as_deref(),
+                Some(master.object_id.as_str())
+            );
+            assert_eq!(
+                replacement.occurrence.as_ref().unwrap().raw,
+                "2026-09-28T09:50:00Z"
+            );
+            assert_eq!(
+                replacement.start.as_ref().unwrap().raw,
+                "2026-09-28T12:00:00Z"
+            );
+            let (served, ics) = get_event(&router, "9f1c0b7e-1d2a-4c55-8a36-5b8e2f4d7c10").await;
+            assert_eq!(Some(served.clone()), etag);
+            assert!(
+                ics.contains("RECURRENCE-ID;TZID=Europe/Saratov:20260928T135000"),
+                "{ics}"
+            );
+            assert!(ics.contains("SUMMARY:Практика ЯП (перенос)"), "{ics}");
+            // Served inside the series, not as a resource of its own.
+            let (_, _, listing) = send(
                 &router,
-                "/dav/calendars/events/r.ics",
-                Some(("If-None-Match", "*")),
-                body,
+                "REPORT",
+                "/dav/calendars/events/",
+                Some("1"),
+                EVENT_QUERY,
             )
             .await;
-            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(
+                listing
+                    .matches("<d:href>/dav/calendars/events/9f1c0b7e")
+                    .count(),
+                1,
+                "{listing}"
+            );
+
+            // The same body again (a retry) creates nothing.
+            let (status, _) = put(&router, SERIES_PATH, Some(("If-Match", &served)), &body).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            assert_eq!(count(), before + 2);
+
+            // Delete only that occurrence: EXDATE on the master, the
+            // replacement leaves the group.
+            let body = with_blocks("EXDATE;TZID=Europe/Saratov:20260928T135000\r\n", "");
+            let (status, _) = put(&router, SERIES_PATH, Some(("If-Match", &served)), &body).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            assert_eq!(count(), before + 1);
+            let master_now = events
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| e.object_id == master.object_id)
+                .cloned()
+                .unwrap();
+            assert_eq!(master_now.exdates.len(), 1);
+            assert_eq!(master_now.exdates[0].raw, "2026-09-28T09:50:00Z");
+            let (served, ics) = get_event(&router, "9f1c0b7e-1d2a-4c55-8a36-5b8e2f4d7c10").await;
+            assert!(
+                ics.contains("EXDATE;TZID=Europe/Saratov:20260928T135000"),
+                "{ics}"
+            );
+            assert!(!ics.contains("RECURRENCE-ID"), "{ics}");
+
+            // Delete the series.
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(SERIES_PATH)
+                        .header(header::AUTHORIZATION, auth())
+                        .header("If-Match", served)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(count(), before);
+        }
+
+        #[tokio::test]
+        async fn deleting_a_series_archives_its_replaced_occurrences() {
+            let (router, events) = with_events();
+            let before = events.events.lock().unwrap().len();
+            let body = with_blocks("", MOVED).replace("SEQUENCE:1", "SEQUENCE:0");
+            let (status, etag) =
+                put(&router, SERIES_PATH, Some(("If-None-Match", "*")), &body).await;
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(events.events.lock().unwrap().len(), before + 2);
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(SERIES_PATH)
+                        .header(header::AUTHORIZATION, auth())
+                        .header("If-Match", etag.unwrap())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(events.events.lock().unwrap().len(), before);
         }
 
         #[tokio::test]

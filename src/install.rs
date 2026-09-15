@@ -83,6 +83,8 @@ pub const SCHEMA: &[PropertySpec] = &[
     // occurrence it stands for, so moving its planned date keeps its identity.
     plain("series", "Series", PropertyFormat::Objects),
     plain("occurrence", "Occurrence", PropertyFormat::Date),
+    // Occurrences removed from a recurring event, one Anytype date per line.
+    plain("exdate", "Excluded dates", PropertyFormat::Text),
     plain("ical_uid", "Calendar UID", PropertyFormat::Text),
 ];
 
