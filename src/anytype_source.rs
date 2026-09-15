@@ -92,7 +92,7 @@ impl TaskSource for AnytypeTaskSource {
         // rather than defensive.
         let live: Vec<&Object> = objects.iter().filter(|object| !object.archived).collect();
 
-        self.verify_schema(&live)?;
+        self.verify_schema(&live).await?;
 
         let archived = objects.len() - live.len();
         let mut batch = TaskBatch::default();
@@ -235,7 +235,7 @@ impl AnytypeTaskSource {
     /// task has no dates and none are complete — wrong output that looks like
     /// valid output. The error names what the type actually offers, which is
     /// how an operator discovers the opaque ids without a setup wizard.
-    fn verify_schema(&self, objects: &[&Object]) -> Result<(), SourceError> {
+    async fn verify_schema(&self, objects: &[&Object]) -> Result<(), SourceError> {
         if objects.is_empty() {
             // Nothing to verify against; the empty-result warning covers this.
             return Ok(());
@@ -255,13 +255,43 @@ impl AnytypeTaskSource {
                 }
             }
             if !found {
-                unresolved.push(format!("properties.{field} = \"{selector}\""));
+                unresolved.push((field, selector.clone()));
             }
         }
 
         if unresolved.is_empty() {
             return Ok(());
         }
+
+        // Anytype omits a property nobody has filled in, so "no task carries
+        // it" is not yet "the selector is wrong". The space's property list
+        // tells the two apart; it is read only in this rare case.
+        let properties = self
+            .client
+            .properties(&self.config.space_id)
+            .list()
+            .await
+            .map_err(|err| SourceError::Transport(err.to_string()))?
+            .collect_all()
+            .await
+            .map_err(|err| SourceError::Transport(err.to_string()))?;
+        unresolved.retain(|(field, selector)| {
+            let exists = properties.iter().any(|property| match selector {
+                PropertySelector::Id(id) => &property.id == id,
+                PropertySelector::Key(key) => &property.key == key,
+            });
+            if exists {
+                debug!(field, %selector, "property exists but no task has a value for it");
+            }
+            !exists
+        });
+        if unresolved.is_empty() {
+            return Ok(());
+        }
+        let unresolved: Vec<String> = unresolved
+            .iter()
+            .map(|(field, selector)| format!("properties.{field} = \"{selector}\""))
+            .collect();
 
         // Deduplicated across objects: one line per distinct property.
         let mut observed: BTreeMap<&str, String> = BTreeMap::new();

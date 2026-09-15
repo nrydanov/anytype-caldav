@@ -360,9 +360,13 @@ async fn more_objects_than_max_objects_fails_the_refresh() {
 async fn an_unresolved_selector_fails_with_a_schema_error() {
     let stripped =
         object("a", "One", false).replace("\"key\":\"scheduled\"", "\"key\":\"renamed\"");
-    let fixture = ScriptedHttpFixture::start(vec![page(&stripped, false, 1)])
-        .await
-        .expect("fixture starts");
+    // The space has no `scheduled` property either: the selector is wrong.
+    let fixture = ScriptedHttpFixture::start(vec![
+        page(&stripped, false, 1),
+        page(&property("p-other", "renamed"), false, 1),
+    ])
+    .await
+    .expect("fixture starts");
     let source = source_for(&fixture, 5000).await;
 
     let err = source.list_tasks().await.unwrap_err();
@@ -372,6 +376,33 @@ async fn an_unresolved_selector_fails_with_a_schema_error() {
         }
         other => panic!("expected a schema error, got {other:?}"),
     }
+}
+
+/// Anytype omits a property nobody filled in. A property the space has but no
+/// task carries is not a misconfiguration, and the feed must keep working.
+#[tokio::test]
+async fn a_property_no_task_has_filled_in_is_not_a_schema_error() {
+    let unset = object("a", "One", false).replace(
+        r#"{"name":"Scheduled","key":"scheduled","id":"p-sched","format":"date",
+              "date":"2026-08-29T00:00:00+04:00"},"#,
+        "",
+    );
+    assert!(!unset.contains("scheduled"), "{unset}");
+    let fixture = ScriptedHttpFixture::start(vec![
+        page(&unset, false, 1),
+        page(&property("p-sched", "scheduled"), false, 1),
+    ])
+    .await
+    .expect("fixture starts");
+    let source = source_for(&fixture, 5000).await;
+
+    let batch = source.list_tasks().await.expect("lists tasks");
+    assert_eq!(batch.tasks.len(), 1);
+    assert!(batch.tasks[0].scheduled.is_none());
+}
+
+fn property(id: &str, key: &str) -> String {
+    format!(r#"{{"object":"property","id":"{id}","key":"{key}","name":"{key}","format":"date"}}"#)
 }
 
 /// Unlike a date, a wrong `done` format cannot degrade quietly: defaulting to
