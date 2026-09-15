@@ -3,11 +3,18 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anytype_task_exporter::{
-    anytype_source::AnytypeTaskSource, config::Config, feed::FeedService, http, push::PushService,
-    render::VTodoRenderer, scheduler::PushScheduler, source::TaskSource, state::StateStore,
+    anytype_source::{AnytypeTaskSource, build_client},
+    config::Config,
+    feed::FeedService,
+    http, install,
+    push::PushService,
+    render::VTodoRenderer,
+    scheduler::PushScheduler,
+    source::TaskSource,
+    state::StateStore,
 };
 use chrono::Utc;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -22,6 +29,21 @@ struct Args {
     /// Path to the TOML configuration file.
     #[arg(long)]
     config: PathBuf,
+
+    /// Without a subcommand the service runs.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Check the configured space against the facade's schema and print what
+    /// is missing. Creates nothing unless --apply is given.
+    Init {
+        /// Create the missing properties.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 fn main() -> std::process::ExitCode {
@@ -67,13 +89,24 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    match runtime.block_on(run(config)) {
+    let result = match args.command {
+        None => runtime.block_on(run(config)),
+        Some(Command::Init { apply }) => runtime.block_on(init(config, apply)),
+    };
+    match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("{err}");
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+async fn init(config: Config, apply: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let client = build_client(&config.anytype)?;
+    println!("space {}", config.anytype.space_id);
+    install::run(&client, &config.anytype.space_id, apply).await?;
+    Ok(())
 }
 
 async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {

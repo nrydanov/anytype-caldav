@@ -4,6 +4,7 @@ pub mod anytype_source;
 pub mod config;
 pub mod feed;
 pub mod http;
+pub mod install;
 pub mod model;
 pub mod push;
 pub mod reminder;

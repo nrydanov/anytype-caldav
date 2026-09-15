@@ -1,4 +1,4 @@
-//! The only module that knows the Anytype SDK exists.
+//! Reads tasks from Anytype. Schema writes live in `install`.
 
 use std::collections::BTreeMap;
 
@@ -24,26 +24,29 @@ pub struct AnytypeTaskSource {
     properties: PropertiesConfig,
 }
 
+/// Builds the SDK client.
+///
+/// `keystore = "env"` is required, not a preference: the default platform
+/// keystore is an OS keyring, and the SDK's own comment on the credential
+/// lookup notes it "may trigger user auth" — a Keychain prompt inside a
+/// headless service. The env store reads `ANYTYPE_KEY_HTTP_TOKEN`, which
+/// `main` populates from `ANYTYPE_API_KEY`.
+pub fn build_client(config: &AnytypeConfig) -> Result<AnytypeClient, SourceError> {
+    let client_config = ClientConfig {
+        base_url: Some(config.url.clone()),
+        app_name: env!("CARGO_PKG_NAME").to_string(),
+        keystore: Some("env".to_string()),
+        ..Default::default()
+    };
+    AnytypeClient::with_config(client_config).map_err(|err| SourceError::Transport(err.to_string()))
+}
+
 impl AnytypeTaskSource {
-    /// Builds the SDK client.
-    ///
-    /// `keystore = "env"` is required, not a preference: the default platform
-    /// keystore is an OS keyring, and the SDK's own comment on the credential
-    /// lookup notes it "may trigger user auth" — a Keychain prompt inside a
-    /// headless service. The env store reads `ANYTYPE_KEY_HTTP_TOKEN`, which
-    /// `main` populates from `ANYTYPE_API_KEY`.
     pub fn connect(
         config: AnytypeConfig,
         properties: PropertiesConfig,
     ) -> Result<Self, SourceError> {
-        let client_config = ClientConfig {
-            base_url: Some(config.url.clone()),
-            app_name: env!("CARGO_PKG_NAME").to_string(),
-            keystore: Some("env".to_string()),
-            ..Default::default()
-        };
-        let client = AnytypeClient::with_config(client_config)
-            .map_err(|err| SourceError::Transport(err.to_string()))?;
+        let client = build_client(&config)?;
         Ok(Self {
             client,
             config,
