@@ -61,6 +61,21 @@ enum Schedule {
     },
 }
 
+/// Gives a VALARM the UID and DTSTAMP it would otherwise get from the
+/// library: a random UUID and the current time on every serialisation, which
+/// changes the resource's ETag on each render.
+pub fn stable_alarm(
+    mut alarm: Alarm,
+    owner_uid: &str,
+    index: usize,
+    stamp: DateTime<Utc>,
+) -> Alarm {
+    alarm
+        .add_property("UID", format!("{owner_uid}-alarm-{index}"))
+        .timestamp(stamp);
+    alarm.done()
+}
+
 /// SEQUENCE for a component last modified at `modified`.
 ///
 /// Calino increments SEQUENCE when it edits a task and, with its default
@@ -191,8 +206,8 @@ impl VTodoRenderer {
         for tag in &task.tags {
             todo.add_multi_property("CATEGORIES", tag);
         }
-        for alarm in self.alarms_for(task) {
-            todo.alarm(alarm);
+        for (index, alarm) in self.alarms_for(task).into_iter().enumerate() {
+            todo.alarm(stable_alarm(alarm, &task.uid(), index, modified));
         }
         todo
     }
@@ -670,6 +685,17 @@ mod tests {
         let second = renderer.render(std::slice::from_ref(&t)).unwrap();
         assert!(first.contains("DTSTAMP:20260829T120000Z"), "{first}");
         assert_eq!(first, second, "repeated renders must be byte-identical");
+    }
+
+    #[test]
+    fn alarms_are_byte_identical_between_renders() {
+        let mut t = task("a", "One");
+        t.deadline = date("2026-08-30T14:30:00+04:00");
+        let renderer = renderer();
+        let first = renderer.render(std::slice::from_ref(&t)).unwrap();
+        let second = renderer.render(std::slice::from_ref(&t)).unwrap();
+        assert!(first.contains("BEGIN:VALARM"), "{first}");
+        assert_eq!(first, second);
     }
 
     #[test]
