@@ -133,6 +133,13 @@ impl VTodoRenderer {
         }
 
         let mut todo = todo.done();
+        // One CATEGORIES line per tag. A single comma-joined line would be
+        // escaped as TEXT (RFC 5545 §3.3.11) and read back as one category whose
+        // name contains commas; RFC 5545 §3.8.1.2 allows the property to repeat,
+        // and Calino reads every line.
+        for tag in &task.tags {
+            todo.add_multi_property("CATEGORIES", tag);
+        }
         for alarm in self.alarms_for(task) {
             todo.alarm(alarm);
         }
@@ -329,6 +336,7 @@ mod tests {
             deadline: None,
             done: false,
             reminder_leads: Vec::new(),
+            tags: Vec::new(),
             object_url: None,
             last_modified: None,
         }
@@ -439,6 +447,22 @@ mod tests {
         let ics = renderer().render(&[task("a", "One")]).unwrap();
         assert!(ics.contains("STATUS:NEEDS-ACTION"), "{ics}");
         assert!(ics.contains("PERCENT-COMPLETE:0"), "{ics}");
+    }
+
+    #[test]
+    fn each_tag_is_its_own_category_line() {
+        let mut tagged = task("a", "One");
+        tagged.tags = vec!["Финансы".into(), "Дом, дача".into()];
+        let ics = renderer().render(&[tagged]).unwrap();
+        assert!(ics.contains("CATEGORIES:Финансы\r\n"), "{ics}");
+        // The comma inside a name is escaped, so it stays one category.
+        assert!(ics.contains("CATEGORIES:Дом\\, дача\r\n"), "{ics}");
+    }
+
+    #[test]
+    fn an_untagged_task_has_no_categories() {
+        let ics = renderer().render(&[task("a", "One")]).unwrap();
+        assert!(!ics.contains("CATEGORIES"), "{ics}");
     }
 
     #[test]

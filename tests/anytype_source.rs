@@ -30,6 +30,7 @@ fn properties() -> PropertiesConfig {
         deadline: PropertySelector::Key("due_date".into()),
         done: PropertySelector::Key("done".into()),
         reminder: None,
+        tags: None,
     }
 }
 
@@ -69,6 +70,24 @@ fn object_with_reminders(id: &str, names: &[&str]) -> String {
               "multi_select":[{tags}]}}
           ]
         }}"#
+    )
+}
+
+fn object_with_tags(id: &str, names: &[&str]) -> String {
+    object_with_reminders(id, &[]).replace(
+        r#"{"name":"Напомнить","key":"reminder_lead","id":"p-rem","format":"multi_select",
+              "multi_select":[]}"#,
+        &format!(
+            r#"{{"name":"Tag","key":"tag","id":"p-tag","format":"multi_select","multi_select":[{}]}}"#,
+            names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| format!(
+                    r#"{{"id":"g-{i}","key":"g_{i}","name":"{name}","color":"teal"}}"#
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
     )
 }
 
@@ -126,6 +145,27 @@ async fn source_with(
         properties,
     )
     .expect("client builds")
+}
+
+#[tokio::test]
+async fn tag_options_become_category_names() {
+    let fixture = ScriptedHttpFixture::start(vec![page(
+        &object_with_tags("a", &["Финансы", "Семья"]),
+        false,
+        1,
+    )])
+    .await
+    .expect("fixture starts");
+    let properties = PropertiesConfig {
+        tags: Some(PropertySelector::Key("tag".into())),
+        ..properties()
+    };
+    let source = source_with(&fixture, 5000, properties).await;
+
+    let batch = source.list_tasks().await.expect("lists tasks");
+
+    assert_eq!(batch.tasks[0].tags, vec!["Финансы", "Семья"]);
+    assert!(batch.warnings.is_empty(), "{:?}", batch.warnings);
 }
 
 #[tokio::test]

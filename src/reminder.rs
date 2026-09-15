@@ -121,6 +121,7 @@ mod tests {
             deadline: None,
             done: false,
             reminder_leads: Vec::new(),
+            tags: Vec::new(),
             object_url: None,
             last_modified: None,
         }

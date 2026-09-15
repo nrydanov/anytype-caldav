@@ -64,6 +64,8 @@ pub struct Task {
     /// Lead times chosen on the task itself. Empty means "use the configured
     /// default"; several values mean several reminders.
     pub reminder_leads: Vec<chrono::Duration>,
+    /// Option names of the tags property, in Anytype's order.
+    pub tags: Vec<String>,
     pub object_url: Option<String>,
     pub last_modified: Option<DateTime<Utc>>,
 }
@@ -187,6 +189,7 @@ mod tests {
             deadline: None,
             done: false,
             reminder_leads: Vec::new(),
+            tags: Vec::new(),
             object_url: None,
             last_modified: None,
         };

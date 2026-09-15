@@ -170,6 +170,7 @@ impl AnytypeTaskSource {
         let deadline = self.read_date(object, &self.properties.deadline, "deadline", warnings)?;
         let done = self.read_done(object)?;
         let reminder_leads = self.read_reminder_leads(object, warnings)?;
+        let tags = self.read_tags(object, warnings)?;
 
         let last_modified = object
             .get_property_date("last_modified_date")
@@ -182,6 +183,7 @@ impl AnytypeTaskSource {
             deadline,
             done,
             reminder_leads,
+            tags,
             object_url: Some(object.get_link()),
             last_modified,
         })
@@ -234,6 +236,38 @@ impl AnytypeTaskSource {
             }
         }
         Ok(leads)
+    }
+
+    /// Reads tag option names, if the property is configured. A wrong format
+    /// costs the tags of that task, never the task.
+    fn read_tags(
+        &self,
+        object: &Object,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<String>, SourceError> {
+        let Some(selector) = self.properties.tags.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let Some(property) = resolve_property(&object.properties, selector, "tags")? else {
+            return Ok(Vec::new());
+        };
+        let tags = match &property.value {
+            PropertyValue::MultiSelect { multi_select } => multi_select.as_slice(),
+            PropertyValue::Select { select } => std::slice::from_ref(select),
+            other => {
+                warnings.push(format!(
+                    "object {} has tags of format {:?}, expected a select; tags omitted",
+                    object.id,
+                    other.format()
+                ));
+                return Ok(Vec::new());
+            }
+        };
+        Ok(tags
+            .iter()
+            .map(|tag| tag.name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect())
     }
 
     /// A malformed date costs that one value, not the whole task.

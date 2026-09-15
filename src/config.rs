@@ -151,6 +151,7 @@ struct RawProperties {
     deadline: String,
     done: String,
     reminder: Option<String>,
+    tags: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,6 +317,8 @@ pub struct PropertiesConfig {
     /// Optional per-task lead times. Without it every task uses
     /// `reminders.lead_time`.
     pub reminder: Option<PropertySelector>,
+    /// Optional tags, written as one `CATEGORIES` line per option name.
+    pub tags: Option<PropertySelector>,
 }
 
 #[derive(Debug, Clone)]
@@ -416,6 +419,12 @@ impl Config {
             .as_deref()
             .map(|value| PropertySelector::parse("reminder", value))
             .transpose()?;
+        let tags = raw
+            .properties
+            .tags
+            .as_deref()
+            .map(|value| PropertySelector::parse("tags", value))
+            .transpose()?;
         // Two selectors pointing at one property would silently map one source
         // value onto two calendar fields.
         let mut selectors = vec![
@@ -425,6 +434,9 @@ impl Config {
         ];
         if let Some(reminder) = &reminder {
             selectors.push(("reminder", reminder));
+        }
+        if let Some(tags) = &tags {
+            selectors.push(("tags", tags));
         }
         for (index, (an, a)) in selectors.iter().enumerate() {
             for (bn, b) in &selectors[index + 1..] {
@@ -567,6 +579,7 @@ impl Config {
                 deadline,
                 done,
                 reminder,
+                tags,
             },
             calendar: CalendarConfig {
                 timezone,

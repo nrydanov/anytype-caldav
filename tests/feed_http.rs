@@ -100,6 +100,7 @@ fn task(id: &str, name: &str) -> Task {
         deadline: None,
         done: false,
         reminder_leads: Vec::new(),
+        tags: Vec::new(),
         object_url: Some(format!("anytype://object?objectId={id}")),
         last_modified: Some(Utc.with_ymd_and_hms(2026, 8, 29, 12, 0, 0).unwrap()),
     }

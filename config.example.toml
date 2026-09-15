@@ -24,6 +24,9 @@ done      = "key:done"
 # Anytype snake_cases option keys, so the name is what gets parsed. Tasks that
 # leave it empty use reminders.lead_time below.
 # reminder = "id:<opaque-id>"
+# Optional. A select/multi-select whose option names become CATEGORIES, one
+# line per tag. Calino colours tasks by category name.
+# tags = "id:<opaque-id>"
 
 [calendar]
 timezone = "Europe/Saratov"
