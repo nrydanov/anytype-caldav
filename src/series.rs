@@ -14,8 +14,11 @@
 use std::{
     collections::HashSet,
     str::FromStr,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use anytype::{
@@ -28,7 +31,7 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 use futures::StreamExt;
 use rrule::RRuleSet;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::{
     model::{AnytypeDate, CalendarValue},
@@ -57,6 +60,8 @@ pub struct Series {
 /// A task that belongs to a series.
 #[derive(Debug, Clone)]
 pub struct Instance {
+    /// The task's own id, kept for the log: which task satisfied an occurrence.
+    pub object_id: String,
     pub series_id: String,
     pub occurrence: Option<AnytypeDate>,
 }
@@ -139,6 +144,14 @@ pub fn plan<'a>(
     let mut warnings = Vec::new();
     for one in series {
         let (Some(rule), Some(anchor)) = (&one.rrule, &one.anchor) else {
+            debug!(
+                series_id = %one.id,
+                series = %one.name,
+                rrule = ?one.rrule,
+                anchor = ?one.anchor.as_ref().map(|a| &a.raw),
+                decision = "skip: missing rule or start date",
+                "series decision"
+            );
             warnings.push(format!(
                 "{:?}: no rule or no start date, nothing to generate",
                 one.name
@@ -147,19 +160,57 @@ pub fn plan<'a>(
         };
         let next = match next_after(rule, anchor, tz, today) {
             Ok(Some(next)) => next,
-            Ok(None) => continue,
+            Ok(None) => {
+                debug!(
+                    series_id = %one.id,
+                    series = %one.name,
+                    rrule = %rule,
+                    anchor = %anchor.raw,
+                    %today,
+                    decision = "skip: rule has no occurrence after today",
+                    "series decision"
+                );
+                continue;
+            }
             Err(err) => {
+                debug!(
+                    series_id = %one.id,
+                    series = %one.name,
+                    rrule = %rule,
+                    anchor = %anchor.raw,
+                    error = %err,
+                    decision = "skip: rule does not parse",
+                    "series decision"
+                );
                 warnings.push(format!("{:?}: bad rule {err}", one.name));
                 continue;
             }
         };
-        let exists = instances.iter().any(|instance| {
-            instance.series_id == one.id
-                && instance
-                    .occurrence
-                    .as_ref()
-                    .is_some_and(|date| date.parsed.with_timezone(&tz).date_naive() == next.1)
+        let own: Vec<&Instance> = instances.iter().filter(|i| i.series_id == one.id).collect();
+        let matching = own.iter().find(|instance| {
+            instance
+                .occurrence
+                .as_ref()
+                .is_some_and(|date| date.parsed.with_timezone(&tz).date_naive() == next.1)
         });
+        let exists = matching.is_some();
+        debug!(
+            series_id = %one.id,
+            series = %one.name,
+            rrule = %rule,
+            anchor = %anchor.raw,
+            %today,
+            next_day = %next.1,
+            next_utc = %next.0,
+            instances = own.len(),
+            instance_days = ?own
+                .iter()
+                .map(|i| i.occurrence.as_ref().map(|d| d.parsed.with_timezone(&tz).date_naive().to_string()))
+                .collect::<Vec<_>>(),
+            matched_instance = ?matching.map(|i| &i.object_id),
+            decision = if exists { "skip: next occurrence already has a task" } else { "create" },
+            "series decision"
+        );
         if !exists {
             planned.push(Planned {
                 series: one,
@@ -183,20 +234,37 @@ impl AnytypeSeries {
     }
 
     async fn objects(&self, type_key: &str) -> Result<Vec<Object>, SeriesError> {
+        let started = Instant::now();
+        debug!(type_key, space_id = %self.space_id, "anytype search started");
         let paged = self
             .client
             .search_in(&self.space_id)
             .types([type_key])
             .execute()
-            .await?;
+            .await
+            .inspect_err(|err| {
+                error!(type_key, error = %err, elapsed_ms = started.elapsed().as_millis(), "anytype search failed");
+            })?;
         let mut stream = paged.into_stream();
         let mut objects = Vec::new();
+        let mut archived = 0usize;
         while let Some(object) = stream.next().await {
-            let object = object?;
-            if !object.archived {
+            let object = object.inspect_err(|err| {
+                error!(type_key, error = %err, read = objects.len(), "anytype search page failed");
+            })?;
+            if object.archived {
+                archived += 1;
+            } else {
                 objects.push(object);
             }
         }
+        debug!(
+            type_key,
+            live = objects.len(),
+            archived,
+            elapsed_ms = started.elapsed().as_millis(),
+            "anytype search finished"
+        );
         Ok(objects)
     }
 
@@ -225,8 +293,12 @@ impl AnytypeSeries {
             let Some(links) = object.get_property_array("series") else {
                 continue;
             };
+            if links.len() > 1 {
+                warn!(task_id = %object.id, task = ?object.name, series = ?links, "task links to more than one series; it counts for each");
+            }
             for series_id in links {
                 instances.push(Instance {
+                    object_id: object.id.clone(),
                     series_id,
                     occurrence: date(&object, "occurrence"),
                 });
@@ -238,6 +310,17 @@ impl AnytypeSeries {
     /// Creates the task for one occurrence, copying what the series carries.
     pub async fn create(&self, planned: &Planned<'_>) -> Result<String, SeriesError> {
         let series = planned.series;
+        let started = Instant::now();
+        debug!(
+            series_id = %series.id,
+            series = %series.name,
+            occurrence = %planned.occurrence,
+            day = %planned.day,
+            priority = ?series.priority,
+            tags = ?series.tags,
+            reminder_leads = ?series.reminder_leads,
+            "anytype create task started"
+        );
         let mut request = self
             .client
             .new_object(&self.space_id, TASK_TYPE)
@@ -254,7 +337,22 @@ impl AnytypeSeries {
         if !series.reminder_leads.is_empty() {
             request = request.set_multi_select("reminder_lead", series.reminder_leads.clone());
         }
-        Ok(request.create().await?.id)
+        let object = request.create().await.inspect_err(|err| {
+            error!(
+                series_id = %series.id,
+                day = %planned.day,
+                error = %err,
+                elapsed_ms = started.elapsed().as_millis(),
+                "anytype create task failed"
+            );
+        })?;
+        debug!(
+            series_id = %series.id,
+            task_id = %object.id,
+            elapsed_ms = started.elapsed().as_millis(),
+            "anytype create task finished"
+        );
+        Ok(object.id)
     }
 }
 
@@ -267,6 +365,7 @@ pub struct SeriesGenerator {
     /// Warnings already logged, so a series without a date does not repeat
     /// itself every five minutes.
     reported: Mutex<HashSet<String>>,
+    passes: AtomicU64,
 }
 
 impl SeriesGenerator {
@@ -282,6 +381,7 @@ impl SeriesGenerator {
             tz,
             poll_interval,
             reported: Mutex::new(HashSet::new()),
+            passes: AtomicU64::new(0),
         }
     }
 
@@ -292,35 +392,100 @@ impl SeriesGenerator {
     /// search, and it keeps a task the user deleted from coming back. A failed
     /// create releases its claim so the next pass retries.
     pub async fn check_at(&self, now: DateTime<Utc>) -> Result<usize, SeriesError> {
+        let pass = self.passes.fetch_add(1, Ordering::Relaxed) + 1;
+        self.check_inner(now)
+            .instrument(info_span!("generator_pass", pass))
+            .await
+    }
+
+    async fn check_inner(&self, now: DateTime<Utc>) -> Result<usize, SeriesError> {
+        let started = Instant::now();
         let today = now.with_timezone(&self.tz).date_naive();
+        debug!(%now, %today, tz = %self.tz, "generator pass started");
         let series = self.source.series().await?;
         let instances = self.source.instances().await?;
         let (planned, warnings) = plan(&series, &instances, self.tz, today);
 
         if let Ok(mut reported) = self.reported.lock() {
-            for warning in warnings {
+            for warning in &warnings {
                 if reported.insert(warning.clone()) {
                     warn!(%warning, "recurring task skipped");
+                } else {
+                    debug!(%warning, "recurring task skipped (already reported)");
                 }
             }
         }
 
-        let mut created = 0;
+        let planned_count = planned.len();
+        let (mut created, mut already, mut failed) = (0usize, 0usize, 0usize);
         for one in planned {
-            if !self.state.claim_instance(&one.series.id, one.day)? {
-                debug!(series = %one.series.name, day = %one.day, "already created once");
+            let claimed = self.state.claim_instance(&one.series.id, one.day).inspect_err(|err| {
+                error!(series_id = %one.series.id, day = %one.day, error = %err, "cannot claim occurrence");
+            })?;
+            if !claimed {
+                // Either created by an earlier pass and not yet visible to
+                // search, or created and then deleted by hand.
+                info!(
+                    series_id = %one.series.id,
+                    series = %one.series.name,
+                    day = %one.day,
+                    "occurrence already claimed; not creating it again"
+                );
+                already += 1;
                 continue;
             }
+            debug!(series_id = %one.series.id, day = %one.day, "occurrence claimed");
             match self.source.create(&one).await {
                 Ok(id) => {
-                    info!(series = %one.series.name, day = %one.day, %id, "created recurring task");
+                    info!(
+                        series_id = %one.series.id,
+                        series = %one.series.name,
+                        day = %one.day,
+                        occurrence = %one.occurrence,
+                        task_id = %id,
+                        "created recurring task"
+                    );
                     created += 1;
                 }
                 Err(err) => {
-                    error!(series = %one.series.name, day = %one.day, error = %err, "cannot create recurring task");
-                    self.state.release_instance(&one.series.id, one.day)?;
+                    error!(
+                        series_id = %one.series.id,
+                        series = %one.series.name,
+                        day = %one.day,
+                        error = %err,
+                        "cannot create recurring task; releasing the claim so the next pass retries"
+                    );
+                    failed += 1;
+                    self.state
+                        .release_instance(&one.series.id, one.day)
+                        .inspect_err(|err| {
+                            error!(series_id = %one.series.id, day = %one.day, error = %err, "cannot release claim; this occurrence will not be retried");
+                        })?;
                 }
             }
+        }
+
+        let summary_is_news = created + failed + already > 0;
+        macro_rules! summary {
+            ($level:ident) => {
+                $level!(
+                    %today,
+                    series = series.len(),
+                    instances = instances.len(),
+                    warnings = warnings.len(),
+                    planned = planned_count,
+                    created,
+                    already_claimed = already,
+                    failed,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "generator pass finished"
+                )
+            };
+        }
+        if summary_is_news {
+            summary!(info);
+        } else {
+            summary!(debug);
         }
         Ok(created)
     }
@@ -330,9 +495,8 @@ impl SeriesGenerator {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            match self.check_at(Utc::now()).await {
-                Ok(created) => debug!(created, "generator check completed"),
-                Err(err) => warn!(error = %err, "generator check failed"),
+            if let Err(err) = self.check_at(Utc::now()).await {
+                error!(error = %err, error_debug = ?err, "generator pass failed; retrying next interval");
             }
         }
     }
@@ -387,6 +551,7 @@ mod tests {
 
     fn instance(series_id: &str, occurrence: &str) -> Instance {
         Instance {
+            object_id: format!("task-of-{series_id}"),
             series_id: series_id.into(),
             occurrence: Some(at(occurrence)),
         }

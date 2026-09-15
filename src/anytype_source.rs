@@ -10,7 +10,7 @@ use anytype::{
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::StreamExt;
-use tracing::warn;
+use tracing::{debug, error, warn};
 
 use crate::{
     config::{AnytypeConfig, PropertiesConfig, PropertySelector},
@@ -58,18 +58,26 @@ impl AnytypeTaskSource {
 #[async_trait]
 impl TaskSource for AnytypeTaskSource {
     async fn list_tasks(&self) -> Result<TaskBatch, SourceError> {
+        let started = std::time::Instant::now();
+        debug!(space_id = %self.config.space_id, type_key = %self.config.type_key, "anytype task listing started");
         let paged = self
             .client
             .search_in(&self.config.space_id)
             .types([self.config.type_key.as_str()])
             .execute()
             .await
-            .map_err(|err| SourceError::Transport(err.to_string()))?;
+            .map_err(|err| {
+                error!(error = %err, error_debug = ?err, elapsed_ms = started.elapsed().as_millis(), "anytype task search failed");
+                SourceError::Transport(err.to_string())
+            })?;
 
         let mut objects = Vec::new();
         let mut stream = paged.into_stream();
         while let Some(item) = stream.next().await {
-            let object = item.map_err(|err| SourceError::Transport(err.to_string()))?;
+            let object = item.map_err(|err| {
+                error!(error = %err, error_debug = ?err, read = objects.len(), "anytype task page failed");
+                SourceError::Transport(err.to_string())
+            })?;
             if objects.len() >= self.config.max_objects {
                 return Err(SourceError::TooManyObjects(format!(
                     "space {} holds more than max_objects = {} objects of type {}",
@@ -85,10 +93,20 @@ impl TaskSource for AnytypeTaskSource {
 
         self.verify_schema(&live)?;
 
+        let archived = objects.len() - live.len();
         let mut batch = TaskBatch::default();
         for object in live {
             batch.tasks.push(self.to_task(object, &mut batch.warnings)?);
         }
+        debug!(
+            objects = objects.len(),
+            archived,
+            tasks = batch.tasks.len(),
+            warnings = batch.warnings.len(),
+            done = batch.tasks.iter().filter(|t| t.done).count(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "anytype task listing finished"
+        );
         Ok(batch)
     }
 }

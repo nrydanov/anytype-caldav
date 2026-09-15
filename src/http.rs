@@ -4,12 +4,13 @@ use std::{sync::Arc, time::SystemTime};
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use tracing::{debug, error};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     feed::{FeedService, Outcome, Snapshot},
@@ -43,7 +44,58 @@ pub fn router(state: AppState, feed_path: &str) -> Router {
             .route(&format!("{prefix}/push/test"), post(push_test));
     }
 
-    router.with_state(state)
+    let prefix = secret_prefix(feed_path);
+    router
+        .with_state(state)
+        .layer(middleware::from_fn(move |request: Request, next: Next| {
+            let prefix = prefix.clone();
+            async move { log_request(&prefix, request, next).await }
+        }))
+}
+
+/// One line per request: enough to line a client's behaviour up with the
+/// passes around it, never the secret part of the path.
+async fn log_request(prefix: &str, request: Request, next: Next) -> Response {
+    let started = std::time::Instant::now();
+    let method = request.method().clone();
+    let path = redact_prefix(request.uri().path(), prefix);
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let user_agent = request
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|ua| ua.chars().take(120).collect::<String>());
+    let conditional = request.headers().contains_key(header::IF_NONE_MATCH);
+
+    let response = next.run(request).await;
+
+    let status = response.status();
+    let elapsed_ms = started.elapsed().as_millis();
+    if status.is_server_error() {
+        warn!(%method, %path, status = status.as_u16(), elapsed_ms, ?origin, ?user_agent, conditional, "http request");
+    } else if path == "/healthz" {
+        debug!(%method, %path, status = status.as_u16(), elapsed_ms, "http request");
+    } else {
+        info!(%method, %path, status = status.as_u16(), elapsed_ms, ?origin, ?user_agent, conditional, "http request");
+    }
+    response
+}
+
+/// `path` with the feed's secret prefix replaced, safe to log. The prefix is
+/// the only thing protecting the feed on a public bind.
+pub fn redact(path: &str, feed_path: &str) -> String {
+    redact_prefix(path, &secret_prefix(feed_path))
+}
+
+fn redact_prefix(path: &str, prefix: &str) -> String {
+    match path.strip_prefix(prefix) {
+        Some(rest) if !prefix.is_empty() => format!("/[secret]{rest}"),
+        _ => path.to_string(),
+    }
 }
 
 /// Everything before the final path segment: `/f/<token>/todos.ics` yields
@@ -269,4 +321,29 @@ fn apply_cors(response: &mut Response, state: &AppState, request_headers: &Heade
         HeaderValue::from_static("ETag, X-Exporter-Stale"),
     );
     out.insert(header::VARY, HeaderValue::from_static("Origin"));
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    #[test]
+    fn the_secret_prefix_never_reaches_the_log() {
+        let feed = "/f/0123456789abcdef/todos.ics";
+        assert_eq!(super::redact(feed, feed), "/[secret]/todos.ics");
+        assert_eq!(
+            super::redact("/f/0123456789abcdef/push/subscribe", feed),
+            "/[secret]/push/subscribe"
+        );
+        assert_eq!(super::redact("/healthz", feed), "/healthz");
+        for line in [
+            super::redact(feed, feed),
+            super::redact("/f/0123456789abcdef/push/key", feed),
+        ] {
+            assert!(!line.contains("0123456789abcdef"), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_root_feed_path_has_nothing_to_hide() {
+        assert_eq!(super::redact("/todos.ics", "/todos.ics"), "/todos.ics");
+    }
 }

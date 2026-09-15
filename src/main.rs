@@ -61,6 +61,27 @@ fn main() -> std::process::ExitCode {
         )
         .init();
 
+    // A panic inside a spawned task ends only that task: without this hook the
+    // generator or the scheduler could stop silently while the feed keeps
+    // answering, and nothing in the journal would say when or why.
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "(non-string panic payload)".into());
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_default();
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .to_string();
+        tracing::error!(%payload, %location, %thread, backtrace = %std::backtrace::Backtrace::force_capture(), "panic");
+    }));
+
     let args = Args::parse();
 
     let api_key = match std::env::var(API_KEY_ENV) {
@@ -171,6 +192,16 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         min_refresh_interval = ?config.server.min_refresh_interval,
         request_timeout = ?config.server.request_timeout,
         allowed_origins = ?config.server.allowed_origins,
+        feed_path = %http::redact(&config.server.feed_path, &config.server.feed_path),
+        version = env!("CARGO_PKG_VERSION"),
+        reminders_enabled = config.reminders.enabled,
+        push_enabled = config.push.enabled,
+        push_poll_interval = ?config.push.poll_interval,
+        state_file = ?config.push.state_file,
+        series_enabled = config.series.enabled,
+        series_poll_interval = ?config.series.poll_interval,
+        tags_selector = config.properties.tags.is_some(),
+        reminder_selector = config.properties.reminder.is_some(),
         "starting anytype-task-exporter"
     );
 
@@ -271,14 +302,29 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
     info!(
         listen = %config.server.listen,
-        feed_path = %config.server.feed_path,
+        feed_path = %http::redact(&config.server.feed_path, &config.server.feed_path),
         "listening"
     );
 
     let serve_result = axum::serve(listener, http::router(state, &config.server.feed_path))
         .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("shutting down");
+            // systemd stops the service with SIGTERM; logging which signal
+            // arrived separates a restart from a crash in the journal.
+            #[cfg(unix)]
+            {
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("SIGTERM handler installs");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => info!(signal = "SIGINT", "shutting down"),
+                    _ = term.recv() => info!(signal = "SIGTERM", "shutting down"),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+                info!("shutting down");
+            }
         })
         .await;
 

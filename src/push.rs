@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use web_push::{
     ContentEncoding, HyperWebPushClient, SubscriptionInfo, VapidSignatureBuilder, WebPushClient,
     WebPushMessageBuilder,
@@ -142,20 +142,32 @@ impl PushService {
         let mut delivered = 0;
         let mut gone = Vec::new();
         for subscription in &targets {
+            let started = std::time::Instant::now();
+            let endpoint = truncate(&subscription.endpoint);
             match self.send(subscription, notification).await {
-                Ok(()) => delivered += 1,
+                Ok(()) => {
+                    delivered += 1;
+                    debug!(%endpoint, tag = ?notification.tag, elapsed_ms = started.elapsed().as_millis(), "push delivered");
+                }
                 Err(PushError::Rejected(message)) if message.contains("410") => {
                     // The browser dropped this subscription; stop keeping it.
-                    warn!(endpoint = %truncate(&subscription.endpoint), "subscription is gone");
+                    warn!(%endpoint, %message, "subscription is gone");
                     gone.push(subscription.endpoint.clone());
                 }
-                Err(err) => warn!(error = %err, "push delivery failed"),
+                Err(err) => {
+                    warn!(%endpoint, error = %err, error_debug = ?err, elapsed_ms = started.elapsed().as_millis(), "push delivery failed")
+                }
             }
         }
 
         for endpoint in gone {
-            if let Err(err) = self.state.remove_subscription(&endpoint) {
-                warn!(error = %err, endpoint = %truncate(&endpoint), "cannot remove gone subscription");
+            match self.state.remove_subscription(&endpoint) {
+                Ok(removed) => {
+                    info!(endpoint = %truncate(&endpoint), removed, "removed gone subscription")
+                }
+                Err(err) => {
+                    warn!(error = %err, endpoint = %truncate(&endpoint), "cannot remove gone subscription")
+                }
             }
         }
 

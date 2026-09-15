@@ -1,11 +1,17 @@
 //! Background delivery of task reminders through Web Push.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use chrono_tz::Tz;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
 use crate::{
     config::{CalendarConfig, RemindersConfig},
@@ -65,6 +71,7 @@ pub struct PushScheduler {
     poll_interval: Duration,
     late_window: chrono::Duration,
     request_timeout: Duration,
+    passes: AtomicU64,
 }
 
 impl PushScheduler {
@@ -88,14 +95,28 @@ impl PushScheduler {
             poll_interval,
             late_window,
             request_timeout,
+            passes: AtomicU64::new(0),
         }
     }
 
     /// Performs one fresh Anytype read and handles every reminder now due.
     pub async fn check_at(&self, now: DateTime<Utc>) -> Result<CheckReport, SchedulerError> {
+        let pass = self.passes.fetch_add(1, Ordering::Relaxed) + 1;
+        self.check_inner(now)
+            .instrument(info_span!("scheduler_pass", pass))
+            .await
+    }
+
+    async fn check_inner(&self, now: DateTime<Utc>) -> Result<CheckReport, SchedulerError> {
+        let started = Instant::now();
+        debug!(%now, "scheduler pass started");
         let batch = tokio::time::timeout(self.request_timeout, self.source.list_tasks())
             .await
-            .map_err(|_| SchedulerError::Timeout(self.request_timeout))??;
+            .map_err(|_| {
+                error!(timeout = ?self.request_timeout, "scheduler task read timed out");
+                SchedulerError::Timeout(self.request_timeout)
+            })?
+            .inspect_err(|err| error!(error = %err, "scheduler task read failed"))?;
         for warning in &batch.warnings {
             warn!(warning = %warning, "scheduler source reported a malformed value");
         }
@@ -110,15 +131,43 @@ impl PushScheduler {
         // late window, which is exactly the window in which someone installs
         // the app and subscribes.
         let audience = self.sink.audience();
+        debug!(
+            tasks = batch.tasks.len(),
+            audience, "scheduler evaluating reminders"
+        );
         for task in &batch.tasks {
             // A task can carry several lead times, each claimed on its own.
-            for moment in reminders_for(task, &self.calendar, &self.reminders) {
+            let moments = reminders_for(task, &self.calendar, &self.reminders);
+            if moments.is_empty() {
+                continue;
+            }
+            for moment in moments {
                 if moment.trigger_at > now {
+                    // trace: every future reminder, every pass — too many
+                    // lines at debug to keep a useful journal history.
+                    trace!(
+                        object_id = %task.object_id,
+                        task = %task.name,
+                        trigger_at = %moment.trigger_at,
+                        anchor = ?moment.anchor,
+                        in_seconds = moment.trigger_at.signed_duration_since(now).num_seconds(),
+                        decision = "wait: trigger in the future",
+                        "reminder decision"
+                    );
                     continue;
                 }
 
-                let expired = now.signed_duration_since(moment.trigger_at) > self.late_window;
+                let late_by = now.signed_duration_since(moment.trigger_at);
+                let expired = late_by > self.late_window;
                 if !expired && audience == 0 {
+                    info!(
+                        object_id = %task.object_id,
+                        task = %task.name,
+                        trigger_at = %moment.trigger_at,
+                        late_by_seconds = late_by.num_seconds(),
+                        decision = "hold: due but nobody is subscribed",
+                        "reminder decision"
+                    );
                     report.waiting += 1;
                     continue;
                 }
@@ -127,10 +176,21 @@ impl PushScheduler {
                 } else {
                     ReminderOutcome::Attempted
                 };
-                if !self
+                let claimed = self
                     .state
-                    .claim_reminder(&task.object_id, moment.trigger_at, outcome)?
-                {
+                    .claim_reminder(&task.object_id, moment.trigger_at, outcome)
+                    .inspect_err(|err| {
+                        error!(object_id = %task.object_id, trigger_at = %moment.trigger_at, error = %err, "cannot claim reminder");
+                    })?;
+                if !claimed {
+                    // trace: a handled reminder stays due forever, so this
+                    // repeats on every pass.
+                    trace!(
+                        object_id = %task.object_id,
+                        trigger_at = %moment.trigger_at,
+                        decision = "skip: already handled",
+                        "reminder decision"
+                    );
                     continue;
                 }
 
@@ -138,25 +198,66 @@ impl PushScheduler {
                     report.expired += 1;
                     info!(
                         object_id = %task.object_id,
+                        task = %task.name,
                         trigger_at = %moment.trigger_at,
-                        "expired reminder skipped"
+                        late_by_seconds = late_by.num_seconds(),
+                        late_window_seconds = self.late_window.num_seconds(),
+                        decision = "expire: later than the late window",
+                        "reminder decision"
                     );
                     continue;
                 }
 
                 report.attempted += 1;
                 let notification = notification_for(task, moment, now, &self.calendar);
+                debug!(
+                    object_id = %task.object_id,
+                    title = %notification.title,
+                    body = %notification.body,
+                    "reminder notification built"
+                );
                 let (delivered, subscriptions) = self.sink.notify_all(&notification).await;
                 report.delivered += delivered;
                 report.subscriptions += subscriptions;
-                info!(
-                    object_id = %task.object_id,
-                    trigger_at = %moment.trigger_at,
-                    delivered,
-                    subscriptions,
-                    "reminder push attempted"
-                );
+                let log_delivery = |level_ok: bool| {
+                    if level_ok {
+                        info!(
+                            object_id = %task.object_id,
+                            task = %task.name,
+                            trigger_at = %moment.trigger_at,
+                            late_by_seconds = late_by.num_seconds(),
+                            delivered,
+                            subscriptions,
+                            decision = "send",
+                            "reminder push attempted"
+                        );
+                    } else {
+                        error!(
+                            object_id = %task.object_id,
+                            task = %task.name,
+                            trigger_at = %moment.trigger_at,
+                            delivered,
+                            subscriptions,
+                            "reminder push reached no subscription; the claim is spent and it will not be retried"
+                        );
+                    }
+                };
+                log_delivery(delivered > 0);
             }
+        }
+        let news = report.attempted + report.expired + report.waiting > 0;
+        if news {
+            info!(
+                ?report,
+                elapsed_ms = started.elapsed().as_millis(),
+                "scheduler pass finished"
+            );
+        } else {
+            debug!(
+                ?report,
+                elapsed_ms = started.elapsed().as_millis(),
+                "scheduler pass finished"
+            );
         }
         Ok(report)
     }
@@ -166,9 +267,8 @@ impl PushScheduler {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            match self.check_at(Utc::now()).await {
-                Ok(report) => debug!(?report, "scheduler check completed"),
-                Err(err) => warn!(error = %err, "scheduler check failed"),
+            if let Err(err) = self.check_at(Utc::now()).await {
+                warn!(error = %err, error_debug = ?err, "scheduler pass failed; retrying next interval");
             }
         }
     }
