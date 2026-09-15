@@ -84,6 +84,31 @@ struct RawConfig {
     reminders: RawReminders,
     #[serde(default)]
     push: RawPush,
+    #[serde(default)]
+    series: RawSeries,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSeries {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_series_poll_interval", with = "humantime_serde")]
+    poll_interval: Duration,
+}
+
+impl Default for RawSeries {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval: default_series_poll_interval(),
+        }
+    }
+}
+
+/// The generator only has to act once a day per series; five minutes keeps the
+/// day boundary tight without re-reading every task every 30 seconds.
+fn default_series_poll_interval() -> Duration {
+    Duration::from_secs(300)
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +260,15 @@ pub struct Config {
     pub server: ServerConfig,
     pub reminders: RemindersConfig,
     pub push: PushConfig,
+    pub series: SeriesConfig,
+}
+
+/// The recurring-task generator. Off by default: turning it on is the
+/// switch-over from whatever made these tasks before, and it must not happen on a deploy.
+#[derive(Debug, Clone)]
+pub struct SeriesConfig {
+    pub enabled: bool,
+    pub poll_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -508,6 +542,18 @@ impl Config {
         }
         let push_late_window = chrono::Duration::from_std(raw.push.late_window)
             .map_err(|_| ConfigError::Invalid("push.late_window is out of range".into()))?;
+        // The generator records what it created in the same database, so a
+        // task deleted by hand is not created again.
+        if raw.series.enabled && push_state_file.is_none() {
+            return Err(ConfigError::Invalid(
+                "series.enabled is true but push.state_file is not set".into(),
+            ));
+        }
+        if raw.series.poll_interval.is_zero() {
+            return Err(ConfigError::Invalid(
+                "series.poll_interval must be greater than zero".into(),
+            ));
+        }
 
         Ok(Self {
             anytype: AnytypeConfig {
@@ -545,6 +591,10 @@ impl Config {
                 state_file: push_state_file,
                 poll_interval: raw.push.poll_interval,
                 late_window: push_late_window,
+            },
+            series: SeriesConfig {
+                enabled: raw.series.enabled,
+                poll_interval: raw.series.poll_interval,
             },
         })
     }
@@ -776,6 +826,25 @@ allowed_origins = ["https://calino.io"]
     fn push_requires_a_state_file_when_enabled() {
         let text = format!(
             "{}\n[push]\nenabled = true\nprivate_key_file = \"/tmp/key.pem\"",
+            base()
+        );
+        let err = load(&text).unwrap_err().to_string();
+        assert!(err.contains("push.state_file"), "{err}");
+    }
+
+    #[test]
+    fn the_generator_is_off_unless_asked_for() {
+        let config = load(&base()).expect("valid config");
+        assert!(!config.series.enabled);
+        assert_eq!(config.series.poll_interval, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn the_generator_requires_a_state_file() {
+        let text = format!(
+            "{}
+[series]
+enabled = true",
             base()
         );
         let err = load(&text).unwrap_err().to_string();

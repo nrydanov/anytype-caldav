@@ -5,7 +5,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{Connection, params};
 
 use crate::push::{BrowserSubscription, SubscriptionKeys};
@@ -103,6 +103,15 @@ impl StateStore {
                     outcome TEXT NOT NULL CHECK (outcome IN ('attempted', 'expired')),
                     PRIMARY KEY (object_id, trigger_at_ms)
                 );
+                -- Added without bumping user_version: older binaries check the
+                -- version and ignore unknown tables, so a rollback still opens
+                -- this file.
+                CREATE TABLE IF NOT EXISTS generated_instances (
+                    series_id TEXT NOT NULL,
+                    occurrence_day TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (series_id, occurrence_day)
+                );
                 PRAGMA user_version = 1;",
             )
             .map_err(|source| StateError::Open {
@@ -189,6 +198,26 @@ impl StateStore {
         Ok(changed == 1)
     }
 
+    /// Reserves the task for one occurrence of a series. `false` means it was
+    /// created before — possibly deleted by hand since, which is respected.
+    pub fn claim_instance(&self, series_id: &str, day: NaiveDate) -> Result<bool, StateError> {
+        let changed = self.connection()?.execute(
+            "INSERT OR IGNORE INTO generated_instances (series_id, occurrence_day, created_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![series_id, day.to_string(), Utc::now().timestamp_millis()],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Undoes a claim whose task could not be created, so the next check retries.
+    pub fn release_instance(&self, series_id: &str, day: NaiveDate) -> Result<(), StateError> {
+        self.connection()?.execute(
+            "DELETE FROM generated_instances WHERE series_id = ?1 AND occurrence_day = ?2",
+            params![series_id, day.to_string()],
+        )?;
+        Ok(())
+    }
+
     fn connection(&self) -> Result<MutexGuard<'_, Connection>, StateError> {
         self.connection.lock().map_err(|_| StateError::Poisoned)
     }
@@ -236,6 +265,18 @@ mod tests {
                 auth: auth.into(),
             },
         }
+    }
+
+    #[test]
+    fn an_instance_is_claimed_once_and_can_be_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.sqlite3")).unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 26).unwrap();
+        assert!(store.claim_instance("guitar", day).unwrap());
+        assert!(!store.claim_instance("guitar", day).unwrap());
+        assert!(store.claim_instance("rent", day).unwrap());
+        store.release_instance("guitar", day).unwrap();
+        assert!(store.claim_instance("guitar", day).unwrap());
     }
 
     #[test]

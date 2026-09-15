@@ -268,6 +268,7 @@ dependencies = [
  "ical",
  "icalendar",
  "reqwest",
+ "rrule",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3481,6 +3482,19 @@ dependencies = [
  "serde_derive",
  "typeid",
  "unicode-ident",
+]
+
+[[package]]
+name = "rrule"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "720acfb4980b9d8a6a430f6d7a11933e701ebbeba5eee39cc9d8c5f932aaff74"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "log",
+ "regex",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

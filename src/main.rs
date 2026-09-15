@@ -10,6 +10,7 @@ use anytype_task_exporter::{
     push::PushService,
     render::VTodoRenderer,
     scheduler::PushScheduler,
+    series::{self, AnytypeSeries, SeriesGenerator},
     source::TaskSource,
     state::StateStore,
 };
@@ -41,6 +42,13 @@ enum Command {
     /// is missing. Creates nothing unless --apply is given.
     Init {
         /// Create the missing properties.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Print which recurring tasks need their next instance today. Creates
+    /// nothing unless --apply is given.
+    Generate {
+        /// Create the missing instances.
         #[arg(long)]
         apply: bool,
     },
@@ -92,6 +100,7 @@ fn main() -> std::process::ExitCode {
     let result = match args.command {
         None => runtime.block_on(run(config)),
         Some(Command::Init { apply }) => runtime.block_on(init(config, apply)),
+        Some(Command::Generate { apply }) => runtime.block_on(generate(config, apply)),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -106,6 +115,47 @@ async fn init(config: Config, apply: bool) -> Result<(), Box<dyn std::error::Err
     let client = build_client(&config.anytype)?;
     println!("space {}", config.anytype.space_id);
     install::run(&client, &config.anytype.space_id, apply).await?;
+    Ok(())
+}
+
+async fn generate(config: Config, apply: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let space = AnytypeSeries::new(
+        build_client(&config.anytype)?,
+        config.anytype.space_id.clone(),
+    );
+    let tz = config.calendar.timezone;
+    let today = Utc::now().with_timezone(&tz).date_naive();
+
+    let all = space.series().await?;
+    let instances = space.instances().await?;
+    println!(
+        "space {}: {} series, {} instances, today {today}",
+        config.anytype.space_id,
+        all.len(),
+        instances.len()
+    );
+    let (planned, warnings) = series::plan(&all, &instances, tz, today);
+    for warning in &warnings {
+        println!("  warn    {warning}");
+    }
+    if planned.is_empty() {
+        println!("nothing to create");
+        return Ok(());
+    }
+    for one in &planned {
+        println!(
+            "  create  {:?} for {} ({})",
+            one.series.name, one.day, one.occurrence
+        );
+    }
+    if !apply {
+        println!("dry run: nothing was created; re-run with --apply");
+        return Ok(());
+    }
+    for one in &planned {
+        let id = space.create(one).await?;
+        println!("  created {id}");
+    }
     Ok(())
 }
 
@@ -140,13 +190,18 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         config.server.request_timeout,
     ));
 
+    let durable_state = match config.push.state_file.as_deref() {
+        Some(path) => Some(Arc::new(StateStore::open(path)?)),
+        None => None,
+    };
+
     let (push, scheduler) = match (
         config.push.enabled,
         config.push.private_key_file.as_deref(),
         config.push.state_file.as_deref(),
+        durable_state.clone(),
     ) {
-        (true, Some(key_path), Some(state_path)) => {
-            let durable_state = Arc::new(StateStore::open(state_path)?);
+        (true, Some(key_path), Some(state_path), Some(durable_state)) => {
             let service = PushService::load(key_path, durable_state.clone())?;
             let scheduler = Arc::new(PushScheduler::new(
                 source,
@@ -176,6 +231,24 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         _ => (None, None),
     };
     let scheduler_handle = scheduler.map(|scheduler| tokio::spawn(scheduler.run()));
+
+    // Validation guarantees a state file whenever the generator is enabled.
+    let generator_handle = match (config.series.enabled, durable_state) {
+        (true, Some(durable_state)) => {
+            let generator = Arc::new(SeriesGenerator::new(
+                AnytypeSeries::new(
+                    build_client(&config.anytype)?,
+                    config.anytype.space_id.clone(),
+                ),
+                durable_state,
+                config.calendar.timezone,
+                config.series.poll_interval,
+            ));
+            info!(poll_interval = ?config.series.poll_interval, "recurring task generator enabled");
+            Some(tokio::spawn(generator.run()))
+        }
+        _ => None,
+    };
 
     let state = http::AppState {
         feed,
@@ -209,7 +282,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         })
         .await;
 
-    if let Some(handle) = scheduler_handle {
+    for handle in [scheduler_handle, generator_handle].into_iter().flatten() {
         handle.abort();
         let _ = handle.await;
     }
