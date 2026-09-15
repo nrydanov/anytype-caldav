@@ -28,6 +28,8 @@ pub struct AppState {
     pub push: Option<Arc<PushService>>,
     /// Set when the CalDAV facade is enabled.
     pub caldav: Option<Arc<crate::caldav::Credentials>>,
+    /// Set when the facade accepts writes; without it the collection is read-only.
+    pub writer: Option<Arc<dyn crate::source::TaskWriter>>,
 }
 
 pub fn router(state: AppState, feed_path: &str) -> Router {

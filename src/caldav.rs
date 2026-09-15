@@ -14,8 +14,10 @@
 //! - `/dav/calendars/tasks/`        → collection properties, REPORT
 //! - `/dav/calendars/tasks/<id>.ics` → one task
 //!
-//! Read-only for now: the collection advertises only the `read` privilege, so
-//! Calino shows the calendar as read-only and never attempts a write.
+//! Writes are accepted only when the service was given a `TaskWriter`; the
+//! collection then advertises `write` and Calino allows editing. PUT and DELETE
+//! check `If-Match`/`If-None-Match` against a fresh read of the task, never
+//! against the cached snapshot, which may be up to `min_refresh_interval` old.
 
 use axum::{
     body::Body,
@@ -28,8 +30,10 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::{
-    feed::{Outcome, Snapshot},
+    feed::{Outcome, Snapshot, calino_filename},
     http::AppState,
+    source::SourceError,
+    writeback::{self, WriteError},
 };
 
 pub const BASE: &str = "/dav/";
@@ -148,14 +152,16 @@ pub async fn handle(
             ],
         )]),
         ("PROPFIND", HOME) => {
+            let writable = state.writer.is_some();
             with_snapshot(&state, |snapshot| {
-                multistatus(vec![response(TASKS, &collection_props(snapshot))])
+                multistatus(vec![response(TASKS, &collection_props(snapshot, writable))])
             })
             .await
         }
         ("PROPFIND", TASKS) => {
+            let writable = state.writer.is_some();
             with_snapshot(&state, |snapshot| {
-                let mut responses = vec![response(TASKS, &collection_props(snapshot))];
+                let mut responses = vec![response(TASKS, &collection_props(snapshot, writable))];
                 // Depth 1 also lists members with their ETags, which is how a
                 // generic client finds out what changed without a REPORT.
                 if depth == "1" {
@@ -234,8 +240,16 @@ pub async fn handle(
             })
             .await
         }
+        ("PUT", _) if object_id(&path).is_some() && state.writer.is_some() => {
+            let name = object_id(&path).expect("checked").to_string();
+            put(&state, &name, &headers, &body).await
+        }
+        ("DELETE", _) if object_id(&path).is_some() && state.writer.is_some() => {
+            let name = object_id(&path).expect("checked").to_string();
+            delete(&state, &name, &headers).await
+        }
         ("PUT" | "DELETE" | "PROPPATCH" | "MKCOL" | "MKCALENDAR" | "MOVE" | "COPY", _) => {
-            info!(%method, path = %path, "caldav write refused: the facade is read-only");
+            info!(%method, path = %path, writable = state.writer.is_some(), "caldav write refused");
             status(StatusCode::FORBIDDEN)
         }
         _ => {
@@ -243,6 +257,228 @@ pub async fn handle(
             status(StatusCode::NOT_FOUND)
         }
     }
+}
+
+/// Finds the object behind a resource name in the current snapshot.
+async fn locate(state: &AppState, name: &str) -> Result<Option<String>, Box<Response>> {
+    match state.feed.get().await {
+        Outcome::Fresh(snapshot) | Outcome::Stale(snapshot) => {
+            Ok(snapshot.objects.get(name).map(|r| r.object_id.clone()))
+        }
+        Outcome::Unavailable { category } => Err(Box::new(unavailable(category))),
+    }
+}
+
+fn unavailable(category: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::RETRY_AFTER, "30")
+        .body(Body::from(category.to_string()))
+        .expect("static response")
+}
+
+/// A failed Anytype call. Transport problems are 503 so Calino keeps the change
+/// queued and retries; a schema problem will not heal by retrying.
+fn source_failure(err: &SourceError) -> Response {
+    match err {
+        SourceError::Transport(_) | SourceError::TooManyObjects(_) => {
+            unavailable("anytype unavailable")
+        }
+        SourceError::Schema(_) => status(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+fn header_text(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string())
+}
+
+fn precondition_failed(reason: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::PRECONDITION_FAILED)
+        .body(Body::from(reason.to_string()))
+        .expect("static response")
+}
+
+async fn put(state: &AppState, name: &str, headers: &HeaderMap, body: &str) -> Response {
+    let writer = state.writer.as_ref().expect("routed only with a writer");
+    let if_match = header_text(headers, header::IF_MATCH).filter(|v| v != "*");
+    let if_none_match = header_text(headers, header::IF_NONE_MATCH);
+
+    let incoming = match writeback::parse(body) {
+        Ok(incoming) => incoming,
+        Err(err @ WriteError::NotCalendar(_)) => {
+            warn!(resource = name, error = %err, body_bytes = body.len(), "caldav put: unreadable body");
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(err.to_string()))
+                .expect("static response");
+        }
+        Err(err) => {
+            warn!(resource = name, error = %err, "caldav put: unsupported body");
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::from(err.to_string()))
+                .expect("static response");
+        }
+    };
+    debug!(
+        resource = name,
+        ?incoming,
+        ?if_match,
+        ?if_none_match,
+        "caldav put parsed"
+    );
+
+    let existing = match locate(state, name).await {
+        Ok(existing) => existing,
+        Err(response) => return *response,
+    };
+
+    let Some(object_id) = existing else {
+        return create(state, name, if_match, &incoming).await;
+    };
+
+    // A fresh read decides the precondition and the patch: the snapshot may be
+    // older than an edit made in Anytype a moment ago.
+    let current = match writer.get_task(&object_id).await {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            info!(resource = name, %object_id, "caldav put: task vanished since the snapshot");
+            state.feed.invalidate();
+            return if if_match.is_some() {
+                precondition_failed("resource no longer exists")
+            } else {
+                create(state, name, None, &incoming).await
+            };
+        }
+        Err(err) => return source_failure(&err),
+    };
+    let current_etag = state.feed.resource_for(&current).etag;
+    if if_none_match.as_deref() == Some("*") {
+        warn!(resource = name, %object_id, "caldav put: If-None-Match * on an existing resource");
+        return precondition_failed("resource exists");
+    }
+    if let Some(expected) = &if_match
+        && expected != &current_etag
+    {
+        warn!(resource = name, %object_id, client_etag = %expected, server_etag = %current_etag, "caldav put: stale etag");
+        return precondition_failed("etag mismatch");
+    }
+
+    let renderer = state.feed.renderer();
+    let patch = writeback::for_update(
+        &current,
+        &renderer.wire(&current),
+        &incoming,
+        renderer.config(),
+    );
+    if patch.is_empty() {
+        info!(resource = name, %object_id, "caldav put: nothing changed");
+    } else {
+        info!(resource = name, %object_id, ?patch, "caldav put: updating task");
+        if let Err(err) = writer.update_task(&object_id, &patch).await {
+            return source_failure(&err);
+        }
+        state.feed.invalidate();
+    }
+    written(state, &object_id, StatusCode::NO_CONTENT).await
+}
+
+async fn create(
+    state: &AppState,
+    name: &str,
+    if_match: Option<String>,
+    incoming: &writeback::Incoming,
+) -> Response {
+    let writer = state.writer.as_ref().expect("routed only with a writer");
+    if if_match.is_some() {
+        info!(
+            resource = name,
+            "caldav put: If-Match on a missing resource"
+        );
+        return precondition_failed("resource does not exist");
+    }
+    let Some(uid) = incoming.uid.clone() else {
+        warn!(resource = name, "caldav put: new task without UID");
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("VTODO has no UID"))
+            .expect("static response");
+    };
+    // The task will be served under the name derived from its UID; a client
+    // that PUT it elsewhere would never find it again.
+    if calino_filename(&uid) != name {
+        warn!(resource = name, %uid, expected = %calino_filename(&uid), "caldav put: resource name does not match UID");
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from("resource name must be derived from the UID"))
+            .expect("static response");
+    }
+    let patch = writeback::for_create(incoming, state.feed.renderer().config());
+    info!(resource = name, %uid, ?patch, "caldav put: creating task");
+    let object_id = match writer.create_task(&uid, &patch).await {
+        Ok(id) => id,
+        Err(err) => return source_failure(&err),
+    };
+    state.feed.invalidate();
+    written(state, &object_id, StatusCode::CREATED).await
+}
+
+/// Answers a successful write with the new ETag, read back from Anytype, so
+/// the client does not need a PROPFIND to learn it.
+async fn written(state: &AppState, object_id: &str, code: StatusCode) -> Response {
+    let writer = state.writer.as_ref().expect("routed only with a writer");
+    let mut builder = Response::builder().status(code);
+    match writer.get_task(object_id).await {
+        Ok(Some(task)) => {
+            let etag = state.feed.resource_for(&task).etag;
+            info!(%object_id, %etag, status = code.as_u16(), "caldav write done");
+            builder = builder.header(header::ETAG, etag);
+        }
+        other => {
+            // The write happened; only the ETag is unknown. Calino recovers it
+            // with a PROPFIND.
+            warn!(%object_id, result = ?other.map(|t| t.is_some()), "caldav write done but reading it back failed");
+        }
+    }
+    builder.body(Body::empty()).expect("static response")
+}
+
+async fn delete(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
+    let writer = state.writer.as_ref().expect("routed only with a writer");
+    let if_match = header_text(headers, header::IF_MATCH).filter(|v| v != "*");
+    let object_id = match locate(state, name).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            info!(resource = name, "caldav delete: already gone");
+            return status(StatusCode::NOT_FOUND);
+        }
+        Err(response) => return *response,
+    };
+    let current = match writer.get_task(&object_id).await {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            state.feed.invalidate();
+            return status(StatusCode::NOT_FOUND);
+        }
+        Err(err) => return source_failure(&err),
+    };
+    let current_etag = state.feed.resource_for(&current).etag;
+    if let Some(expected) = &if_match
+        && expected != &current_etag
+    {
+        warn!(resource = name, %object_id, client_etag = %expected, server_etag = %current_etag, "caldav delete: stale etag");
+        return precondition_failed("etag mismatch");
+    }
+    info!(resource = name, %object_id, task = %current.name, "caldav delete: archiving task");
+    if let Err(err) = writer.archive_task(&object_id).await {
+        return source_failure(&err);
+    }
+    state.feed.invalidate();
+    status(StatusCode::NO_CONTENT)
 }
 
 /// Runs `render` against the current snapshot, or reports why there is none.
@@ -292,7 +528,7 @@ fn report_kind(body: &str) -> Report {
     }
 }
 
-fn collection_props(snapshot: &Snapshot) -> Vec<String> {
+fn collection_props(snapshot: &Snapshot, writable: bool) -> Vec<String> {
     vec![
         "<d:resourcetype><d:collection/><c:calendar/></d:resourcetype>".to_string(),
         prop_text("d:displayname", "Anytype"),
@@ -300,15 +536,23 @@ fn collection_props(snapshot: &Snapshot) -> Vec<String> {
         // Changes whenever any task changes, so Calino can skip an unchanged
         // collection without listing it.
         prop_text("cs:getctag", &snapshot.etag),
-        "<d:current-user-privilege-set><d:privilege><d:read/></d:privilege></d:current-user-privilege-set>".to_string(),
+        if writable {
+            "<d:current-user-privilege-set><d:privilege><d:read/></d:privilege><d:privilege><d:write/></d:privilege><d:privilege><d:write-content/></d:privilege><d:privilege><d:bind/></d:privilege><d:privilege><d:unbind/></d:privilege></d:current-user-privilege-set>".to_string()
+        } else {
+            "<d:current-user-privilege-set><d:privilege><d:read/></d:privilege></d:current-user-privilege-set>".to_string()
+        },
     ]
 }
 
-/// `/dav/calendars/tasks/<id>.ics` → `<id>`. Object ids are base32 CIDs, so
-/// anything outside `[a-z0-9]` is refused rather than looked up.
+/// `/dav/calendars/tasks/<name>.ics` → `<name>`. A name is an object id or a
+/// name Calino derived from a UID, so only `[A-Za-z0-9._~-]` is accepted; `..`
+/// and anything path-like is refused rather than looked up.
 fn object_id(path: &str) -> Option<&str> {
     let name = path.strip_prefix(TASKS)?.strip_suffix(".ics")?;
-    (!name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric())).then_some(name)
+    let plain = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '-'));
+    (!name.is_empty() && plain && !name.contains("..")).then_some(name)
 }
 
 fn href_for(object_id: &str) -> String {
@@ -356,7 +600,7 @@ fn options() -> Response {
     let out = response.headers_mut();
     out.insert(
         header::ALLOW,
-        HeaderValue::from_static("OPTIONS, GET, HEAD, PROPFIND, REPORT"),
+        HeaderValue::from_static("OPTIONS, GET, HEAD, PROPFIND, REPORT, PUT, DELETE"),
     );
     out.insert("DAV", HeaderValue::from_static("1, 3, calendar-access"));
     response
@@ -427,6 +671,10 @@ mod tests {
             Some("bafyreiabc123")
         );
         assert_eq!(object_id("/dav/calendars/tasks/../x.ics"), None);
+        assert_eq!(
+            object_id("/dav/calendars/tasks/0b9a4f2c-5d1e-4c3a-9f7e-2a6b8c1d0e3f.ics"),
+            Some("0b9a4f2c-5d1e-4c3a-9f7e-2a6b8c1d0e3f")
+        );
         assert_eq!(object_id("/dav/calendars/tasks/.ics"), None);
         assert_eq!(object_id("/dav/calendars/tasks/abc"), None);
     }

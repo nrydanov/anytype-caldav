@@ -101,6 +101,7 @@ fn task(id: &str, name: &str) -> Task {
         done: false,
         reminder_leads: Vec::new(),
         tags: Vec::new(),
+        ical_uid: None,
         object_url: Some(format!("anytype://object?objectId={id}")),
         last_modified: Some(Utc.with_ymd_and_hms(2026, 8, 29, 12, 0, 0).unwrap()),
     }
@@ -146,6 +147,7 @@ fn build_at(
         allowed_origins: Arc::new(origins),
         push: None,
         caldav: None,
+        writer: None,
     };
     (http::router(state, feed_path), feed)
 }

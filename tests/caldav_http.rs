@@ -46,6 +46,7 @@ fn task(id: &str, name: &str) -> Task {
         done: false,
         reminder_leads: Vec::new(),
         tags: vec!["Финансы".into()],
+        ical_uid: None,
         object_url: None,
         last_modified: Some(Utc.with_ymd_and_hms(2026, 9, 15, 12, 0, 0).unwrap()),
     }
@@ -80,6 +81,7 @@ fn router() -> Router {
             allowed_origins: Arc::new(Vec::new()),
             push: None,
             caldav: Some(Arc::new(Credentials::new("me", "pw"))),
+            writer: None,
         },
         "/f/secret/todos.ics",
     )
@@ -302,4 +304,326 @@ async fn unknown_resources_are_missing_and_writes_are_refused() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// ------------------------------------------------------------------ writes
+
+mod writes {
+    use std::sync::Mutex;
+
+    use anytype_task_exporter::{source::TaskWriter, writeback::Patch};
+
+    use super::*;
+
+    /// Anytype in memory: listing and writing share one store, the way the
+    /// real source reads what it just wrote.
+    #[derive(Default)]
+    struct Store {
+        tasks: Mutex<Vec<Task>>,
+        patches: Mutex<Vec<(String, Patch)>>,
+        next: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl TaskSource for Store {
+        async fn list_tasks(&self) -> Result<TaskBatch, SourceError> {
+            Ok(TaskBatch {
+                tasks: self.tasks.lock().unwrap().clone(),
+                warnings: Vec::new(),
+            })
+        }
+    }
+
+    fn apply(task: &mut Task, patch: &Patch) {
+        if let Some(name) = &patch.name {
+            task.name = name.clone();
+        }
+        if let Some(done) = patch.done {
+            task.done = done;
+        }
+        if let Some(value) = &patch.scheduled {
+            task.scheduled = value.as_deref().and_then(AnytypeDate::parse);
+        }
+        if let Some(value) = &patch.deadline {
+            task.deadline = value.as_deref().and_then(AnytypeDate::parse);
+        }
+        // Anytype bumps last-modified on every write, which changes DTSTAMP.
+        task.last_modified = Some(Utc::now());
+    }
+
+    #[async_trait]
+    impl TaskWriter for Store {
+        async fn get_task(&self, object_id: &str) -> Result<Option<Task>, SourceError> {
+            Ok(self
+                .tasks
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.object_id == object_id)
+                .cloned())
+        }
+        async fn update_task(&self, object_id: &str, patch: &Patch) -> Result<(), SourceError> {
+            self.patches
+                .lock()
+                .unwrap()
+                .push((object_id.into(), patch.clone()));
+            let mut tasks = self.tasks.lock().unwrap();
+            let task = tasks.iter_mut().find(|t| t.object_id == object_id).unwrap();
+            apply(task, patch);
+            Ok(())
+        }
+        async fn create_task(&self, uid: &str, patch: &Patch) -> Result<String, SourceError> {
+            let mut next = self.next.lock().unwrap();
+            *next += 1;
+            let id = format!("bafyreinew{next}");
+            let mut created = task(&id, "");
+            created.scheduled = None;
+            created.tags = Vec::new();
+            created.ical_uid = Some(uid.into());
+            apply(&mut created, patch);
+            self.tasks.lock().unwrap().push(created);
+            Ok(id)
+        }
+        async fn archive_task(&self, object_id: &str) -> Result<(), SourceError> {
+            self.tasks
+                .lock()
+                .unwrap()
+                .retain(|t| t.object_id != object_id);
+            Ok(())
+        }
+    }
+
+    fn writable() -> (Router, Arc<Store>) {
+        let store = Arc::new(Store::default());
+        store
+            .tasks
+            .lock()
+            .unwrap()
+            .push(task("bafyreiaaa", "Pay rent"));
+        let renderer = VTodoRenderer::new(
+            CalendarConfig {
+                timezone: Saratov,
+                name: "Anytype Tasks".into(),
+                date_only_timezone: Saratov,
+            },
+            RemindersConfig {
+                enabled: false,
+                lead_time: chrono::Duration::minutes(30),
+                all_day_time: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            },
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        );
+        let feed = Arc::new(FeedService::new(
+            store.clone(),
+            renderer,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        ));
+        let router = http::router(
+            AppState {
+                feed,
+                allowed_origins: Arc::new(Vec::new()),
+                push: None,
+                caldav: Some(Arc::new(Credentials::new("me", "pw"))),
+                writer: Some(store.clone()),
+            },
+            "/f/secret/todos.ics",
+        );
+        (router, store)
+    }
+
+    async fn put(
+        router: &Router,
+        path: &str,
+        condition: Option<(&str, &str)>,
+        body: &str,
+    ) -> (StatusCode, Option<String>) {
+        let mut request = Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header(header::AUTHORIZATION, auth())
+            .header(header::CONTENT_TYPE, "text/calendar; charset=utf-8");
+        if let Some((name, value)) = condition {
+            request = request.header(name, value);
+        }
+        let response = router
+            .clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .map(|v| v.to_str().unwrap().to_string());
+        (response.status(), etag)
+    }
+
+    async fn current(router: &Router, name: &str) -> (String, String) {
+        let (status, headers, ics) = send(
+            router,
+            "GET",
+            &format!("/dav/calendars/tasks/{name}.ics"),
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name}");
+        (
+            headers
+                .get(header::ETAG)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
+            ics,
+        )
+    }
+
+    #[tokio::test]
+    async fn the_collection_advertises_write_when_a_writer_is_present() {
+        let (router, _) = writable();
+        let (_, _, body) = send(&router, "PROPFIND", "/dav/calendars/", Some("1"), "").await;
+        assert!(
+            body.contains("<d:privilege><d:write/></d:privilege>"),
+            "{body}"
+        );
+    }
+
+    /// The whole Calino tick: GET, edit the bytes, PUT with If-Match.
+    #[tokio::test]
+    async fn ticking_in_the_client_marks_the_task_done_and_returns_the_new_etag() {
+        let (router, store) = writable();
+        let (etag, ics) = current(&router, "bafyreiaaa").await;
+        let ticked = ics
+            .replace("STATUS:NEEDS-ACTION", "STATUS:COMPLETED")
+            .replace("PERCENT-COMPLETE:0", "PERCENT-COMPLETE:100");
+
+        let (status, new_etag) = put(
+            &router,
+            "/dav/calendars/tasks/bafyreiaaa.ics",
+            Some(("If-Match", &etag)),
+            &ticked,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let patches = store.patches.lock().unwrap().clone();
+        assert_eq!(
+            patches,
+            vec![(
+                "bafyreiaaa".to_string(),
+                Patch {
+                    done: Some(true),
+                    ..Patch::default()
+                }
+            )]
+        );
+        let (fresh_etag, fresh) = current(&router, "bafyreiaaa").await;
+        assert_eq!(new_etag.as_deref(), Some(fresh_etag.as_str()));
+        assert_ne!(fresh_etag, etag);
+        assert!(fresh.contains("STATUS:COMPLETED"), "{fresh}");
+    }
+
+    #[tokio::test]
+    async fn a_stale_etag_is_refused_and_nothing_is_written() {
+        let (router, store) = writable();
+        let (_, ics) = current(&router, "bafyreiaaa").await;
+        let (status, _) = put(
+            &router,
+            "/dav/calendars/tasks/bafyreiaaa.ics",
+            Some(("If-Match", "\"stale\"")),
+            &ics.replace("SUMMARY:Pay rent", "SUMMARY:Changed"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert!(store.patches.lock().unwrap().is_empty());
+    }
+
+    /// Calino creates with If-None-Match: * at `<uid>.ics` and afterwards
+    /// addresses the task only by that name.
+    #[tokio::test]
+    async fn a_task_created_in_the_client_stays_under_its_own_name() {
+        let (router, store) = writable();
+        let uid = "0b9a4f2c-5d1e-4c3a-9f7e-2a6b8c1d0e3f";
+        let body = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:{uid}\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260920\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
+        );
+        let path = format!("/dav/calendars/tasks/{uid}.ics");
+
+        let (status, etag) = put(&router, &path, Some(("If-None-Match", "*")), &body).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(etag.is_some());
+
+        let created = store.tasks.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(created.name, "Buy milk");
+        assert_eq!(created.ical_uid.as_deref(), Some(uid));
+        assert_eq!(created.scheduled.unwrap().raw, "2026-09-19T20:00:00Z");
+
+        let (_, ics) = current(&router, uid).await;
+        assert!(ics.contains(&format!("UID:{uid}")), "{ics}");
+
+        // A second create at the same name is a precondition failure, not a duplicate.
+        let (status, _) = put(&router, &path, Some(("If-None-Match", "*")), &body).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(store.tasks.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_create_at_a_name_that_does_not_match_the_uid_is_refused() {
+        let (router, store) = writable();
+        let body = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:abc\r\nSUMMARY:x\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let (status, _) = put(
+            &router,
+            "/dav/calendars/tasks/other.ics",
+            Some(("If-None-Match", "*")),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(store.tasks.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_archives_and_the_resource_is_gone() {
+        let (router, store) = writable();
+        let (etag, _) = current(&router, "bafyreiaaa").await;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/dav/calendars/tasks/bafyreiaaa.ics")
+                    .header(header::AUTHORIZATION, auth())
+                    .header("If-Match", etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(store.tasks.lock().unwrap().is_empty());
+        let (status, _, _) = send(
+            &router,
+            "GET",
+            "/dav/calendars/tasks/bafyreiaaa.ics",
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn an_event_is_refused_with_a_reason() {
+        let (router, _) = writable();
+        let body = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:e\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let (status, _) = put(
+            &router,
+            "/dav/calendars/tasks/e.ics",
+            Some(("If-None-Match", "*")),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
 }

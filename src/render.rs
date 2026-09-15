@@ -26,10 +26,28 @@ pub enum RenderError {
     },
 }
 
+/// Which Anytype property a date on the wire came from. Writing a change back
+/// has to land in the same place, or moving a card in a calendar would turn a
+/// planned date into a deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Scheduled,
+    Deadline,
+    /// An all-day plan and deadline on one day, collapsed into one `DUE`.
+    Both,
+}
+
+/// A task's dates as a calendar client receives them, with their origins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Wire {
+    pub start: Option<(DatePerhapsTime, Origin)>,
+    pub due: Option<(DatePerhapsTime, Origin)>,
+}
+
 /// What a task's two dates become on the wire.
 enum Schedule {
     Neither,
-    Due(DatePerhapsTime),
+    Due(DatePerhapsTime, Origin),
     Both {
         start: DatePerhapsTime,
         due: DatePerhapsTime,
@@ -126,7 +144,7 @@ impl VTodoRenderer {
             task.deadline.as_ref().map(|value| value.classify(tz)),
         ) {
             Schedule::Neither => {}
-            Schedule::Due(due) => {
+            Schedule::Due(due, _) => {
                 todo.due(due);
             }
             Schedule::Both { start, due } => {
@@ -204,8 +222,12 @@ impl VTodoRenderer {
             // `DTSTART`-only task is parsed, kept, and never drawn — while its
             // parser reads `start` back off `DUE` when `DTSTART` is absent
             // (`start = DTSTART || DUE`), so the hour survives the omission.
-            (Some(start), None) => return Schedule::Due(self.to_calendar_date(start)),
-            (None, Some(due)) => return Schedule::Due(self.to_calendar_date(due)),
+            (Some(start), None) => {
+                return Schedule::Due(self.to_calendar_date(start), Origin::Scheduled);
+            }
+            (None, Some(due)) => {
+                return Schedule::Due(self.to_calendar_date(due), Origin::Deadline);
+            }
             (Some(start), Some(due)) => (start, due),
         };
 
@@ -226,7 +248,7 @@ impl VTodoRenderer {
             // One all-day value cannot precede another on the same day, and the
             // start would say nothing the deadline does not.
             (CalendarValue::AllDay(from), CalendarValue::AllDay(to)) if from == to => {
-                Schedule::Due(self.to_calendar_date(due))
+                Schedule::Due(self.to_calendar_date(due), Origin::Both)
             }
             (CalendarValue::AllDay(_), CalendarValue::AllDay(_))
             | (CalendarValue::Instant(_), CalendarValue::Instant(_)) => Schedule::Both {
@@ -260,9 +282,47 @@ impl VTodoRenderer {
                 },
                 // A DST gap swallowed one of the civil times; the deadline alone
                 // is still valid and is the more important of the two.
-                _ => Schedule::Due(self.to_calendar_date(due)),
+                _ => Schedule::Due(self.to_calendar_date(due), Origin::Deadline),
             },
         }
+    }
+
+    pub fn config(&self) -> &CalendarConfig {
+        &self.config
+    }
+
+    /// The dates a client sees for `task`, and where each came from.
+    pub fn wire(&self, task: &Task) -> Wire {
+        let tz = self.config.date_only_timezone;
+        match self.schedule(
+            task.scheduled.as_ref().map(|value| value.classify(tz)),
+            task.deadline.as_ref().map(|value| value.classify(tz)),
+        ) {
+            Schedule::Neither => Wire {
+                start: None,
+                due: None,
+            },
+            Schedule::Due(due, origin) => Wire {
+                start: None,
+                due: Some((due, origin)),
+            },
+            Schedule::Both { start, due } => Wire {
+                start: Some((start, Origin::Scheduled)),
+                due: Some((due, Origin::Deadline)),
+            },
+            // The deadline is only described in words; the wire date is the plan.
+            Schedule::Described { due, .. } => Wire {
+                start: None,
+                due: Some((due, Origin::Scheduled)),
+            },
+        }
+    }
+
+    /// One task as a complete `VCALENDAR`, as a CalDAV resource carries it.
+    pub fn render_one(&self, task: &Task) -> String {
+        let mut calendar = self.calendar();
+        calendar.push(self.render_task(task));
+        calendar.to_string()
     }
 
     /// The civil moment a value starts covering.
@@ -355,6 +415,7 @@ mod tests {
             done: false,
             reminder_leads: Vec::new(),
             tags: Vec::new(),
+            ical_uid: None,
             object_url: None,
             last_modified: None,
         }

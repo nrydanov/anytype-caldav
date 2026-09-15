@@ -122,6 +122,7 @@ mod tests {
             done: false,
             reminder_leads: Vec::new(),
             tags: Vec::new(),
+            ical_uid: None,
             object_url: None,
             last_modified: None,
         }

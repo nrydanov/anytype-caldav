@@ -2,7 +2,10 @@
 
 use async_trait::async_trait;
 
-use crate::model::TaskBatch;
+use crate::{
+    model::{Task, TaskBatch},
+    writeback::Patch,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
@@ -33,4 +36,16 @@ impl SourceError {
 #[async_trait]
 pub trait TaskSource: Send + Sync + 'static {
     async fn list_tasks(&self) -> Result<TaskBatch, SourceError>;
+}
+
+/// Writes coming back from a calendar client.
+#[async_trait]
+pub trait TaskWriter: Send + Sync + 'static {
+    /// A fresh read of one task; `None` when it is gone or archived.
+    async fn get_task(&self, object_id: &str) -> Result<Option<Task>, SourceError>;
+    async fn update_task(&self, object_id: &str, patch: &Patch) -> Result<(), SourceError>;
+    /// Creates a task that remembers the client's UID; returns its object id.
+    async fn create_task(&self, uid: &str, patch: &Patch) -> Result<String, SourceError>;
+    /// Archives, which Anytype's API calls delete and keeps in the Bin.
+    async fn archive_task(&self, object_id: &str) -> Result<(), SourceError>;
 }

@@ -66,6 +66,9 @@ pub struct Task {
     pub reminder_leads: Vec<chrono::Duration>,
     /// Option names of the tags property, in Anytype's order.
     pub tags: Vec<String>,
+    /// The UID a calendar client gave a task it created. Such a task must stay
+    /// reachable under the resource name the client computed from that UID.
+    pub ical_uid: Option<String>,
     pub object_url: Option<String>,
     pub last_modified: Option<DateTime<Utc>>,
 }
@@ -74,7 +77,10 @@ impl Task {
     /// Stable across renames and date edits: a calendar client updates the
     /// existing component instead of creating a duplicate.
     pub fn uid(&self) -> String {
-        format!("{}@anytype-task-exporter", self.object_id)
+        match &self.ical_uid {
+            Some(uid) => uid.clone(),
+            None => format!("{}@anytype-task-exporter", self.object_id),
+        }
     }
 }
 
@@ -190,6 +196,7 @@ mod tests {
             done: false,
             reminder_leads: Vec::new(),
             tags: Vec::new(),
+            ical_uid: None,
             object_url: None,
             last_modified: None,
         };

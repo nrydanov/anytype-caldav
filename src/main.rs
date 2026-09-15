@@ -207,10 +207,11 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         "starting anytype-task-exporter"
     );
 
-    let source: Arc<dyn TaskSource> = Arc::new(AnytypeTaskSource::connect(
+    let anytype = Arc::new(AnytypeTaskSource::connect(
         config.anytype.clone(),
         config.properties.clone(),
     )?);
+    let source: Arc<dyn TaskSource> = anytype.clone();
     let renderer = VTodoRenderer::new(
         config.calendar.clone(),
         config.reminders.clone(),
@@ -290,7 +291,12 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 format!("caldav.enabled is true but {CALDAV_PASSWORD_ENV} is not set").into(),
             );
         }
-        info!(username = %config.caldav.username, base = anytype_task_exporter::caldav::BASE, "caldav facade enabled (read-only)");
+        info!(
+            username = %config.caldav.username,
+            base = anytype_task_exporter::caldav::BASE,
+            writable = config.caldav.writable,
+            "caldav facade enabled"
+        );
         Some(Arc::new(anytype_task_exporter::caldav::Credentials::new(
             &config.caldav.username,
             &password,
@@ -303,6 +309,10 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         feed,
         allowed_origins: Arc::new(config.server.allowed_origins.clone()),
         caldav,
+        writer: config
+            .caldav
+            .writable
+            .then(|| anytype.clone() as Arc<dyn anytype_task_exporter::source::TaskWriter>),
         push,
     };
 

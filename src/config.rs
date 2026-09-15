@@ -95,6 +95,8 @@ struct RawCaldav {
     #[serde(default)]
     enabled: bool,
     username: Option<String>,
+    #[serde(default)]
+    writable: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,6 +282,9 @@ pub struct Config {
 pub struct CaldavConfig {
     pub enabled: bool,
     pub username: String,
+    /// Accept PUT and DELETE from clients. Off by default, separately from
+    /// `enabled`, so a deploy never makes the calendar editable by itself.
+    pub writable: bool,
 }
 
 /// The recurring-task generator. Off by default: turning it on is the
@@ -642,6 +647,7 @@ impl Config {
             caldav: CaldavConfig {
                 enabled: raw.caldav.enabled,
                 username: caldav_username,
+                writable: raw.caldav.enabled && raw.caldav.writable,
             },
         })
     }

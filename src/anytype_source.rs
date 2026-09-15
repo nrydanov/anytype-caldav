@@ -5,17 +5,18 @@ use std::collections::BTreeMap;
 use anytype::{
     client::{AnytypeClient, ClientConfig},
     objects::Object,
-    properties::{PropertyValue, PropertyWithValue},
+    properties::{PropertyValue, PropertyWithValue, SetProperty},
 };
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::StreamExt;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::{AnytypeConfig, PropertiesConfig, PropertySelector},
     model::{AnytypeDate, Task, TaskBatch},
-    source::{SourceError, TaskSource},
+    source::{SourceError, TaskSource, TaskWriter},
+    writeback::Patch,
 };
 
 pub struct AnytypeTaskSource {
@@ -111,6 +112,122 @@ impl TaskSource for AnytypeTaskSource {
     }
 }
 
+/// Writes address properties by the schema's keys (`install::SCHEMA`), not by
+/// the configured id selectors: the facade's schema is the same in every
+/// space, and a key is what the write API takes.
+#[async_trait]
+impl TaskWriter for AnytypeTaskSource {
+    async fn get_task(&self, object_id: &str) -> Result<Option<Task>, SourceError> {
+        let started = std::time::Instant::now();
+        let object = match self
+            .client
+            .object(&self.config.space_id, object_id)
+            .get()
+            .await
+        {
+            Ok(object) => object,
+            Err(anytype::error::AnytypeError::NotFound { .. }) => {
+                debug!(object_id, "anytype get task: not found");
+                return Ok(None);
+            }
+            Err(err) => {
+                error!(object_id, error = %err, error_debug = ?err, "anytype get task failed");
+                return Err(SourceError::Transport(err.to_string()));
+            }
+        };
+        if object.archived {
+            debug!(object_id, "anytype get task: archived");
+            return Ok(None);
+        }
+        let mut warnings = Vec::new();
+        let task = self.to_task(&object, &mut warnings)?;
+        for warning in warnings {
+            warn!(%warning, "anytype get task reported a malformed value");
+        }
+        debug!(
+            object_id,
+            done = task.done,
+            elapsed_ms = started.elapsed().as_millis(),
+            "anytype get task finished"
+        );
+        Ok(Some(task))
+    }
+
+    async fn update_task(&self, object_id: &str, patch: &Patch) -> Result<(), SourceError> {
+        let started = std::time::Instant::now();
+        let mut request = self.client.update_object(&self.config.space_id, object_id);
+        if let Some(name) = &patch.name {
+            request = request.name(name.clone());
+        }
+        for property in patch_properties(patch) {
+            request = request.add_property(property);
+        }
+        info!(object_id, ?patch, "anytype update task started");
+        request.update().await.map_err(|err| {
+            error!(object_id, ?patch, error = %err, error_debug = ?err, "anytype update task failed");
+            SourceError::Transport(err.to_string())
+        })?;
+        info!(
+            object_id,
+            elapsed_ms = started.elapsed().as_millis(),
+            "anytype update task finished"
+        );
+        Ok(())
+    }
+
+    async fn create_task(&self, uid: &str, patch: &Patch) -> Result<String, SourceError> {
+        let started = std::time::Instant::now();
+        let mut request = self
+            .client
+            .new_object(&self.config.space_id, &self.config.type_key)
+            .name(patch.name.clone().unwrap_or_else(|| "(unnamed)".into()))
+            .set_text("ical_uid", uid);
+        for property in patch_properties(patch) {
+            request = request.add_property(property);
+        }
+        info!(uid, ?patch, "anytype create task started");
+        let object = request.create().await.map_err(|err| {
+            error!(uid, ?patch, error = %err, error_debug = ?err, "anytype create task failed");
+            SourceError::Transport(err.to_string())
+        })?;
+        info!(uid, object_id = %object.id, elapsed_ms = started.elapsed().as_millis(), "anytype create task finished");
+        Ok(object.id)
+    }
+
+    async fn archive_task(&self, object_id: &str) -> Result<(), SourceError> {
+        info!(object_id, "anytype archive task started");
+        self.client
+            .object(&self.config.space_id, object_id)
+            .delete()
+            .await
+            .map_err(|err| {
+                error!(object_id, error = %err, error_debug = ?err, "anytype archive task failed");
+                SourceError::Transport(err.to_string())
+            })?;
+        info!(object_id, "anytype archive task finished");
+        Ok(())
+    }
+}
+
+/// The property values of a patch, in the API's JSON shape. A `null` date
+/// clears the property (anytype-heart `processProperties`: a nil value is
+/// written as null).
+fn patch_properties(patch: &Patch) -> Vec<serde_json::Value> {
+    let mut properties = Vec::new();
+    if let Some(done) = patch.done {
+        properties.push(serde_json::json!({ "key": "done", "checkbox": done }));
+    }
+    for (key, value) in [
+        ("scheduled", &patch.scheduled),
+        ("due_date", &patch.deadline),
+    ] {
+        if let Some(value) = value {
+            properties.push(serde_json::json!({ "key": key, "date": value }));
+        }
+    }
+    properties
+}
+
 impl AnytypeTaskSource {
     /// Fails loudly when a configured selector matches nothing.
     ///
@@ -189,6 +306,12 @@ impl AnytypeTaskSource {
         let done = self.read_done(object)?;
         let reminder_leads = self.read_reminder_leads(object, warnings)?;
         let tags = self.read_tags(object, warnings)?;
+        let ical_uid = match object.get_property("ical_uid").map(|p| &p.value) {
+            Some(PropertyValue::Text { text }) if !text.trim().is_empty() => {
+                Some(text.trim().to_string())
+            }
+            _ => None,
+        };
 
         let last_modified = object
             .get_property_date("last_modified_date")
@@ -202,6 +325,7 @@ impl AnytypeTaskSource {
             done,
             reminder_leads,
             tags,
+            ical_uid,
             object_url: Some(object.get_link()),
             last_modified,
         })

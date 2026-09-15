@@ -31,8 +31,32 @@ pub struct Snapshot {
 /// One task as a CalDAV resource.
 #[derive(Debug, Clone)]
 pub struct Resource {
+    pub object_id: String,
     pub ics: Arc<str>,
     pub etag: String,
+}
+
+/// The resource name a task is served under. A task created in Calino keeps
+/// the name Calino computed from its UID, because Calino addresses it by that
+/// name and ignores any `Location` the server returns.
+pub fn resource_name(task: &crate::model::Task) -> String {
+    match &task.ical_uid {
+        Some(uid) => calino_filename(uid),
+        None => task.object_id.clone(),
+    }
+}
+
+/// Calino's `eventResourceFilename` without the `.ics`: `encodeURIComponent`,
+/// then `!'()*~` percent-encoded too, then every `%` replaced by `~`.
+pub fn calino_filename(uid: &str) -> String {
+    let mut out = String::new();
+    for byte in uid.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => out.push(byte as char),
+            other => out.push_str(&format!("~{other:02X}")),
+        }
+    }
+    out
 }
 
 /// What a caller should serve.
@@ -122,6 +146,28 @@ impl FeedService {
         }
     }
 
+    /// One task rendered exactly as the snapshot would carry it.
+    pub fn resource_for(&self, task: &crate::model::Task) -> Resource {
+        let ics = self.renderer.render_one(task);
+        Resource {
+            object_id: task.object_id.clone(),
+            etag: etag_for(&ics),
+            ics: Arc::from(ics.as_str()),
+        }
+    }
+
+    pub fn renderer(&self) -> &VTodoRenderer {
+        &self.renderer
+    }
+
+    /// Forces the next `get` to read Anytype again. Called after a write, so a
+    /// client's follow-up request sees the new ETag instead of a cached one.
+    pub fn invalidate(&self) {
+        let mut state = self.state.lock().expect("feed state poisoned");
+        state.last_attempt = None;
+        debug!("feed cache invalidated after a write");
+    }
+
     fn cached_within_interval(&self) -> Option<Outcome> {
         let state = self.state.lock().expect("feed state poisoned");
         let last_attempt = state.last_attempt?;
@@ -200,20 +246,10 @@ impl FeedService {
             .max()
             .unwrap_or_else(Utc::now);
         let etag = etag_for(&body);
-        let objects: BTreeMap<String, Resource> = self
-            .renderer
-            .render_each(&batch.tasks)
-            .into_iter()
-            .map(|(id, ics)| {
-                let etag = etag_for(&ics);
-                (
-                    id,
-                    Resource {
-                        ics: Arc::from(ics.as_str()),
-                        etag,
-                    },
-                )
-            })
+        let objects: BTreeMap<String, Resource> = batch
+            .tasks
+            .iter()
+            .map(|task| (resource_name(task), self.resource_for(task)))
             .collect();
 
         info!(
