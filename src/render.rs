@@ -81,6 +81,29 @@ impl VTodoRenderer {
             by_uid.insert(uid, task);
         }
 
+        let mut calendar = self.calendar();
+        for task in by_uid.values() {
+            calendar.push(self.render_task(task));
+        }
+
+        Ok(calendar.to_string())
+    }
+
+    /// One `VCALENDAR` per task, keyed by object id: the resources of a CalDAV
+    /// collection. Each body is exactly what the feed would contain for that
+    /// task, so both views agree byte for byte on the component.
+    pub fn render_each(&self, tasks: &[Task]) -> Vec<(String, String)> {
+        tasks
+            .iter()
+            .map(|task| {
+                let mut calendar = self.calendar();
+                calendar.push(self.render_task(task));
+                (task.object_id.clone(), calendar.to_string())
+            })
+            .collect()
+    }
+
+    fn calendar(&self) -> Calendar {
         let mut calendar = Calendar::new();
         calendar
             .name(&self.config.name)
@@ -88,12 +111,7 @@ impl VTodoRenderer {
             .append_property(Property::new("PRODID", "-//Anytype Task Exporter//EN"))
             .append_property(Property::new("VERSION", "2.0"))
             .append_property(Property::new("CALSCALE", "GREGORIAN"));
-
-        for task in by_uid.values() {
-            calendar.push(self.render_task(task));
-        }
-
-        Ok(calendar.to_string())
+        calendar
     }
 
     fn render_task(&self, task: &Task) -> Todo {

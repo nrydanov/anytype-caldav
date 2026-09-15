@@ -21,6 +21,8 @@ use tracing_subscriber::EnvFilter;
 
 /// Environment variable this service reads the Anytype API key from.
 const API_KEY_ENV: &str = "ANYTYPE_API_KEY";
+/// Environment variable the CalDAV password is read from.
+const CALDAV_PASSWORD_ENV: &str = "CALDAV_PASSWORD";
 /// Environment variable the SDK's `env` keystore reads the token from.
 const SDK_TOKEN_ENV: &str = "ANYTYPE_KEY_HTTP_TOKEN";
 
@@ -281,9 +283,26 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
+    let caldav = if config.caldav.enabled {
+        let password = std::env::var(CALDAV_PASSWORD_ENV).unwrap_or_default();
+        if password.trim().is_empty() {
+            return Err(
+                format!("caldav.enabled is true but {CALDAV_PASSWORD_ENV} is not set").into(),
+            );
+        }
+        info!(username = %config.caldav.username, base = anytype_task_exporter::caldav::BASE, "caldav facade enabled (read-only)");
+        Some(Arc::new(anytype_task_exporter::caldav::Credentials::new(
+            &config.caldav.username,
+            &password,
+        )))
+    } else {
+        None
+    };
+
     let state = http::AppState {
         feed,
         allowed_origins: Arc::new(config.server.allowed_origins.clone()),
+        caldav,
         push,
     };
 

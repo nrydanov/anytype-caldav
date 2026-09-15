@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use tracing::{debug, error, info, warn};
 
@@ -26,6 +26,8 @@ pub struct AppState {
     pub feed: Arc<FeedService>,
     pub allowed_origins: Arc<Vec<String>>,
     pub push: Option<Arc<PushService>>,
+    /// Set when the CalDAV facade is enabled.
+    pub caldav: Option<Arc<crate::caldav::Credentials>>,
 }
 
 pub fn router(state: AppState, feed_path: &str) -> Router {
@@ -42,6 +44,13 @@ pub fn router(state: AppState, feed_path: &str) -> Router {
             .route(&format!("{prefix}/push/key"), get(push_key))
             .route(&format!("{prefix}/push/subscribe"), post(push_subscribe))
             .route(&format!("{prefix}/push/test"), post(push_test));
+    }
+
+    if state.caldav.is_some() {
+        router = router
+            .route("/dav", any(crate::caldav::handle))
+            .route("/dav/", any(crate::caldav::handle))
+            .route("/dav/{*rest}", any(crate::caldav::handle));
     }
 
     let prefix = secret_prefix(feed_path);

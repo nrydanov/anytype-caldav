@@ -86,6 +86,15 @@ struct RawConfig {
     push: RawPush,
     #[serde(default)]
     series: RawSeries,
+    #[serde(default)]
+    caldav: RawCaldav,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawCaldav {
+    #[serde(default)]
+    enabled: bool,
+    username: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,6 +271,15 @@ pub struct Config {
     pub reminders: RemindersConfig,
     pub push: PushConfig,
     pub series: SeriesConfig,
+    pub caldav: CaldavConfig,
+}
+
+/// The CalDAV facade under `/dav/`. The password is not here: it is read from
+/// `CALDAV_PASSWORD`, next to the Anytype API key, so this file holds no secret.
+#[derive(Debug, Clone)]
+pub struct CaldavConfig {
+    pub enabled: bool,
+    pub username: String,
 }
 
 /// The recurring-task generator. Off by default: turning it on is the
@@ -561,6 +579,18 @@ impl Config {
                 "series.enabled is true but push.state_file is not set".into(),
             ));
         }
+        let caldav_username = raw
+            .caldav
+            .username
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if raw.caldav.enabled && caldav_username.is_empty() {
+            return Err(ConfigError::Invalid(
+                "caldav.enabled is true but caldav.username is not set".into(),
+            ));
+        }
         if raw.series.poll_interval.is_zero() {
             return Err(ConfigError::Invalid(
                 "series.poll_interval must be greater than zero".into(),
@@ -608,6 +638,10 @@ impl Config {
             series: SeriesConfig {
                 enabled: raw.series.enabled,
                 poll_interval: raw.series.poll_interval,
+            },
+            caldav: CaldavConfig {
+                enabled: raw.caldav.enabled,
+                username: caldav_username,
             },
         })
     }
@@ -850,6 +884,15 @@ allowed_origins = ["https://calino.io"]
         let config = load(&base()).expect("valid config");
         assert!(!config.series.enabled);
         assert_eq!(config.series.poll_interval, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn caldav_is_off_unless_asked_for_and_needs_a_username() {
+        assert!(!load(&base()).expect("valid config").caldav.enabled);
+        let err = load(&format!("{}\n[caldav]\nenabled = true", base()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("caldav.username"), "{err}");
     }
 
     #[test]

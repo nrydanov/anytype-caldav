@@ -1,6 +1,7 @@
 //! Refresh coordination, caching, and the stale fallback.
 
 use std::{
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -21,6 +22,17 @@ pub struct Snapshot {
     pub body: Arc<str>,
     pub etag: String,
     pub last_modified: DateTime<Utc>,
+    /// The same tasks as CalDAV resources, keyed by object id. Rendered in the
+    /// same refresh as `body`, so the feed and a CalDAV client never see two
+    /// different reads of Anytype.
+    pub objects: Arc<BTreeMap<String, Resource>>,
+}
+
+/// One task as a CalDAV resource.
+#[derive(Debug, Clone)]
+pub struct Resource {
+    pub ics: Arc<str>,
+    pub etag: String,
 }
 
 /// What a caller should serve.
@@ -188,6 +200,21 @@ impl FeedService {
             .max()
             .unwrap_or_else(Utc::now);
         let etag = etag_for(&body);
+        let objects: BTreeMap<String, Resource> = self
+            .renderer
+            .render_each(&batch.tasks)
+            .into_iter()
+            .map(|(id, ics)| {
+                let etag = etag_for(&ics);
+                (
+                    id,
+                    Resource {
+                        ics: Arc::from(ics.as_str()),
+                        etag,
+                    },
+                )
+            })
+            .collect();
 
         info!(
             tasks = batch.tasks.len(),
@@ -200,6 +227,7 @@ impl FeedService {
             body: Arc::from(body.as_str()),
             etag,
             last_modified,
+            objects: Arc::new(objects),
         });
         state.last_attempt = Some(Instant::now());
         state.last_ok = true;

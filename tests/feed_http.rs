@@ -145,6 +145,7 @@ fn build_at(
         feed: feed.clone(),
         allowed_origins: Arc::new(origins),
         push: None,
+        caldav: None,
     };
     (http::router(state, feed_path), feed)
 }
