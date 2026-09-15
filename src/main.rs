@@ -267,7 +267,8 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         durable_state.clone(),
     ) {
         (true, Some(key_path), Some(state_path), Some(durable_state)) => {
-            let service = PushService::load(key_path, durable_state.clone())?;
+            let service =
+                PushService::load(key_path, durable_state.clone(), config.push.app_url.clone())?;
             let scheduler = PushScheduler::new(
                 source,
                 durable_state,

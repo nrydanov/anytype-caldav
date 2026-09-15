@@ -293,6 +293,95 @@ async fn a_query_outside_the_calendar_is_forbidden_rather_than_missing() {
 }
 
 #[tokio::test]
+async fn push_outside_the_secret_prefix_needs_the_caldav_password() {
+    use anytype_task_exporter::{push::PushService, state::StateStore};
+
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(StateStore::open(&directory.path().join("state.sqlite3")).unwrap());
+    let push = PushService::load(
+        std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/vapid-test-only.pem"
+        )),
+        state,
+        Some("https://calendar.example/".into()),
+    )
+    .unwrap();
+    let feed = Arc::new(FeedService::new(
+        Arc::new(Fixed(Vec::new())),
+        VTodoRenderer::new(
+            CalendarConfig {
+                timezone: Saratov,
+                name: "t".into(),
+                date_only_timezone: Saratov,
+            },
+            RemindersConfig {
+                enabled: false,
+                lead_time: chrono::Duration::minutes(30),
+                all_day_time: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            },
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        ),
+        Duration::from_secs(30),
+        Duration::from_secs(5),
+    ));
+    let router = http::router(
+        AppState {
+            feed,
+            allowed_origins: Arc::new(Vec::new()),
+            push: Some(push.clone()),
+            caldav: Some(Arc::new(Credentials::new("me", "pw"))),
+            writer: None,
+            events: None,
+        },
+        "/f/secret/todos.ics",
+    );
+    let subscription =
+        r#"{"endpoint":"https://web.push.apple.com/abc","keys":{"p256dh":"k","auth":"a"}}"#;
+    let request = |auth: Option<String>| {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/push/subscribe")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(auth) = auth {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        builder.body(Body::from(subscription)).unwrap()
+    };
+
+    let garbage = Request::builder()
+        .method("POST")
+        .uri("/push/subscribe")
+        .body(Body::from("{}"))
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(garbage).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let refused = router.clone().oneshot(request(None)).await.unwrap();
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    assert!(!refused.headers().contains_key(header::WWW_AUTHENTICATE));
+    assert_eq!(push.subscription_count(), 0);
+
+    let accepted = router.clone().oneshot(request(Some(auth()))).await.unwrap();
+    assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+    assert_eq!(push.subscription_count(), 1);
+
+    let key = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/push/key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(key.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn unknown_resources_are_missing_and_writes_are_refused() {
     let router = router();
     let (status, _, _) = send(

@@ -48,7 +48,8 @@ pub struct SubscriptionKeys {
     pub auth: String,
 }
 
-/// What a notification carries. The service worker reads these fields.
+/// What a notification carries. The PoC service worker reads the flat
+/// fields; Safari reads the declarative envelope added by [`payload`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Notification {
     pub title: String,
@@ -57,6 +58,34 @@ pub struct Notification {
     pub url: Option<String>,
     /// Collapses repeats for the same task rather than stacking them.
     pub tag: Option<String>,
+    /// The day the reminder is about, for opening that day in the calendar.
+    #[serde(skip)]
+    pub day: Option<chrono::NaiveDate>,
+}
+
+/// The JSON sent to the browser. With an `app_url` it also carries the
+/// Declarative Web Push envelope (`web_push: 8030`, WebKit, iOS 18.4): Safari
+/// shows `notification` itself, with no service worker, and opens `navigate`
+/// on tap. The flat fields stay for the PoC page's service worker.
+pub fn payload(notification: &Notification, app_url: Option<&str>) -> serde_json::Value {
+    let mut value = serde_json::to_value(notification).expect("plain struct");
+    if let Some(app_url) = app_url {
+        let navigate = match notification.day {
+            Some(day) => format!("{app_url}?date={}", day.format("%Y-%m-%d")),
+            None => app_url.to_string(),
+        };
+        let mut declarative = serde_json::json!({
+            "title": notification.title,
+            "body": notification.body,
+            "navigate": navigate,
+        });
+        if let Some(tag) = &notification.tag {
+            declarative["tag"] = serde_json::json!(tag);
+        }
+        value["web_push"] = serde_json::json!(8030);
+        value["notification"] = declarative;
+    }
+    value
 }
 
 impl std::fmt::Debug for PushService {
@@ -74,6 +103,7 @@ pub struct PushService {
     vapid_pem: Vec<u8>,
     public_key: String,
     state: Arc<StateStore>,
+    app_url: Option<String>,
     client: HyperWebPushClient,
 }
 
@@ -81,6 +111,7 @@ impl PushService {
     pub fn load(
         private_key_path: &std::path::Path,
         state: Arc<StateStore>,
+        app_url: Option<String>,
     ) -> Result<Arc<Self>, PushError> {
         let vapid_pem = std::fs::read(private_key_path).map_err(|source| PushError::KeyRead {
             path: private_key_path.display().to_string(),
@@ -98,6 +129,7 @@ impl PushService {
             vapid_pem,
             public_key,
             state,
+            app_url,
             client: HyperWebPushClient::new(),
         }))
     }
@@ -190,8 +222,8 @@ impl PushService {
             .build()
             .map_err(|err| PushError::Build(err.to_string()))?;
 
-        let payload =
-            serde_json::to_vec(notification).map_err(|err| PushError::Build(err.to_string()))?;
+        let payload = serde_json::to_vec(&payload(notification, self.app_url.as_deref()))
+            .map_err(|err| PushError::Build(err.to_string()))?;
 
         let mut builder = WebPushMessageBuilder::new(&info);
         builder.set_payload(ContentEncoding::Aes128Gcm, &payload);
@@ -242,7 +274,7 @@ mod tests {
         };
         let state = test_state();
         let service =
-            PushService::load(std::path::Path::new(&path), state.clone()).expect("key loads");
+            PushService::load(std::path::Path::new(&path), state.clone(), None).expect("key loads");
 
         let public = service.public_key();
         // An uncompressed P-256 point is 65 bytes -> 87 base64url chars.
@@ -264,14 +296,63 @@ mod tests {
             .expect("subscription is persisted");
         drop(service);
 
-        let reloaded = PushService::load(std::path::Path::new(&path), state).expect("reloads");
+        let reloaded =
+            PushService::load(std::path::Path::new(&path), state, None).expect("reloads");
         assert_eq!(reloaded.subscription_count(), 1);
+    }
+
+    fn reminder() -> Notification {
+        Notification {
+            title: "Семинар".into(),
+            body: "Начало через 15 минут — сегодня в 10:00".into(),
+            url: Some("https://object.any.coop/obj".into()),
+            tag: Some("obj".into()),
+            day: chrono::NaiveDate::from_ymd_opt(2026, 9, 20),
+        }
+    }
+
+    #[test]
+    fn without_an_app_url_the_payload_stays_flat() {
+        let value = payload(&reminder(), None);
+        assert_eq!(value["title"], "Семинар");
+        assert_eq!(value["url"], "https://object.any.coop/obj");
+        assert!(value.get("web_push").is_none(), "{value}");
+        assert!(value.get("day").is_none(), "{value}");
+    }
+
+    #[test]
+    fn with_an_app_url_the_payload_is_also_declarative() {
+        let value = payload(&reminder(), Some("https://calendar.example/"));
+        assert_eq!(value["web_push"], 8030);
+        assert_eq!(value["notification"]["title"], "Семинар");
+        assert_eq!(value["notification"]["body"], value["body"]);
+        assert_eq!(
+            value["notification"]["navigate"],
+            "https://calendar.example/?date=2026-09-20"
+        );
+        assert_eq!(value["notification"]["tag"], "obj");
+        // The PoC worker keeps reading the flat fields.
+        assert_eq!(value["tag"], "obj");
+
+        let mut test = reminder();
+        test.day = None;
+        test.tag = None;
+        let value = payload(&test, Some("https://calendar.example/"));
+        assert_eq!(
+            value["notification"]["navigate"],
+            "https://calendar.example/"
+        );
+        assert!(value["notification"].get("tag").is_none(), "{value}");
     }
 
     #[test]
     fn a_missing_key_file_is_an_actionable_error() {
-        let err = PushService::load(std::path::Path::new("/nonexistent/vapid.pem"), test_state())
-            .unwrap_err();
+        let err = PushService::load(
+            std::path::Path::new("/nonexistent/vapid.pem"),
+            test_state(),
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, PushError::KeyRead { .. }), "{err:?}");
         assert!(err.to_string().contains("/nonexistent/vapid.pem"), "{err}");
     }
@@ -280,7 +361,7 @@ mod tests {
     fn a_non_key_file_is_rejected_rather_than_half_loaded() {
         let path = std::env::temp_dir().join("not-a-vapid-key.pem");
         std::fs::write(&path, b"hello").expect("write");
-        let err = PushService::load(&path, test_state()).unwrap_err();
+        let err = PushService::load(&path, test_state(), None).unwrap_err();
         assert!(matches!(err, PushError::KeyInvalid(_)), "{err:?}");
         let _ = std::fs::remove_file(&path);
     }

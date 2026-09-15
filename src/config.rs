@@ -134,6 +134,7 @@ struct RawPush {
     poll_interval: Duration,
     #[serde(default = "default_push_late_window", with = "humantime_serde")]
     late_window: Duration,
+    app_url: Option<String>,
 }
 
 impl Default for RawPush {
@@ -144,6 +145,7 @@ impl Default for RawPush {
             state_file: None,
             poll_interval: default_push_poll_interval(),
             late_window: default_push_late_window(),
+            app_url: None,
         }
     }
 }
@@ -310,6 +312,10 @@ pub struct PushConfig {
     pub state_file: Option<std::path::PathBuf>,
     pub poll_interval: Duration,
     pub late_window: chrono::Duration,
+    /// The calendar app a tapped notification opens, e.g. Calino's root.
+    /// When set, pushes also carry a Declarative Web Push envelope, which
+    /// Safari shows without a service worker and which requires this URL.
+    pub app_url: Option<String>,
 }
 
 /// Controls the `VALARM` emitted with each task.
@@ -643,6 +649,11 @@ impl Config {
                 state_file: push_state_file,
                 poll_interval: raw.push.poll_interval,
                 late_window: push_late_window,
+                app_url: raw
+                    .push
+                    .app_url
+                    .map(|url| url.trim().to_string())
+                    .filter(|url| !url.is_empty()),
             },
             series: SeriesConfig {
                 enabled: raw.series.enabled,

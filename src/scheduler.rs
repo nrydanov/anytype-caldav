@@ -357,6 +357,10 @@ fn notification_for(
         body: describe(moment, now, calendar.timezone),
         url: task.object_url.clone(),
         tag: Some(task.object_id.clone()),
+        day: Some(match moment.value {
+            CalendarValue::AllDay(day) => day,
+            CalendarValue::Instant(at) => at.with_timezone(&calendar.timezone).date_naive(),
+        }),
     }
 }
 

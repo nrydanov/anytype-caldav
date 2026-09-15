@@ -50,6 +50,16 @@ pub fn router(state: AppState, feed_path: &str) -> Router {
             .route(&format!("{prefix}/push/test"), post(push_test));
     }
 
+    // The same endpoints for a script served with the calendar app, which must
+    // not know the feed's secret prefix. The key is public; subscribing and
+    // the test send need the CalDAV credentials.
+    if state.push.is_some() && state.caldav.is_some() {
+        router = router
+            .route("/push/key", get(push_key))
+            .route("/push/subscribe", post(authorized_subscribe))
+            .route("/push/test", post(authorized_test));
+    }
+
     if state.caldav.is_some() {
         router = router
             .route("/dav", any(crate::caldav::handle))
@@ -147,6 +157,53 @@ async fn push_subscribe(
     }
 }
 
+/// 401 without `WWW-Authenticate`: a challenge would make the browser open its
+/// own sign-in dialog over the app.
+fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    let accepted = state
+        .caldav
+        .as_ref()
+        .is_some_and(|credentials| credentials.accepts(headers));
+    if !accepted {
+        warn!(
+            presented = headers.contains_key(header::AUTHORIZATION),
+            "push request without valid credentials"
+        );
+    }
+    accepted
+}
+
+async fn authorized_subscribe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    // The body is read as text so the credentials are checked before it is
+    // parsed: an anonymous caller learns nothing from a 422.
+    if !authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let subscription: BrowserSubscription = match serde_json::from_str(&body) {
+        Ok(subscription) => subscription,
+        Err(err) => {
+            warn!(error = %err, "push subscription body is not a subscription");
+            return (StatusCode::UNPROCESSABLE_ENTITY, "not a push subscription").into_response();
+        }
+    };
+    info!(
+        endpoint_host = subscription.endpoint.split('/').nth(2).unwrap_or("?"),
+        "push subscription from the calendar app"
+    );
+    push_subscribe(State(state), Json(subscription)).await
+}
+
+async fn authorized_test(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    push_test(State(state)).await
+}
+
 /// Proves the whole chain end to end without waiting for a real deadline.
 async fn push_test(State(state): State<AppState>) -> Response {
     let Some(push) = &state.push else {
@@ -157,6 +214,7 @@ async fn push_test(State(state): State<AppState>) -> Response {
         body: "Тестовое уведомление от экспортёра".to_string(),
         url: None,
         tag: Some("test".to_string()),
+        day: None,
     };
     let (delivered, attempted) = push.notify_all(&notification).await;
     Json(serde_json::json!({ "delivered": delivered, "subscriptions": attempted })).into_response()

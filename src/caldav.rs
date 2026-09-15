@@ -63,7 +63,7 @@ impl Credentials {
     /// Checks an `Authorization: Basic …` header. The password comparison
     /// runs over fixed-length digests so its duration does not depend on how
     /// much of the password matched.
-    fn accepts(&self, headers: &HeaderMap) -> bool {
+    pub fn accepts(&self, headers: &HeaderMap) -> bool {
         let Some(encoded) = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
