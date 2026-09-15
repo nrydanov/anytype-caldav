@@ -61,6 +61,19 @@ enum Schedule {
     },
 }
 
+/// SEQUENCE for a component last modified at `modified`.
+///
+/// Calino increments SEQUENCE when it edits a task and, with its default
+/// "server wins" setting, takes the server's copy only when the server's
+/// SEQUENCE is not lower than its own (`useCalDAV.ts` sync reconciliation).
+/// Without the property the server reads as 0, so after one edit in Calino
+/// later edits made in Anytype would never reach the calendar. Seconds since
+/// the epoch only grow with each Anytype write and stay far above Calino's
+/// small counters.
+pub fn sequence_for(modified: DateTime<Utc>) -> u32 {
+    u32::try_from(modified.timestamp().max(0)).unwrap_or(u32::MAX)
+}
+
 pub struct VTodoRenderer {
     config: CalendarConfig,
     reminders: RemindersConfig,
@@ -134,9 +147,11 @@ impl VTodoRenderer {
 
     fn render_task(&self, task: &Task) -> Todo {
         let mut todo = Todo::new();
+        let modified = task.last_modified.unwrap_or(self.fallback_stamp);
         todo.uid(&task.uid())
             .summary(&task.name)
-            .timestamp(task.last_modified.unwrap_or(self.fallback_stamp));
+            .timestamp(modified)
+            .sequence(sequence_for(modified));
 
         let tz = self.config.date_only_timezone;
         match self.schedule(
@@ -542,6 +557,22 @@ mod tests {
     fn an_untagged_task_has_no_categories() {
         let ics = renderer().render(&[task("a", "One")]).unwrap();
         assert!(!ics.contains("CATEGORIES"), "{ics}");
+    }
+
+    /// Calino keeps a server copy only if its SEQUENCE is not below its own
+    /// edit counter; a later Anytype write must win again.
+    #[test]
+    fn sequence_grows_with_every_anytype_write() {
+        let mut t = task("a", "One");
+        t.last_modified = Some(Utc.with_ymd_and_hms(2026, 9, 15, 12, 0, 0).unwrap());
+        let first = renderer().render_one(&t);
+        assert!(first.contains("SEQUENCE:1789473600\r\n"), "{first}");
+        t.last_modified = Some(Utc.with_ymd_and_hms(2026, 9, 15, 12, 0, 5).unwrap());
+        assert!(
+            renderer()
+                .render_one(&t)
+                .contains("SEQUENCE:1789473605\r\n")
+        );
     }
 
     #[test]
