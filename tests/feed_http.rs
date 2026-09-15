@@ -148,6 +148,7 @@ fn build_at(
         push: None,
         caldav: None,
         writer: None,
+        events: None,
     };
     (http::router(state, feed_path), feed)
 }

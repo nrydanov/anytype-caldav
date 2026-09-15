@@ -30,6 +30,8 @@ pub struct AppState {
     pub caldav: Option<Arc<crate::caldav::Credentials>>,
     /// Set when the facade accepts writes; without it the collection is read-only.
     pub writer: Option<Arc<dyn crate::source::TaskWriter>>,
+    /// Set when events are served as a second collection.
+    pub events: Option<Arc<crate::events::EventService>>,
 }
 
 pub fn router(state: AppState, feed_path: &str) -> Router {

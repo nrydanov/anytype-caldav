@@ -15,6 +15,7 @@ use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
 use crate::{
     config::{CalendarConfig, RemindersConfig},
+    events::{Event, EventStore},
     model::{CalendarValue, Task},
     push::{Notification, PushService},
     reminder::{ReminderAnchor, ReminderMoment, reminders_for},
@@ -71,6 +72,7 @@ pub struct PushScheduler {
     poll_interval: Duration,
     late_window: chrono::Duration,
     request_timeout: Duration,
+    events: Option<Arc<dyn EventStore>>,
     passes: AtomicU64,
 }
 
@@ -95,8 +97,56 @@ impl PushScheduler {
             poll_interval,
             late_window,
             request_timeout,
+            events: None,
             passes: AtomicU64::new(0),
         }
+    }
+
+    /// Also remind of event starts. Only the leads set on an event count: an
+    /// event without `reminder_lead` shows no alarm in the calendar and gets
+    /// no push either.
+    pub fn with_events(mut self, events: Arc<dyn EventStore>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// Reminder moments of every event with leads, as tasks planned at the
+    /// event's start. A failed read skips events for this pass and keeps the
+    /// task reminders going.
+    async fn event_entries(&self) -> Vec<(Task, Vec<ReminderMoment>)> {
+        let Some(store) = &self.events else {
+            return Vec::new();
+        };
+        let events = match tokio::time::timeout(self.request_timeout, store.list()).await {
+            Ok(Ok(events)) => events,
+            Ok(Err(err)) => {
+                warn!(error = %err, "scheduler event read failed; events skipped this pass");
+                return Vec::new();
+            }
+            Err(_) => {
+                warn!(timeout = ?self.request_timeout, "scheduler event read timed out; events skipped this pass");
+                return Vec::new();
+            }
+        };
+        debug!(events = events.len(), "scheduler read events");
+        events
+            .iter()
+            .filter_map(|event| {
+                let task = event_as_task(event);
+                if task.reminder_leads.is_empty() {
+                    return None;
+                }
+                let moments: Vec<ReminderMoment> =
+                    reminders_for(&task, &self.calendar, &self.reminders)
+                        .into_iter()
+                        .map(|moment| ReminderMoment {
+                            anchor: ReminderAnchor::Start,
+                            ..moment
+                        })
+                        .collect();
+                Some((task, moments))
+            })
+            .collect()
     }
 
     /// Performs one fresh Anytype read and handles every reminder now due.
@@ -135,13 +185,20 @@ impl PushScheduler {
             tasks = batch.tasks.len(),
             audience, "scheduler evaluating reminders"
         );
-        for task in &batch.tasks {
+        let mut entries: Vec<(Task, Vec<ReminderMoment>)> = batch
+            .tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.clone(),
+                    reminders_for(task, &self.calendar, &self.reminders),
+                )
+            })
+            .collect();
+        entries.extend(self.event_entries().await);
+        for (task, moments) in &entries {
             // A task can carry several lead times, each claimed on its own.
-            let moments = reminders_for(task, &self.calendar, &self.reminders);
-            if moments.is_empty() {
-                continue;
-            }
-            for moment in moments {
+            for &moment in moments {
                 if moment.trigger_at > now {
                     // trace: every future reminder, every pass — too many
                     // lines at debug to keep a useful journal history.
@@ -274,6 +331,21 @@ impl PushScheduler {
     }
 }
 
+fn event_as_task(event: &Event) -> Task {
+    Task {
+        object_id: event.object_id.clone(),
+        name: event.name.clone(),
+        scheduled: event.start.clone(),
+        deadline: None,
+        done: false,
+        reminder_leads: event.leads(),
+        tags: event.tags.clone(),
+        ical_uid: event.ical_uid.clone(),
+        object_url: event.object_url.clone(),
+        last_modified: event.last_modified,
+    }
+}
+
 fn notification_for(
     task: &Task,
     moment: ReminderMoment,
@@ -326,6 +398,8 @@ fn label(anchor: ReminderAnchor, past: bool) -> &'static str {
         (ReminderAnchor::Deadline, true) => "Дедлайн был",
         (ReminderAnchor::Scheduled, false) => "По плану",
         (ReminderAnchor::Scheduled, true) => "По плану было",
+        (ReminderAnchor::Start, false) => "Начало",
+        (ReminderAnchor::Start, true) => "Началось",
     }
 }
 
@@ -571,6 +645,67 @@ mod tests {
             Some("https://object.any.coop/obj?spaceId=space")
         );
         assert_eq!(sent[0].tag.as_deref(), Some("obj"));
+    }
+
+    use crate::events::{Event, EventStore};
+
+    struct OneEvent(Event);
+
+    #[async_trait]
+    impl EventStore for OneEvent {
+        async fn list(&self) -> Result<Vec<Event>, SourceError> {
+            Ok(vec![self.0.clone()])
+        }
+        async fn get(&self, _: &str) -> Result<Option<Event>, SourceError> {
+            unreachable!()
+        }
+        async fn create(
+            &self,
+            _: &str,
+            _: &crate::events::EventPatch,
+        ) -> Result<String, SourceError> {
+            unreachable!()
+        }
+        async fn update(&self, _: &str, _: &crate::events::EventPatch) -> Result<(), SourceError> {
+            unreachable!()
+        }
+        async fn archive(&self, _: &str) -> Result<(), SourceError> {
+            unreachable!()
+        }
+    }
+
+    fn event(id: &str, leads: &[&str]) -> Event {
+        Event {
+            object_id: id.into(),
+            name: "Семинар".into(),
+            // 10:00 Saratov.
+            start: AnytypeDate::parse("2026-08-30T06:00:00Z"),
+            end: None,
+            location: None,
+            tags: Vec::new(),
+            reminder_names: leads.iter().map(|l| l.to_string()).collect(),
+            ical_uid: None,
+            object_url: None,
+            last_modified: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_event_start_is_reminded_only_with_its_own_leads() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 30, 5, 45, 10).unwrap();
+        let (scheduler, sink, _, _directory) = build_scheduler(vec![SourceStep::Tasks(Vec::new())]);
+        let scheduler = scheduler.with_events(Arc::new(OneEvent(event("ev", &["15m"]))));
+        scheduler.check_at(now).await.unwrap();
+        let sent = sink.notifications();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].title, "Семинар");
+        assert!(sent[0].body.starts_with("Начало "), "{}", sent[0].body);
+        assert!(sent[0].body.contains("10:00"), "{}", sent[0].body);
+
+        let (scheduler, sink, _, _directory) = build_scheduler(vec![SourceStep::Tasks(Vec::new())]);
+        let scheduler = scheduler.with_events(Arc::new(OneEvent(event("ev", &[]))));
+        scheduler.check_at(now).await.unwrap();
+        assert!(sink.notifications().is_empty());
     }
 
     /// A claim is permanent, so spending one while no browser is subscribed

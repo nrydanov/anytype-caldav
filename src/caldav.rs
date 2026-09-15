@@ -13,6 +13,8 @@
 //! - `/dav/calendars/`              → the one collection
 //! - `/dav/calendars/tasks/`        → collection properties, REPORT
 //! - `/dav/calendars/tasks/<id>.ics` → one task
+//! - `/dav/calendars/events/`       → events, when `caldav.events` is on
+//! - `/dav/calendars/events/<id>.ics` → one event
 //!
 //! Writes are accepted only when the service was given a `TaskWriter`; the
 //! collection then advertises `write` and Calino allows editing. PUT and DELETE
@@ -30,6 +32,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::{
+    events::{self as ev, EventService, EventWriteError},
     feed::{Outcome, Snapshot, calino_filename},
     http::AppState,
     source::SourceError,
@@ -40,6 +43,7 @@ pub const BASE: &str = "/dav/";
 const PRINCIPAL: &str = "/dav/principal/";
 const HOME: &str = "/dav/calendars/";
 const TASKS: &str = "/dav/calendars/tasks/";
+const EVENTS: &str = "/dav/calendars/events/";
 const REALM: &str = "anytype";
 
 /// Who may use the facade. The password is only ever held as a digest.
@@ -153,15 +157,37 @@ pub async fn handle(
         )]),
         ("PROPFIND", HOME) => {
             let writable = state.writer.is_some();
+            let events = match &state.events {
+                Some(service) => match service.snapshot().await {
+                    Ok(snapshot) => Some(response(
+                        EVENTS,
+                        &collection_props("VEVENT", "События", &snapshot.ctag, writable),
+                    )),
+                    Err(err) => return source_failure(&err),
+                },
+                None => None,
+            };
             with_snapshot(&state, |snapshot| {
-                multistatus(vec![response(TASKS, &collection_props(snapshot, writable))])
+                let mut responses = vec![response(
+                    TASKS,
+                    &collection_props("VTODO", "Anytype", &snapshot.etag, writable),
+                )];
+                responses.extend(events);
+                multistatus(responses)
             })
             .await
+        }
+        (_, _) if path.starts_with(EVENTS) && state.events.is_some() => {
+            let service = state.events.clone().expect("checked");
+            events_route(&state, &service, &method, &path, &depth, &headers, &body).await
         }
         ("PROPFIND", TASKS) => {
             let writable = state.writer.is_some();
             with_snapshot(&state, |snapshot| {
-                let mut responses = vec![response(TASKS, &collection_props(snapshot, writable))];
+                let mut responses = vec![response(
+                    TASKS,
+                    &collection_props("VTODO", "Anytype", &snapshot.etag, writable),
+                )];
                 // Depth 1 also lists members with their ETags, which is how a
                 // generic client finds out what changed without a REPORT.
                 if depth == "1" {
@@ -186,7 +212,7 @@ pub async fn handle(
                     debug!("caldav calendar-query for events: none");
                     multistatus(Vec::new())
                 }
-                Report::Tasks => {
+                Report::Tasks | Report::TasksOnly => {
                     debug!(
                         resources = snapshot.objects.len(),
                         "caldav calendar-query for tasks"
@@ -488,6 +514,292 @@ async fn delete(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
     status(StatusCode::NO_CONTENT)
 }
 
+// ------------------------------------------------------------------ events
+
+/// Every request under `events/`. Mirrors the task collection: the snapshot
+/// serves reads, a fresh read of the object decides write preconditions.
+async fn events_route(
+    state: &AppState,
+    service: &EventService,
+    method: &Method,
+    path: &str,
+    depth: &str,
+    headers: &HeaderMap,
+    body: &str,
+) -> Response {
+    let writable = state.writer.is_some();
+    let name = resource_name_in(path, EVENTS).map(str::to_string);
+    match (method.as_str(), path, name) {
+        ("PROPFIND", EVENTS, _) => match service.snapshot().await {
+            Ok(snapshot) => {
+                let mut responses = vec![response(
+                    EVENTS,
+                    &collection_props("VEVENT", "События", &snapshot.ctag, writable),
+                )];
+                if depth == "1" {
+                    responses.extend(snapshot.objects.iter().map(|(name, resource)| {
+                        response(&event_href(name), &[prop_text("d:getetag", &resource.etag)])
+                    }));
+                }
+                multistatus(responses)
+            }
+            Err(err) => source_failure(&err),
+        },
+        ("REPORT", EVENTS, _) => match report_kind(body) {
+            Report::SyncCollection => {
+                info!("caldav sync-collection on events requested but not supported");
+                status(StatusCode::FORBIDDEN)
+            }
+            Report::TasksOnly => {
+                debug!("caldav calendar-query for tasks in events: none");
+                multistatus(Vec::new())
+            }
+            Report::Tasks | Report::EventsOnly => match service.snapshot().await {
+                Ok(snapshot) => {
+                    debug!(
+                        resources = snapshot.objects.len(),
+                        "caldav calendar-query for events"
+                    );
+                    multistatus(
+                        snapshot
+                            .objects
+                            .iter()
+                            .map(|(name, resource)| {
+                                response(
+                                    &event_href(name),
+                                    &[
+                                        prop_text("d:getetag", &resource.etag),
+                                        prop_text("d:getcontenttype", "text/calendar"),
+                                        prop_text("c:calendar-data", &resource.ics),
+                                    ],
+                                )
+                            })
+                            .collect(),
+                    )
+                }
+                Err(err) => source_failure(&err),
+            },
+        },
+        ("PROPFIND" | "GET" | "HEAD", _, Some(name)) => {
+            let snapshot = match service.snapshot().await {
+                Ok(snapshot) => snapshot,
+                Err(err) => return source_failure(&err),
+            };
+            let Some(resource) = snapshot.objects.get(&name) else {
+                debug!(resource = %name, "caldav event not found");
+                return status(StatusCode::NOT_FOUND);
+            };
+            if method.as_str() == "PROPFIND" {
+                return multistatus(vec![response(
+                    &event_href(&name),
+                    &[prop_text("d:getetag", &resource.etag)],
+                )]);
+            }
+            let body = if method == Method::HEAD {
+                Body::empty()
+            } else {
+                Body::from(resource.ics.to_string())
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/calendar; charset=utf-8")
+                .header(header::ETAG, &resource.etag)
+                .body(body)
+                .expect("valid response")
+        }
+        ("PUT", _, Some(name)) if writable => put_event(service, &name, headers, body).await,
+        ("DELETE", _, Some(name)) if writable => delete_event(service, &name, headers).await,
+        ("PUT" | "DELETE" | "PROPPATCH" | "MKCOL" | "MKCALENDAR" | "MOVE" | "COPY", _, _) => {
+            info!(%method, path, writable, "caldav event write refused");
+            status(StatusCode::FORBIDDEN)
+        }
+        _ => {
+            debug!(%method, path, "caldav events path not found");
+            status(StatusCode::NOT_FOUND)
+        }
+    }
+}
+
+fn event_href(name: &str) -> String {
+    format!("{EVENTS}{name}.ics")
+}
+
+async fn locate_event(service: &EventService, name: &str) -> Result<Option<String>, Box<Response>> {
+    match service.snapshot().await {
+        Ok(snapshot) => Ok(snapshot.objects.get(name).map(|r| r.object_id.clone())),
+        Err(err) => Err(Box::new(source_failure(&err))),
+    }
+}
+
+async fn put_event(
+    service: &EventService,
+    name: &str,
+    headers: &HeaderMap,
+    body: &str,
+) -> Response {
+    let if_match = header_text(headers, header::IF_MATCH).filter(|v| v != "*");
+    let if_none_match = header_text(headers, header::IF_NONE_MATCH);
+    let incoming = match ev::parse_event(body) {
+        Ok(incoming) => incoming,
+        Err(err) => {
+            warn!(resource = name, error = %err, body_bytes = body.len(), "caldav event put: refused body");
+            let code = match err {
+                EventWriteError::NotCalendar(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::FORBIDDEN,
+            };
+            return Response::builder()
+                .status(code)
+                .body(Body::from(err.to_string()))
+                .expect("static response");
+        }
+    };
+    debug!(
+        resource = name,
+        ?incoming,
+        ?if_match,
+        ?if_none_match,
+        "caldav event put parsed"
+    );
+
+    let object_id = match locate_event(service, name).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return create_event(service, name, if_match, &incoming).await,
+        Err(response) => return *response,
+    };
+    let current = match service.source.get(&object_id).await {
+        Ok(Some(event)) => event,
+        Ok(None) => {
+            info!(resource = name, %object_id, "caldav event put: event vanished since the snapshot");
+            service.invalidate();
+            return if if_match.is_some() {
+                precondition_failed("resource no longer exists")
+            } else {
+                create_event(service, name, None, &incoming).await
+            };
+        }
+        Err(err) => return source_failure(&err),
+    };
+    let current_etag = service.resource(&current).map(|r| r.etag);
+    if if_none_match.as_deref() == Some("*") {
+        warn!(resource = name, %object_id, "caldav event put: If-None-Match * on an existing resource");
+        return precondition_failed("resource exists");
+    }
+    if let Some(expected) = &if_match
+        && Some(expected) != current_etag.as_ref()
+    {
+        warn!(resource = name, %object_id, client_etag = %expected, server_etag = ?current_etag, "caldav event put: stale etag");
+        return precondition_failed("etag mismatch");
+    }
+    let patch = ev::event_patch_for_update(&current, &incoming, &service.config);
+    if patch.is_empty() {
+        info!(resource = name, %object_id, "caldav event put: nothing changed");
+    } else {
+        info!(resource = name, %object_id, ?patch, "caldav event put: updating event");
+        if let Err(err) = service.source.update(&object_id, &patch).await {
+            return source_failure(&err);
+        }
+        service.invalidate();
+    }
+    event_written(service, &object_id, StatusCode::NO_CONTENT).await
+}
+
+async fn create_event(
+    service: &EventService,
+    name: &str,
+    if_match: Option<String>,
+    incoming: &ev::IncomingEvent,
+) -> Response {
+    if if_match.is_some() {
+        info!(
+            resource = name,
+            "caldav event put: If-Match on a missing resource"
+        );
+        return precondition_failed("resource does not exist");
+    }
+    let Some(uid) = incoming.uid.clone() else {
+        warn!(resource = name, "caldav event put: new event without UID");
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("VEVENT has no UID"))
+            .expect("static response");
+    };
+    if calino_filename(&uid) != name {
+        warn!(resource = name, %uid, expected = %calino_filename(&uid), "caldav event put: resource name does not match UID");
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from("resource name must be derived from the UID"))
+            .expect("static response");
+    }
+    if incoming.start.is_none() {
+        warn!(
+            resource = name,
+            "caldav event put: new event without DTSTART"
+        );
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("VEVENT has no DTSTART"))
+            .expect("static response");
+    }
+    let patch = ev::event_patch_for_create(incoming, &service.config);
+    info!(resource = name, %uid, ?patch, "caldav event put: creating event");
+    let object_id = match service.source.create(&uid, &patch).await {
+        Ok(id) => id,
+        Err(err) => return source_failure(&err),
+    };
+    service.invalidate();
+    event_written(service, &object_id, StatusCode::CREATED).await
+}
+
+async fn event_written(service: &EventService, object_id: &str, code: StatusCode) -> Response {
+    let mut builder = Response::builder().status(code);
+    match service.source.get(object_id).await {
+        Ok(Some(event)) => match service.resource(&event) {
+            Some(resource) => {
+                info!(%object_id, etag = %resource.etag, status = code.as_u16(), "caldav event write done");
+                builder = builder.header(header::ETAG, resource.etag);
+            }
+            None => warn!(%object_id, "caldav event write done but the event has no start"),
+        },
+        other => {
+            warn!(%object_id, result = ?other.map(|e| e.is_some()), "caldav event write done but reading it back failed");
+        }
+    }
+    builder.body(Body::empty()).expect("static response")
+}
+
+async fn delete_event(service: &EventService, name: &str, headers: &HeaderMap) -> Response {
+    let if_match = header_text(headers, header::IF_MATCH).filter(|v| v != "*");
+    let object_id = match locate_event(service, name).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            info!(resource = name, "caldav event delete: already gone");
+            return status(StatusCode::NOT_FOUND);
+        }
+        Err(response) => return *response,
+    };
+    let current = match service.source.get(&object_id).await {
+        Ok(Some(event)) => event,
+        Ok(None) => {
+            service.invalidate();
+            return status(StatusCode::NOT_FOUND);
+        }
+        Err(err) => return source_failure(&err),
+    };
+    let current_etag = service.resource(&current).map(|r| r.etag);
+    if let Some(expected) = &if_match
+        && Some(expected) != current_etag.as_ref()
+    {
+        warn!(resource = name, %object_id, client_etag = %expected, server_etag = ?current_etag, "caldav event delete: stale etag");
+        return precondition_failed("etag mismatch");
+    }
+    info!(resource = name, %object_id, event = %current.name, "caldav event delete: archiving event");
+    if let Err(err) = service.source.archive(&object_id).await {
+        return source_failure(&err);
+    }
+    service.invalidate();
+    status(StatusCode::NO_CONTENT)
+}
+
 /// Runs `render` against the current snapshot, or reports why there is none.
 /// A stale snapshot is served: a calendar client keeps working while Anytype
 /// is briefly unreachable, exactly as the feed does.
@@ -516,6 +828,7 @@ where
 #[derive(Debug, PartialEq)]
 enum Report {
     Tasks,
+    TasksOnly,
     EventsOnly,
     SyncCollection,
 }
@@ -530,19 +843,23 @@ fn report_kind(body: &str) -> Report {
     let asks_tasks = body.contains("\"VTODO\"") || body.contains("'VTODO'");
     if asks_events && !asks_tasks {
         Report::EventsOnly
+    } else if asks_tasks && !asks_events {
+        Report::TasksOnly
     } else {
         Report::Tasks
     }
 }
 
-fn collection_props(snapshot: &Snapshot, writable: bool) -> Vec<String> {
+fn collection_props(component: &str, name: &str, ctag: &str, writable: bool) -> Vec<String> {
     vec![
         "<d:resourcetype><d:collection/><c:calendar/></d:resourcetype>".to_string(),
-        prop_text("d:displayname", "Anytype"),
-        "<c:supported-calendar-component-set><c:comp name=\"VTODO\"/></c:supported-calendar-component-set>".to_string(),
-        // Changes whenever any task changes, so Calino can skip an unchanged
+        prop_text("d:displayname", name),
+        format!(
+            "<c:supported-calendar-component-set><c:comp name=\"{component}\"/></c:supported-calendar-component-set>"
+        ),
+        // Changes whenever any member changes, so Calino can skip an unchanged
         // collection without listing it.
-        prop_text("cs:getctag", &snapshot.etag),
+        prop_text("cs:getctag", ctag),
         if writable {
             "<d:current-user-privilege-set><d:privilege><d:read/></d:privilege><d:privilege><d:write/></d:privilege><d:privilege><d:write-content/></d:privilege><d:privilege><d:bind/></d:privilege><d:privilege><d:unbind/></d:privilege></d:current-user-privilege-set>".to_string()
         } else {
@@ -555,7 +872,11 @@ fn collection_props(snapshot: &Snapshot, writable: bool) -> Vec<String> {
 /// name Calino derived from a UID, so only `[A-Za-z0-9._~-]` is accepted; `..`
 /// and anything path-like is refused rather than looked up.
 fn object_id(path: &str) -> Option<&str> {
-    let name = path.strip_prefix(TASKS)?.strip_suffix(".ics")?;
+    resource_name_in(path, TASKS)
+}
+
+fn resource_name_in<'a>(path: &'a str, collection: &str) -> Option<&'a str> {
+    let name = path.strip_prefix(collection)?.strip_suffix(".ics")?;
     let plain = name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '-'));
@@ -569,7 +890,11 @@ fn href_for(object_id: &str) -> String {
 /// Collections are addressed with a trailing slash; accept them without one.
 fn normalize(path: &str) -> String {
     match path {
-        "/dav" | "/dav/principal" | "/dav/calendars" | "/dav/calendars/tasks" => format!("{path}/"),
+        "/dav"
+        | "/dav/principal"
+        | "/dav/calendars"
+        | "/dav/calendars/tasks"
+        | "/dav/calendars/events" => format!("{path}/"),
         other => other.to_string(),
     }
 }
@@ -666,7 +991,8 @@ mod tests {
         let todo = r#"<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VTODO"/></c:comp-filter></c:filter></c:calendar-query>"#;
         let event = todo.replace("VTODO", "VEVENT");
         let sync = r#"<D:sync-collection xmlns:D="DAV:"><D:sync-token/><D:sync-level>1</D:sync-level></D:sync-collection>"#;
-        assert_eq!(report_kind(todo), Report::Tasks);
+        assert_eq!(report_kind(todo), Report::TasksOnly);
+        assert_eq!(report_kind("<c:calendar-query/>"), Report::Tasks);
         assert_eq!(report_kind(&event), Report::EventsOnly);
         assert_eq!(report_kind(sync), Report::SyncCollection);
     }

@@ -502,21 +502,21 @@ impl SeriesGenerator {
     }
 }
 
-fn text(object: &Object, key: &str) -> Option<String> {
+pub(crate) fn text(object: &Object, key: &str) -> Option<String> {
     match &object.get_property(key)?.value {
         PropertyValue::Text { text } => Some(text.clone()).filter(|t| !t.trim().is_empty()),
         _ => None,
     }
 }
 
-fn date(object: &Object, key: &str) -> Option<AnytypeDate> {
+pub(crate) fn date(object: &Object, key: &str) -> Option<AnytypeDate> {
     match &object.get_property(key)?.value {
         PropertyValue::Date { date } => AnytypeDate::parse(date),
         _ => None,
     }
 }
 
-fn tag_ids(object: &Object, key: &str) -> Vec<String> {
+pub(crate) fn tag_ids(object: &Object, key: &str) -> Vec<String> {
     object
         .get_property_multi_select(key)
         .map(|tags| tags.iter().map(|tag| tag.id.clone()).collect())

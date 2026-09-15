@@ -268,7 +268,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     ) {
         (true, Some(key_path), Some(state_path), Some(durable_state)) => {
             let service = PushService::load(key_path, durable_state.clone())?;
-            let scheduler = Arc::new(PushScheduler::new(
+            let scheduler = PushScheduler::new(
                 source,
                 durable_state,
                 service.clone(),
@@ -277,7 +277,16 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 config.push.poll_interval,
                 config.push.late_window,
                 config.server.request_timeout,
-            ));
+            );
+            let scheduler = Arc::new(match (config.caldav.events, config.reminders.enabled) {
+                (true, _) => scheduler.with_events(Arc::new(
+                    anytype_task_exporter::events::AnytypeEvents::new(
+                        build_client(&config.anytype)?,
+                        config.anytype.space_id.clone(),
+                    ),
+                )),
+                (false, _) => scheduler,
+            });
             info!(
                 public_key = %service.public_key(),
                 subscriptions = service.subscription_count(),
@@ -336,7 +345,28 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let events = if config.caldav.events {
+        use anytype_task_exporter::events::{AnytypeEvents, EventService};
+        info!(
+            ttl = ?config.server.min_refresh_interval,
+            writable = config.caldav.writable,
+            "caldav events collection enabled"
+        );
+        Some(Arc::new(EventService::new(
+            Arc::new(AnytypeEvents::new(
+                build_client(&config.anytype)?,
+                config.anytype.space_id.clone(),
+            )),
+            config.calendar.clone(),
+            Utc::now(),
+            config.server.min_refresh_interval,
+        )))
+    } else {
+        None
+    };
+
     let state = http::AppState {
+        events,
         feed,
         allowed_origins: Arc::new(config.server.allowed_origins.clone()),
         caldav,

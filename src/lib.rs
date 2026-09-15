@@ -3,6 +3,7 @@
 pub mod anytype_source;
 pub mod caldav;
 pub mod config;
+pub mod events;
 pub mod feed;
 pub mod http;
 pub mod install;

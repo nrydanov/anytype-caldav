@@ -281,7 +281,7 @@ impl FeedService {
     }
 }
 
-fn etag_for(body: &str) -> String {
+pub fn etag_for(body: &str) -> String {
     let digest = Sha256::digest(body.as_bytes());
     format!("\"{}\"", hex::encode(&digest[..16]))
 }

@@ -57,7 +57,7 @@ impl Patch {
 }
 
 pub fn parse(body: &str) -> Result<Incoming, WriteError> {
-    let calendar: Calendar = body.parse().map_err(WriteError::NotCalendar)?;
+    let calendar: Calendar = terminated(body).parse().map_err(WriteError::NotCalendar)?;
     let todos: Vec<&Todo> = calendar.todos().collect();
     let todo = match todos.as_slice() {
         [] => return Err(WriteError::NoTodo),
@@ -85,14 +85,24 @@ pub fn parse(body: &str) -> Result<Incoming, WriteError> {
     })
 }
 
+/// The parser rejects a document whose last line has no line break; some
+/// clients and shell tools send one.
+pub(crate) fn terminated(body: &str) -> std::borrow::Cow<'_, str> {
+    if body.ends_with('\n') {
+        body.into()
+    } else {
+        format!("{body}\r\n").into()
+    }
+}
+
 /// A date on the wire, normalised so two spellings of one moment compare equal.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Moment {
+pub(crate) enum Moment {
     Day(NaiveDate),
     At(DateTime<Utc>),
 }
 
-fn moment(value: &DatePerhapsTime, tz: Tz) -> Option<Moment> {
+pub(crate) fn moment(value: &DatePerhapsTime, tz: Tz) -> Option<Moment> {
     Some(match value {
         DatePerhapsTime::Date(day) => Moment::Day(*day),
         DatePerhapsTime::DateTime(CalendarDateTime::Utc(at)) => Moment::At(*at),
@@ -114,7 +124,7 @@ fn moment(value: &DatePerhapsTime, tz: Tz) -> Option<Moment> {
 
 /// Anytype's storage shape: a date-only value is local midnight in
 /// `date_only_timezone`, serialised as UTC.
-fn to_anytype(value: Moment, date_only_tz: Tz) -> Option<String> {
+pub(crate) fn to_anytype(value: Moment, date_only_tz: Tz) -> Option<String> {
     let utc = match value {
         Moment::Day(day) => date_only_tz
             .from_local_datetime(&day.and_time(NaiveTime::MIN))

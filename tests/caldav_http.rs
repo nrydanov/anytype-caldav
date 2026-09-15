@@ -82,6 +82,7 @@ fn router() -> Router {
             push: None,
             caldav: Some(Arc::new(Credentials::new("me", "pw"))),
             writer: None,
+            events: None,
         },
         "/f/secret/todos.ics",
     )
@@ -286,7 +287,7 @@ async fn an_event_query_returns_nothing() {
 #[tokio::test]
 async fn a_query_outside_the_calendar_is_forbidden_rather_than_missing() {
     for path in ["/dav/", "/dav/principal/", "/dav/calendars/"] {
-        let (status, _, _) = send(&router(), "REPORT", path, Some("1"), &TODO_QUERY).await;
+        let (status, _, _) = send(&router(), "REPORT", path, Some("1"), TODO_QUERY).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
     }
 }
@@ -434,6 +435,7 @@ mod writes {
                 push: None,
                 caldav: Some(Arc::new(Credentials::new("me", "pw"))),
                 writer: Some(store.clone()),
+                events: None,
             },
             "/f/secret/todos.ics",
         );
@@ -633,5 +635,312 @@ mod writes {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    mod events {
+        use anytype_task_exporter::events::{Event, EventPatch, EventService, EventStore};
+
+        use super::*;
+
+        #[derive(Default)]
+        struct Events {
+            events: Mutex<Vec<Event>>,
+            next: Mutex<u32>,
+        }
+
+        fn apply(event: &mut Event, patch: &EventPatch) {
+            if let Some(name) = &patch.name {
+                event.name = name.clone();
+            }
+            if let Some(start) = &patch.start {
+                event.start = start.as_deref().and_then(AnytypeDate::parse);
+            }
+            if let Some(end) = &patch.end {
+                event.end = end.as_deref().and_then(AnytypeDate::parse);
+            }
+            if let Some(location) = &patch.location {
+                event.location = location.clone();
+            }
+            if let Some(reminders) = &patch.reminders {
+                event.reminder_names = reminders.clone();
+            }
+            event.last_modified = Some(event.last_modified.unwrap() + chrono::Duration::seconds(1));
+        }
+
+        #[async_trait]
+        impl EventStore for Events {
+            async fn list(&self) -> Result<Vec<Event>, SourceError> {
+                Ok(self.events.lock().unwrap().clone())
+            }
+            async fn get(&self, object_id: &str) -> Result<Option<Event>, SourceError> {
+                Ok(self
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e.object_id == object_id)
+                    .cloned())
+            }
+            async fn create(&self, uid: &str, patch: &EventPatch) -> Result<String, SourceError> {
+                let mut next = self.next.lock().unwrap();
+                *next += 1;
+                let mut event = lecture(&format!("new{next}"));
+                event.ical_uid = Some(uid.into());
+                event.reminder_names.clear();
+                event.location = None;
+                apply(&mut event, patch);
+                let id = event.object_id.clone();
+                self.events.lock().unwrap().push(event);
+                Ok(id)
+            }
+            async fn update(&self, object_id: &str, patch: &EventPatch) -> Result<(), SourceError> {
+                let mut events = self.events.lock().unwrap();
+                let event = events
+                    .iter_mut()
+                    .find(|e| e.object_id == object_id)
+                    .unwrap();
+                apply(event, patch);
+                Ok(())
+            }
+            async fn archive(&self, object_id: &str) -> Result<(), SourceError> {
+                self.events
+                    .lock()
+                    .unwrap()
+                    .retain(|e| e.object_id != object_id);
+                Ok(())
+            }
+        }
+
+        fn lecture(id: &str) -> Event {
+            Event {
+                object_id: id.into(),
+                name: "Лекция".into(),
+                start: AnytypeDate::parse("2026-09-20T09:50:00Z"),
+                end: AnytypeDate::parse("2026-09-20T11:20:00Z"),
+                location: Some("Кафедра".into()),
+                tags: vec!["Аспирантура".into()],
+                reminder_names: vec!["15m".into()],
+                ical_uid: None,
+                object_url: None,
+                last_modified: Some(Utc.with_ymd_and_hms(2026, 9, 15, 12, 0, 0).unwrap()),
+            }
+        }
+
+        fn with_events() -> (Router, Arc<Events>) {
+            let (_, tasks) = writable();
+            let events = Arc::new(Events::default());
+            events.events.lock().unwrap().push(lecture("bafyreieee"));
+            let mut undated = lecture("bafyreiundated");
+            undated.start = None;
+            events.events.lock().unwrap().push(undated);
+            let config = CalendarConfig {
+                timezone: Saratov,
+                name: "Anytype Tasks".into(),
+                date_only_timezone: Saratov,
+            };
+            let renderer = VTodoRenderer::new(
+                config.clone(),
+                RemindersConfig {
+                    enabled: false,
+                    lead_time: chrono::Duration::minutes(30),
+                    all_day_time: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+                },
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+            );
+            let feed = Arc::new(FeedService::new(
+                tasks.clone(),
+                renderer,
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+            ));
+            let service = EventService::new(
+                events.clone(),
+                config,
+                Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                // No cache, so every request sees the store as it is.
+                Duration::ZERO,
+            );
+            let router = http::router(
+                AppState {
+                    feed,
+                    allowed_origins: Arc::new(Vec::new()),
+                    push: None,
+                    caldav: Some(Arc::new(Credentials::new("me", "pw"))),
+                    writer: Some(tasks),
+                    events: Some(Arc::new(service)),
+                },
+                "/f/secret/todos.ics",
+            );
+            (router, events)
+        }
+
+        const EVENT_QUERY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:time-range start="20260901T000000Z" end="20261101T000000Z"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>"#;
+
+        #[tokio::test]
+        async fn the_home_set_lists_tasks_and_events_by_component() {
+            let (router, _) = with_events();
+            let (status, _, body) =
+                send(&router, "PROPFIND", "/dav/calendars/", Some("1"), "").await;
+            assert_eq!(status, StatusCode::MULTI_STATUS);
+            assert!(
+                body.contains("<d:href>/dav/calendars/tasks/</d:href>"),
+                "{body}"
+            );
+            assert!(
+                body.contains("<d:href>/dav/calendars/events/</d:href>"),
+                "{body}"
+            );
+            assert!(body.contains(r#"<c:comp name="VEVENT"/>"#), "{body}");
+        }
+
+        #[tokio::test]
+        async fn an_event_query_serves_dated_events_and_a_task_query_none() {
+            let (router, _) = with_events();
+            let (status, _, body) = send(
+                &router,
+                "REPORT",
+                "/dav/calendars/events/",
+                Some("1"),
+                EVENT_QUERY,
+            )
+            .await;
+            assert_eq!(status, StatusCode::MULTI_STATUS);
+            assert_eq!(body.matches("<d:response>").count(), 1, "{body}");
+            assert!(
+                body.contains("/dav/calendars/events/bafyreieee.ics"),
+                "{body}"
+            );
+            assert!(body.contains("TRIGGER:-PT15M"), "{body}");
+            let (_, _, body) = send(
+                &router,
+                "REPORT",
+                "/dav/calendars/events/",
+                Some("1"),
+                TODO_QUERY,
+            )
+            .await;
+            assert_eq!(body.matches("<d:response>").count(), 0, "{body}");
+        }
+
+        async fn get_event(router: &Router, name: &str) -> (String, String) {
+            let (status, headers, ics) = send(
+                router,
+                "GET",
+                &format!("/dav/calendars/events/{name}.ics"),
+                None,
+                "",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{name}");
+            (
+                headers
+                    .get(header::ETAG)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                ics,
+            )
+        }
+
+        #[tokio::test]
+        async fn moving_an_event_in_the_client_writes_its_dates() {
+            let (router, events) = with_events();
+            let (etag, ics) = get_event(&router, "bafyreieee").await;
+            let edited = ics
+                .replace("DTSTART:20260920T095000Z", "DTSTART:20260921T100000Z")
+                .replace("DTEND:20260920T112000Z", "DTEND:20260921T113000Z")
+                .replace("TRIGGER:-PT15M", "TRIGGER:-PT60M");
+            let (status, new_etag) = put(
+                &router,
+                "/dav/calendars/events/bafyreieee.ics",
+                Some(("If-Match", &etag)),
+                &edited,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            assert!(new_etag.is_some_and(|e| e != etag));
+            let stored = events.events.lock().unwrap()[0].clone();
+            assert_eq!(stored.start.unwrap().raw, "2026-09-21T10:00:00Z");
+            assert_eq!(stored.end.unwrap().raw, "2026-09-21T11:30:00Z");
+            assert_eq!(stored.reminder_names, vec!["1h".to_string()]);
+        }
+
+        #[tokio::test]
+        async fn a_stale_event_etag_is_refused() {
+            let (router, _) = with_events();
+            let (_, ics) = get_event(&router, "bafyreieee").await;
+            let (status, _) = put(
+                &router,
+                "/dav/calendars/events/bafyreieee.ics",
+                Some(("If-Match", "\"old\"")),
+                &ics,
+            )
+            .await;
+            assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        }
+
+        #[tokio::test]
+        async fn an_event_created_in_the_client_lands_in_anytype_under_its_name() {
+            let (router, events) = with_events();
+            let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:abc 1\r\nSUMMARY:Встреча\r\nDTSTART;VALUE=DATE:20261001\r\nDTEND;VALUE=DATE:20261003\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+            let (status, etag) = put(
+                &router,
+                "/dav/calendars/events/abc~201.ics",
+                Some(("If-None-Match", "*")),
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            let (served, _) = get_event(&router, "abc~201").await;
+            assert_eq!(Some(served), etag);
+            let stored = events.events.lock().unwrap().last().cloned().unwrap();
+            // All day, 1–2 October: last day inclusive in Anytype.
+            assert_eq!(stored.start.unwrap().raw, "2026-09-30T20:00:00Z");
+            assert_eq!(stored.end.unwrap().raw, "2026-10-01T20:00:00Z");
+        }
+
+        #[tokio::test]
+        async fn a_recurring_event_is_refused() {
+            let (router, _) = with_events();
+            let body = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:r\r\nSUMMARY:x\r\nDTSTART:20261001T100000Z\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+            let (status, _) = put(
+                &router,
+                "/dav/calendars/events/r.ics",
+                Some(("If-None-Match", "*")),
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn deleting_an_event_archives_it() {
+            let (router, events) = with_events();
+            let (etag, _) = get_event(&router, "bafyreieee").await;
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri("/dav/calendars/events/bafyreieee.ics")
+                        .header(header::AUTHORIZATION, auth())
+                        .header("If-Match", etag)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert!(
+                events
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e.object_id != "bafyreieee")
+            );
+        }
     }
 }

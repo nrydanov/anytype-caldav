@@ -11,6 +11,8 @@ use crate::{
 pub enum ReminderAnchor {
     Deadline,
     Scheduled,
+    /// The start of an event.
+    Start,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
