@@ -284,6 +284,14 @@ async fn an_event_query_returns_nothing() {
 }
 
 #[tokio::test]
+async fn a_query_outside_the_calendar_is_forbidden_rather_than_missing() {
+    for path in ["/dav/", "/dav/principal/", "/dav/calendars/"] {
+        let (status, _, _) = send(&router(), "REPORT", path, Some("1"), &TODO_QUERY).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+    }
+}
+
+#[tokio::test]
 async fn unknown_resources_are_missing_and_writes_are_refused() {
     let router = router();
     let (status, _, _) = send(

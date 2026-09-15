@@ -248,6 +248,13 @@ pub async fn handle(
             let name = object_id(&path).expect("checked").to_string();
             delete(&state, &name, &headers).await
         }
+        // A query at the base, principal or home set: not a calendar collection.
+        // RFC 4791 wants 403 here; Calino's diagnostics read 404 as a
+        // broken server and 403 as "point me at a calendar".
+        ("REPORT", BASE | "/" | PRINCIPAL | HOME) => {
+            debug!(path = %path, "caldav report outside a calendar collection");
+            status(StatusCode::FORBIDDEN)
+        }
         ("PUT" | "DELETE" | "PROPPATCH" | "MKCOL" | "MKCALENDAR" | "MOVE" | "COPY", _) => {
             info!(%method, path = %path, writable = state.writer.is_some(), "caldav write refused");
             status(StatusCode::FORBIDDEN)
