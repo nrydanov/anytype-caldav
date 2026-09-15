@@ -209,6 +209,16 @@ impl StateStore {
         Ok(changed == 1)
     }
 
+    /// Whether an occurrence was claimed before, without claiming it.
+    pub fn instance_claimed(&self, series_id: &str, day: NaiveDate) -> Result<bool, StateError> {
+        let count: i64 = self.connection()?.query_row(
+            "SELECT COUNT(*) FROM generated_instances WHERE series_id = ?1 AND occurrence_day = ?2",
+            params![series_id, day.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Undoes a claim whose task could not be created, so the next check retries.
     pub fn release_instance(&self, series_id: &str, day: NaiveDate) -> Result<(), StateError> {
         self.connection()?.execute(
@@ -272,7 +282,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.sqlite3")).unwrap();
         let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 26).unwrap();
+        assert!(!store.instance_claimed("guitar", day).unwrap());
         assert!(store.claim_instance("guitar", day).unwrap());
+        assert!(store.instance_claimed("guitar", day).unwrap());
         assert!(!store.claim_instance("guitar", day).unwrap());
         assert!(store.claim_instance("rent", day).unwrap());
         store.release_instance("guitar", day).unwrap();

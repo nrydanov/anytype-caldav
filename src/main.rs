@@ -147,7 +147,18 @@ async fn generate(config: Config, apply: bool) -> Result<(), Box<dyn std::error:
         config.anytype.space_id.clone(),
     );
     let tz = config.calendar.timezone;
-    let today = Utc::now().with_timezone(&tz).date_naive();
+    let now = Utc::now();
+    let today = now.with_timezone(&tz).date_naive();
+    // The claims are what keep a task deleted by hand from coming back, so the
+    // command uses the same database as the service when one is configured.
+    // A different machine's database protects only that machine's runs.
+    let state = match config.push.state_file.as_deref() {
+        Some(path) => Some(Arc::new(StateStore::open(path)?)),
+        None => {
+            println!("  note    no push.state_file: occurrences created before are not remembered");
+            None
+        }
+    };
 
     let all = space.series().await?;
     let instances = space.instances().await?;
@@ -166,8 +177,18 @@ async fn generate(config: Config, apply: bool) -> Result<(), Box<dyn std::error:
         return Ok(());
     }
     for one in &planned {
+        let claimed = match &state {
+            Some(state) => state.instance_claimed(&one.series.id, one.day)?,
+            None => false,
+        };
+        let verb = if claimed { "skip   " } else { "create " };
+        let why = if claimed {
+            "; created once before, perhaps deleted by hand"
+        } else {
+            ""
+        };
         println!(
-            "  create  {:?} for {} ({})",
+            "  {verb} {:?} for {} ({}){why}",
             one.series.name, one.day, one.occurrence
         );
     }
@@ -175,9 +196,19 @@ async fn generate(config: Config, apply: bool) -> Result<(), Box<dyn std::error:
         println!("dry run: nothing was created; re-run with --apply");
         return Ok(());
     }
-    for one in &planned {
-        let id = space.create(one).await?;
-        println!("  created {id}");
+    match state {
+        // The same pass the service runs, claims included.
+        Some(state) => {
+            let generator = SeriesGenerator::new(space, state, tz, config.series.poll_interval);
+            let created = generator.check_at(now).await?;
+            println!("  created {created}");
+        }
+        None => {
+            for one in &planned {
+                let id = space.create(one).await?;
+                println!("  created {id}");
+            }
+        }
     }
     Ok(())
 }
