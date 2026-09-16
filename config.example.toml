@@ -74,3 +74,17 @@ all_day_time = "09:00"
 # Declarative Web Push envelope, which Safari on iOS 18.4+ shows without a
 # service worker. See deploy/calino/ for subscribing from inside Calino.
 # app_url = "https://calendar.example/"
+
+# CalDAV facade under /dav/, for a calendar app such as Calino. The password
+# comes from CALDAV_PASSWORD, next to the Anytype API key.
+# [caldav]
+# enabled = true
+# username = "anytype"
+# Accept edits from the client and write them to Anytype. Off by default, so a
+# deploy never makes the calendar editable by itself.
+# writable = true
+# Serve objects of type `event` as a second collection, events/.
+# events = true
+# Store the client's own settings documents, outside Anytype. Needs
+# push.state_file, which holds the database they are kept in.
+# settings = true
