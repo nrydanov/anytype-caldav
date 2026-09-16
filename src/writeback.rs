@@ -103,7 +103,7 @@ pub(crate) fn terminated(body: &str) -> std::borrow::Cow<'_, str> {
 
 /// A date on the wire, normalised so two spellings of one moment compare equal.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum Moment {
+pub enum Moment {
     Day(NaiveDate),
     At(DateTime<Utc>),
 }
@@ -130,7 +130,7 @@ pub(crate) fn moment(value: &DatePerhapsTime, tz: Tz) -> Option<Moment> {
 
 /// Anytype's storage shape: a date-only value is local midnight in
 /// `date_only_timezone`, serialised as UTC.
-pub(crate) fn to_anytype(value: Moment, date_only_tz: Tz) -> Option<String> {
+pub fn to_anytype(value: Moment, date_only_tz: Tz) -> Option<String> {
     let utc = match value {
         Moment::Day(day) => date_only_tz
             .from_local_datetime(&day.and_time(NaiveTime::MIN))

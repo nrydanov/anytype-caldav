@@ -2,6 +2,7 @@
 
 pub mod anytype_source;
 pub mod caldav;
+pub mod capture;
 pub mod config;
 pub mod events;
 pub mod feed;
