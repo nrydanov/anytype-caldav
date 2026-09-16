@@ -112,6 +112,16 @@ impl StateStore {
                     created_at_ms INTEGER NOT NULL,
                     PRIMARY KEY (series_id, occurrence_day)
                 );
+                -- Opaque client documents, stored byte for byte: a calendar
+                -- app's own settings have no place in Anytype. Added without
+                -- bumping user_version, like generated_instances.
+                CREATE TABLE IF NOT EXISTS client_documents (
+                    collection TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (collection, name)
+                );
                 PRAGMA user_version = 1;",
             )
             .map_err(|source| StateError::Open {
@@ -226,6 +236,45 @@ impl StateStore {
             params![series_id, day.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Every document of a collection, oldest name first.
+    pub fn documents(&self, collection: &str) -> Result<Vec<(String, String)>, StateError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT name, body FROM client_documents WHERE collection = ?1 ORDER BY name",
+        )?;
+        let rows =
+            statement.query_map(params![collection], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn document(&self, collection: &str, name: &str) -> Result<Option<String>, StateError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT body FROM client_documents WHERE collection = ?1 AND name = ?2")?;
+        let mut rows = statement.query_map(params![collection, name], |row| row.get(0))?;
+        rows.next().transpose().map_err(StateError::from)
+    }
+
+    pub fn put_document(&self, collection: &str, name: &str, body: &str) -> Result<(), StateError> {
+        self.connection()?.execute(
+            "INSERT INTO client_documents (collection, name, body, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (collection, name) DO UPDATE
+             SET body = excluded.body, updated_at_ms = excluded.updated_at_ms",
+            params![collection, name, body, Utc::now().timestamp_millis()],
+        )?;
+        Ok(())
+    }
+
+    /// `true` when a document was there to remove.
+    pub fn delete_document(&self, collection: &str, name: &str) -> Result<bool, StateError> {
+        let removed = self.connection()?.execute(
+            "DELETE FROM client_documents WHERE collection = ?1 AND name = ?2",
+            params![collection, name],
+        )?;
+        Ok(removed == 1)
     }
 
     fn connection(&self) -> Result<MutexGuard<'_, Connection>, StateError> {

@@ -15,6 +15,7 @@
 //! - `/dav/calendars/tasks/<id>.ics` → one task
 //! - `/dav/calendars/events/`       → events, when `caldav.events` is on
 //! - `/dav/calendars/events/<id>.ics` → one event
+//! - `/dav/calendars/calino-settings/` → the client's own documents, stored as they arrive
 //!
 //! Writes are accepted only when the service was given a `TaskWriter`; the
 //! collection then advertises `write` and Calino allows editing. PUT and DELETE
@@ -29,13 +30,14 @@ use axum::{
 };
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     events::{self as ev, EventService, EventWriteError},
-    feed::{Outcome, Snapshot, calino_filename},
+    feed::{Outcome, Snapshot, calino_filename, etag_for},
     http::AppState,
     source::SourceError,
+    state::StateStore,
     writeback::{self, WriteError},
 };
 
@@ -44,6 +46,15 @@ const PRINCIPAL: &str = "/dav/principal/";
 const HOME: &str = "/dav/calendars/";
 const TASKS: &str = "/dav/calendars/tasks/";
 const EVENTS: &str = "/dav/calendars/events/";
+/// Calino keeps its own settings in a calendar of its own, marked with a dead
+/// property (`settingsSync.ts`, `CalDAVClient.discoverSettingsCalendar`). The
+/// documents are stored as they arrive: they describe the calendar app, not
+/// the task space, so nothing of them belongs in Anytype.
+const SETTINGS: &str = "/dav/calendars/calino-settings/";
+const SETTINGS_NAMESPACE: &str = "http://calino.app/ns/";
+const SETTINGS_DISPLAY_NAME: &str = "Calino Settings";
+/// A settings document is a few kilobytes; this only stops a runaway client.
+const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 const REALM: &str = "anytype";
 
 /// Who may use the facade. The password is only ever held as a digest.
@@ -167,15 +178,24 @@ pub async fn handle(
                 },
                 None => None,
             };
+            let settings = state
+                .documents
+                .as_ref()
+                .map(|store| response(SETTINGS, &settings_collection_props(store)));
             with_snapshot(&state, |snapshot| {
                 let mut responses = vec![response(
                     TASKS,
                     &collection_props("VTODO", "Anytype", &snapshot.etag, writable),
                 )];
                 responses.extend(events);
+                responses.extend(settings);
                 multistatus(responses)
             })
             .await
+        }
+        (_, _) if path.starts_with(SETTINGS) && state.documents.is_some() => {
+            let store = state.documents.clone().expect("checked");
+            settings_route(&store, &method, &path, &depth, &headers, &body)
         }
         (_, _) if path.starts_with(EVENTS) && state.events.is_some() => {
             let service = state.events.clone().expect("checked");
@@ -514,6 +534,153 @@ async fn delete(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
     }
     state.feed.invalidate();
     status(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------- settings
+
+fn settings_collection_props(store: &StateStore) -> Vec<String> {
+    let ctag = store
+        .documents(SETTINGS)
+        .map(|documents| {
+            etag_for(
+                &documents
+                    .iter()
+                    .map(|(name, body)| format!("{name}:{body}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            )
+        })
+        .unwrap_or_else(|_| "\"unknown\"".to_string());
+    let mut props = collection_props("VEVENT", SETTINGS_DISPLAY_NAME, &ctag, true);
+    // The marker Calino looks for; without it the client makes a calendar of
+    // its own, which this server does not allow.
+    props.push(format!(
+        "<C:X-CALINO-SETTINGS-CALENDAR xmlns:C=\"{SETTINGS_NAMESPACE}\">1</C:X-CALINO-SETTINGS-CALENDAR>"
+    ));
+    props
+}
+
+fn document_name(path: &str) -> Option<&str> {
+    resource_name_in(path, SETTINGS)
+}
+
+fn settings_route(
+    store: &StateStore,
+    method: &Method,
+    path: &str,
+    depth: &str,
+    headers: &HeaderMap,
+    body: &str,
+) -> Response {
+    let name = document_name(path).map(str::to_string);
+    let documents = |store: &StateStore| store.documents(SETTINGS).unwrap_or_default();
+    match (method.as_str(), path, name) {
+        ("PROPFIND", SETTINGS, _) => {
+            let mut responses = vec![response(SETTINGS, &settings_collection_props(store))];
+            if depth == "1" {
+                responses.extend(documents(store).into_iter().map(|(name, body)| {
+                    response(
+                        &format!("{SETTINGS}{name}.ics"),
+                        &[prop_text("d:getetag", &etag_for(&body))],
+                    )
+                }));
+            }
+            multistatus(responses)
+        }
+        // Calino filters by UID; every document of this collection is its own,
+        // so the filter needs no reading.
+        ("REPORT", SETTINGS, _) => multistatus(
+            documents(store)
+                .into_iter()
+                .map(|(name, body)| {
+                    response(
+                        &format!("{SETTINGS}{name}.ics"),
+                        &[
+                            prop_text("d:getetag", &etag_for(&body)),
+                            prop_text("d:getcontenttype", "text/calendar"),
+                            prop_text("c:calendar-data", &body),
+                        ],
+                    )
+                })
+                .collect(),
+        ),
+        // The collection is already marked; a client setting properties on it
+        // is told the write went nowhere rather than that it failed.
+        ("PROPPATCH", SETTINGS, _) => multistatus(vec![response(SETTINGS, &[])]),
+        ("GET" | "HEAD" | "PROPFIND", _, Some(name)) => {
+            let Some(body) = store.document(SETTINGS, &name).ok().flatten() else {
+                debug!(resource = %name, "caldav settings document not found");
+                return status(StatusCode::NOT_FOUND);
+            };
+            let etag = etag_for(&body);
+            if method.as_str() == "PROPFIND" {
+                return multistatus(vec![response(
+                    &format!("{SETTINGS}{name}.ics"),
+                    &[prop_text("d:getetag", &etag)],
+                )]);
+            }
+            let payload = if method == Method::HEAD {
+                Body::empty()
+            } else {
+                Body::from(body)
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/calendar; charset=utf-8")
+                .header(header::ETAG, etag)
+                .body(payload)
+                .expect("valid response")
+        }
+        ("PUT", _, Some(name)) => {
+            if body.len() > MAX_DOCUMENT_BYTES {
+                warn!(resource = %name, bytes = body.len(), "caldav settings document too large");
+                return status(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            let current = store.document(SETTINGS, &name).ok().flatten();
+            let if_match = header_text(headers, header::IF_MATCH).filter(|v| v != "*");
+            let if_none_match = header_text(headers, header::IF_NONE_MATCH);
+            if if_none_match.as_deref() == Some("*") && current.is_some() {
+                return precondition_failed("resource exists");
+            }
+            if let Some(expected) = &if_match {
+                let now = current.as_deref().map(etag_for);
+                if now.as_ref() != Some(expected) {
+                    warn!(resource = %name, client_etag = %expected, server_etag = ?now, "caldav settings put: stale etag");
+                    return precondition_failed("etag mismatch");
+                }
+            }
+            if let Err(err) = store.put_document(SETTINGS, &name, body) {
+                error!(resource = %name, error = %err, "caldav settings put failed");
+                return status(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            info!(resource = %name, bytes = body.len(), created = current.is_none(), "caldav settings document written");
+            let code = if current.is_some() {
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::CREATED
+            };
+            Response::builder()
+                .status(code)
+                .header(header::ETAG, etag_for(body))
+                .body(Body::empty())
+                .expect("valid response")
+        }
+        ("DELETE", _, Some(name)) => match store.delete_document(SETTINGS, &name) {
+            Ok(true) => {
+                info!(resource = %name, "caldav settings document deleted");
+                status(StatusCode::NO_CONTENT)
+            }
+            Ok(false) => status(StatusCode::NOT_FOUND),
+            Err(err) => {
+                error!(resource = %name, error = %err, "caldav settings delete failed");
+                status(StatusCode::INTERNAL_SERVER_ERROR)
+            }
+        },
+        _ => {
+            debug!(%method, path, "caldav settings path not found");
+            status(StatusCode::NOT_FOUND)
+        }
+    }
 }
 
 // ------------------------------------------------------------------ events
@@ -944,7 +1111,8 @@ fn normalize(path: &str) -> String {
         | "/dav/principal"
         | "/dav/calendars"
         | "/dav/calendars/tasks"
-        | "/dav/calendars/events" => format!("{path}/"),
+        | "/dav/calendars/events"
+        | "/dav/calendars/calino-settings" => format!("{path}/"),
         other => other.to_string(),
     }
 }

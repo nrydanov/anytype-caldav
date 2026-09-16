@@ -307,6 +307,8 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     };
     let scheduler_handle = scheduler.map(|scheduler| tokio::spawn(scheduler.run()));
 
+    let durable_state_for_documents = durable_state.clone();
+
     // Validation guarantees a state file whenever the generator is enabled.
     let generator_handle = match (config.series.enabled, durable_state) {
         (true, Some(durable_state)) => {
@@ -366,7 +368,20 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // The calendar app's own documents, kept beside the push subscriptions.
+    let documents = config
+        .caldav
+        .settings
+        .then(|| durable_state_for_documents.clone())
+        .flatten();
+    if config.caldav.settings && documents.is_none() {
+        tracing::warn!(
+            "caldav.settings is true but push.state_file is not set; client settings are not stored"
+        );
+    }
+
     let state = http::AppState {
+        documents,
         events,
         feed,
         allowed_origins: Arc::new(config.server.allowed_origins.clone()),

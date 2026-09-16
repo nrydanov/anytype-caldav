@@ -83,6 +83,7 @@ fn router() -> Router {
             caldav: Some(Arc::new(Credentials::new("me", "pw"))),
             writer: None,
             events: None,
+            documents: None,
         },
         "/f/secret/todos.ics",
     )
@@ -292,6 +293,146 @@ async fn a_query_outside_the_calendar_is_forbidden_rather_than_missing() {
     }
 }
 
+/// Calino's settings sync: it looks for a calendar carrying its own dead
+/// property, then keeps one document there (`CalDAVClient.discoverSettingsCalendar`).
+mod settings {
+    use anytype_task_exporter::state::StateStore;
+
+    use super::*;
+
+    const PATH: &str = "/dav/calendars/calino-settings/calino-settings.ics";
+
+    fn router_with_documents() -> (Router, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(StateStore::open(&directory.path().join("state.sqlite3")).unwrap());
+        let renderer = VTodoRenderer::new(
+            CalendarConfig {
+                timezone: Saratov,
+                name: "t".into(),
+                date_only_timezone: Saratov,
+            },
+            RemindersConfig {
+                enabled: false,
+                lead_time: chrono::Duration::minutes(30),
+                all_day_time: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            },
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        );
+        let feed = Arc::new(FeedService::new(
+            Arc::new(Fixed(Vec::new())),
+            renderer,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        ));
+        let router = http::router(
+            AppState {
+                feed,
+                allowed_origins: Arc::new(Vec::new()),
+                push: None,
+                caldav: Some(Arc::new(Credentials::new("me", "pw"))),
+                writer: None,
+                events: None,
+                documents: Some(store),
+            },
+            "/f/secret/todos.ics",
+        );
+        (router, directory)
+    }
+
+    async fn put_document(
+        router: &Router,
+        condition: Option<(&str, &str)>,
+        body: &str,
+    ) -> (StatusCode, Option<String>) {
+        let mut request = Request::builder()
+            .method("PUT")
+            .uri(PATH)
+            .header(header::AUTHORIZATION, auth())
+            .header(header::CONTENT_TYPE, "text/calendar; charset=utf-8");
+        if let Some((name, value)) = condition {
+            request = request.header(name, value);
+        }
+        let response = router
+            .clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let etag = response
+            .headers()
+            .get(header::ETAG)
+            .map(|v| v.to_str().unwrap().to_string());
+        (response.status(), etag)
+    }
+
+    #[tokio::test]
+    async fn the_home_set_offers_a_calendar_marked_for_settings() {
+        let (router, _directory) = router_with_documents();
+        let (status, _, body) = send(&router, "PROPFIND", "/dav/calendars/", Some("1"), "").await;
+        assert_eq!(status, StatusCode::MULTI_STATUS);
+        assert!(
+            body.contains("<d:href>/dav/calendars/calino-settings/</d:href>"),
+            "{body}"
+        );
+        assert!(
+            body.contains("<d:displayname>Calino Settings</d:displayname>"),
+            "{body}"
+        );
+        assert!(
+            body.contains(r#"<C:X-CALINO-SETTINGS-CALENDAR xmlns:C="http://calino.app/ns/">1</C:X-CALINO-SETTINGS-CALENDAR>"#),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_document_is_stored_and_served_back_unchanged() {
+        let (router, _directory) = router_with_documents();
+        let document = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:calino-settings\r\nDTSTAMP:20260916T120000Z\r\nATTACH;ENCODING=BASE64;FMTTYPE=application/json:eyJhIjoxfQ==\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+        let (status, etag) = put_document(&router, Some(("If-None-Match", "*")), document).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let etag = etag.unwrap();
+
+        let (status, headers, body) = send(&router, "GET", PATH, None, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, document, "stored byte for byte");
+        assert_eq!(headers.get(header::ETAG).unwrap().to_str().unwrap(), etag);
+
+        // The query Calino sends, a UID filter, lists the document with its data.
+        let query = r#"<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:prop-filter name="UID"><c:text-match collation="i;octet" negate="no">calino-settings</c:text-match></c:prop-filter></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>"#;
+        let (status, _, listing) = send(
+            &router,
+            "REPORT",
+            "/dav/calendars/calino-settings/",
+            Some("1"),
+            query,
+        )
+        .await;
+        assert_eq!(status, StatusCode::MULTI_STATUS);
+        assert!(listing.contains("ATTACH"), "{listing}");
+        // The ETag is XML-escaped inside the listing.
+        assert!(listing.contains(etag.trim_matches('"')), "{listing}");
+
+        // A second write needs the current ETag.
+        let (status, _) = put_document(&router, Some(("If-Match", "\"stale\"")), document).await;
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        let changed = document.replace("eyJhIjoxfQ==", "eyJhIjoyfQ==");
+        let (status, new_etag) = put_document(&router, Some(("If-Match", &etag)), &changed).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_ne!(new_etag.unwrap(), etag);
+        let (_, _, body) = send(&router, "GET", PATH, None, "").await;
+        assert_eq!(body, changed);
+    }
+
+    #[tokio::test]
+    async fn without_a_store_the_calendar_is_not_offered() {
+        let (status, _, body) = send(&router(), "PROPFIND", "/dav/calendars/", Some("1"), "").await;
+        assert_eq!(status, StatusCode::MULTI_STATUS);
+        assert!(!body.contains("calino-settings"), "{body}");
+        let (status, _, _) = send(&router(), "GET", PATH, None, "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
+
 #[tokio::test]
 async fn push_outside_the_secret_prefix_needs_the_caldav_password() {
     use anytype_task_exporter::{push::PushService, state::StateStore};
@@ -333,6 +474,7 @@ async fn push_outside_the_secret_prefix_needs_the_caldav_password() {
             caldav: Some(Arc::new(Credentials::new("me", "pw"))),
             writer: None,
             events: None,
+            documents: None,
         },
         "/f/secret/todos.ics",
     );
@@ -528,6 +670,7 @@ mod writes {
                 caldav: Some(Arc::new(Credentials::new("me", "pw"))),
                 writer: Some(store.clone()),
                 events: None,
+                documents: None,
             },
             "/f/secret/todos.ics",
         );
@@ -925,6 +1068,7 @@ mod writes {
                     caldav: Some(Arc::new(Credentials::new("me", "pw"))),
                     writer: Some(tasks),
                     events: Some(Arc::new(service)),
+                    documents: None,
                 },
                 "/f/secret/todos.ics",
             );

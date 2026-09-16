@@ -32,6 +32,8 @@ pub struct AppState {
     pub writer: Option<Arc<dyn crate::source::TaskWriter>>,
     /// Set when events are served as a second collection.
     pub events: Option<Arc<crate::events::EventService>>,
+    /// Set when the client's own documents are stored for it.
+    pub documents: Option<Arc<crate::state::StateStore>>,
 }
 
 pub fn router(state: AppState, feed_path: &str) -> Router {

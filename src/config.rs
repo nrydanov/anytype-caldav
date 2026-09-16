@@ -99,6 +99,8 @@ struct RawCaldav {
     writable: bool,
     #[serde(default)]
     events: bool,
+    #[serde(default)]
+    settings: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -291,6 +293,8 @@ pub struct CaldavConfig {
     pub writable: bool,
     /// Serve objects of type `event` as a second collection, `events/`.
     pub events: bool,
+    /// Store the calendar app's own settings documents, outside Anytype.
+    pub settings: bool,
 }
 
 /// The recurring-task generator. Off by default: turning it on is the
@@ -664,6 +668,7 @@ impl Config {
                 username: caldav_username,
                 writable: raw.caldav.enabled && raw.caldav.writable,
                 events: raw.caldav.enabled && raw.caldav.events,
+                settings: raw.caldav.enabled && raw.caldav.settings,
             },
         })
     }
