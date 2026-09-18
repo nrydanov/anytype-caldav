@@ -219,6 +219,26 @@ async fn discovery_leads_from_the_base_to_a_read_only_task_collection() {
     assert!(!body.contains("<d:write"), "{body}");
 }
 
+/// Thunderbird reads `resourcetype` of every discovery answer before anything
+/// else and gives up on the server when it is missing
+/// (`CalDavProvider.sys.mjs`, `detectCollection`).
+#[tokio::test]
+async fn the_base_and_the_principal_state_their_resource_type() {
+    let router = router();
+
+    let (_, _, body) = send(&router, "PROPFIND", "/dav/", Some("0"), PROBE).await;
+    assert!(
+        body.contains("<d:resourcetype><d:collection/></d:resourcetype>"),
+        "{body}"
+    );
+
+    let (_, _, body) = send(&router, "PROPFIND", "/dav/principal/", Some("0"), PROBE).await;
+    assert!(
+        body.contains("<d:resourcetype><d:principal/></d:resourcetype>"),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn a_task_query_lists_every_task_with_escaped_data_and_matching_etags() {
     let router = router();

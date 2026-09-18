@@ -152,9 +152,11 @@ pub async fn handle(
     debug!(%method, path = %path, depth, body_bytes = body.len(), "caldav request");
 
     match (method.as_str(), path.as_str()) {
+        // Thunderbird stops discovery at an answer without `resourcetype`.
         ("PROPFIND", "/dav/" | "/") => multistatus(vec![response(
             BASE,
             &[
+                "<d:resourcetype><d:collection/></d:resourcetype>".to_string(),
                 prop_href("d:current-user-principal", PRINCIPAL),
                 prop_text("d:displayname", "Anytype"),
             ],
@@ -162,6 +164,7 @@ pub async fn handle(
         ("PROPFIND", PRINCIPAL) => multistatus(vec![response(
             PRINCIPAL,
             &[
+                "<d:resourcetype><d:principal/></d:resourcetype>".to_string(),
                 prop_href("c:calendar-home-set", HOME),
                 prop_href("d:current-user-principal", PRINCIPAL),
             ],
