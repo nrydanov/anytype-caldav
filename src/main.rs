@@ -28,6 +28,11 @@ const CALDAV_PASSWORD_ENV: &str = "CALDAV_PASSWORD";
 const ACCOUNTS_SECRET_ENV: &str = "ACCOUNTS_SECRET";
 /// Environment variable the SDK's `env` keystore reads the token from.
 const SDK_TOKEN_ENV: &str = "ANYTYPE_KEY_HTTP_TOKEN";
+/// Environment variable a gRPC session token is read from, for `init` to set
+/// the properties in a type's header.
+const SESSION_TOKEN_ENV: &str = "ANYTYPE_SESSION_TOKEN";
+/// Environment variable the SDK's `env` keystore reads that token from.
+const SDK_SESSION_TOKEN_ENV: &str = "ANYTYPE_KEY_SESSION_TOKEN";
 
 #[derive(Parser)]
 #[command(about, version)]
@@ -121,6 +126,22 @@ fn main() -> std::process::ExitCode {
     }
     drop(api_key);
 
+    // A session token lets `init` reach Anytype's gRPC for the one thing its
+    // REST API cannot do. Handed to the SDK the same way, in the same window.
+    let session_token = match secret(SESSION_TOKEN_ENV) {
+        Ok(token) => token,
+        Err(err) => {
+            eprintln!("{err}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let grpc_available = session_token.is_some();
+    if let Some(token) = session_token {
+        unsafe {
+            std::env::set_var(SDK_SESSION_TOKEN_ENV, token);
+        }
+    }
+
     let overrides: Vec<String> = std::env::vars()
         .map(|(name, _)| name)
         .filter(|name| name.starts_with(anytype_caldav::config::ENV_PREFIX))
@@ -159,7 +180,7 @@ fn main() -> std::process::ExitCode {
 
     let result = match args.command {
         None => runtime.block_on(run(config)),
-        Some(Command::Init { apply }) => runtime.block_on(init(config, apply)),
+        Some(Command::Init { apply }) => runtime.block_on(init(config, apply, grpc_available)),
         Some(Command::Generate { apply }) => runtime.block_on(generate(config, apply)),
         Some(Command::Users) => runtime.block_on(users(config)),
     };
@@ -172,10 +193,14 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-async fn init(config: Config, apply: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn init(
+    config: Config,
+    apply: bool,
+    grpc_available: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let client = build_client(&config.anytype)?;
     println!("space {}", config.anytype.space_id);
-    install::run(&client, &config.anytype.space_id, apply).await?;
+    install::run(&client, &config.anytype.space_id, apply, grpc_available).await?;
     Ok(())
 }
 

@@ -213,6 +213,7 @@ async fn source_with(
             space_id: SPACE.into(),
             type_key: "task".into(),
             max_objects,
+            grpc_url: None,
         },
         properties,
     )

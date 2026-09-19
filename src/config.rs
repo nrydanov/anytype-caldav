@@ -252,6 +252,7 @@ struct RawAnytype {
     type_key: String,
     #[serde(default = "default_max_objects")]
     max_objects: usize,
+    grpc_url: Option<String>,
 }
 
 /// The three required selectors default to the keys `init` creates, so a
@@ -491,6 +492,10 @@ pub struct AnytypeConfig {
     pub space_id: String,
     pub type_key: String,
     pub max_objects: usize,
+    /// Anytype's gRPC endpoint, used by `init` for the one thing its REST API
+    /// cannot do: setting the properties in a type's header. Unset, the SDK's
+    /// default is used, which is only reachable on the same host.
+    pub grpc_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -842,6 +847,11 @@ impl Config {
                 space_id,
                 type_key: raw.anytype.type_key.trim().to_string(),
                 max_objects: raw.anytype.max_objects,
+                grpc_url: raw
+                    .anytype
+                    .grpc_url
+                    .map(|url| url.trim().to_string())
+                    .filter(|url| !url.is_empty()),
             },
             properties: PropertiesConfig {
                 scheduled,

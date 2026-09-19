@@ -60,6 +60,7 @@ pub fn build_client(config: &AnytypeConfig) -> Result<AnytypeClient, SourceError
         base_url: Some(config.url.clone()),
         app_name: env!("CARGO_PKG_NAME").to_string(),
         keystore: Some("env".to_string()),
+        grpc_endpoint: config.grpc_url.clone(),
         ..Default::default()
     };
     AnytypeClient::with_config(client_config).map_err(|err| SourceError::Transport(err.to_string()))

@@ -1,16 +1,21 @@
 //! `init`: checks a space against the properties the CalDAV facade owns, and
 //! creates the ones that are missing.
 //!
-//! This is the only module that writes to Anytype, and it only ever creates.
+//! This is the only module that changes the space's schema, and it only ever
+//! adds: nothing is removed, renamed or detached.
 //! A property with the right key but the wrong format is reported, never
 //! repaired: Anytype cannot change a format in place, so a repair is a data
 //! migration the user decides on.
 //!
-//! Attaching properties to types is deliberately absent. The REST type update
-//! replaces a type's whole recommended-property list, and the SDK's exact way to
-//! read that list (`classify_properties`) needs gRPC credentials this service
-//! does not hold. Sending a guessed list could silently detach a user's own
-//! properties.
+//! Then the types: `event`, `recurring_task` and `recurring_event` are created
+//! when missing, and the properties the server writes are listed on each type,
+//! so the objects show them. That is REST:
+//! an update sends back what the type lists with the missing keys appended,
+//! and anytype-heart keeps the header and the hidden list as they were
+//! (core/api/service/type.go). Finally the header: which properties a type
+//! shows at the top of its objects. REST cannot set it, so this one step uses
+//! gRPC, and only when a session token is given; it adds the missing
+//! properties after what the header shows and removes nothing.
 
 use std::collections::BTreeMap;
 
@@ -19,6 +24,7 @@ use anytype::{
     error::AnytypeError,
     objects::Color,
     properties::{Property, PropertyFormat},
+    types::{CreateTypeProperty, Type, TypeLayout, TypePropertyClassification},
 };
 
 /// One property of the facade's schema.
@@ -86,7 +92,111 @@ pub const SCHEMA: &[PropertySpec] = &[
     // Occurrences removed from a recurring event, one Anytype date per line.
     plain("exdate", "Excluded dates", PropertyFormat::Text),
     plain("ical_uid", "Calendar UID", PropertyFormat::Text),
+    // An event's own deadline, served as an entry of its own (events.rs).
+    plain("deadline", "Deadline", PropertyFormat::Date),
 ];
+
+/// A type the server reads and writes objects of.
+#[derive(Debug)]
+pub struct TypeSpec {
+    pub key: &'static str,
+    pub name: &'static str,
+    pub plural_name: &'static str,
+    pub layout: TypeLayout,
+    /// Listed on the type, so its objects show them.
+    pub properties: &'static [&'static str],
+    /// Shown in the header of the type's objects, after what it already shows.
+    pub header: &'static [&'static str],
+}
+
+/// `task` is bundled with Anytype; the other three are made when missing.
+pub const TYPES: &[TypeSpec] = &[
+    TypeSpec {
+        key: "task",
+        name: "Task",
+        plural_name: "Tasks",
+        layout: TypeLayout::Action,
+        properties: &[
+            "scheduled",
+            "reminder_lead",
+            "priority",
+            "series",
+            "occurrence",
+        ],
+        header: &["priority", "due_date", "scheduled", "reminder_lead"],
+    },
+    TypeSpec {
+        key: "event",
+        name: "Event",
+        plural_name: "Events",
+        layout: TypeLayout::Basic,
+        properties: &[
+            "start_date",
+            "end_date",
+            "deadline",
+            "address",
+            "tag",
+            "reminder_lead",
+        ],
+        header: &["start_date", "end_date", "deadline", "reminder_lead"],
+    },
+    TypeSpec {
+        key: "recurring_task",
+        name: "Recurring task",
+        plural_name: "Recurring tasks",
+        layout: TypeLayout::Basic,
+        properties: &["rrule", "start_date", "priority", "tag", "reminder_lead"],
+        header: &["rrule", "start_date"],
+    },
+    TypeSpec {
+        key: "recurring_event",
+        name: "Recurring event",
+        plural_name: "Recurring events",
+        layout: TypeLayout::Basic,
+        properties: &[
+            "rrule",
+            "start_date",
+            "end_date",
+            "address",
+            "tag",
+            "reminder_lead",
+            "deadline",
+        ],
+        header: &["reminder_lead", "start_date", "rrule"],
+    },
+];
+
+/// The keys of `wanted` a type does not list yet, in `wanted`'s order.
+pub fn missing_keys<'a>(listed: &[&str], wanted: &[&'a str]) -> Vec<&'a str> {
+    wanted
+        .iter()
+        .filter(|key| !listed.contains(key))
+        .copied()
+        .collect()
+}
+
+/// The header and the ordinary list after adding `wanted` (property ids) to
+/// the header: appended after what it shows, and taken out of the ordinary
+/// list so none is listed twice. `None` when the header already shows them
+/// all, so a repeated run writes nothing.
+pub fn header_change(
+    featured: &[String],
+    recommended: &[String],
+    wanted: &[String],
+) -> Option<(Vec<String>, Vec<String>)> {
+    let added: Vec<&String> = wanted.iter().filter(|id| !featured.contains(id)).collect();
+    if added.is_empty() {
+        return None;
+    }
+    let mut new_featured = featured.to_vec();
+    new_featured.extend(added.iter().map(|id| (*id).clone()));
+    let new_recommended = recommended
+        .iter()
+        .filter(|id| !added.contains(id))
+        .cloned()
+        .collect();
+    Some((new_featured, new_recommended))
+}
 
 /// What `init` found for one spec.
 #[derive(Debug)]
@@ -117,6 +227,10 @@ pub enum InstallError {
     Schema(Vec<Problem>),
     #[error("anytype: {0}")]
     Anytype(#[from] AnytypeError),
+    #[error("{0}")]
+    Type(String),
+    #[error("setting the header of {key}: {message}")]
+    Header { key: &'static str, message: String },
     #[error(
         "{expected}: anytype created the property with key {actual}; delete {id} and investigate"
     )]
@@ -173,8 +287,37 @@ pub fn plan<'a>(
     }
 }
 
-/// Prints the plan and, with `apply`, creates the missing properties.
-pub async fn run(client: &AnytypeClient, space_id: &str, apply: bool) -> Result<(), InstallError> {
+/// Prints the plan and, with `apply`, carries it out: missing properties,
+/// then types, then headers. `grpc_available` says whether a session token
+/// was given; without it the headers are left alone.
+pub async fn run(
+    client: &AnytypeClient,
+    space_id: &str,
+    apply: bool,
+    grpc_available: bool,
+) -> Result<(), InstallError> {
+    let mut changes = create_properties(client, space_id, apply).await?;
+    changes |= prepare_types(client, space_id, apply).await?;
+    if grpc_available {
+        changes |= set_headers(client, space_id, apply).await?;
+    } else {
+        println!("  skip    headers: no session token (ANYTYPE_SESSION_TOKEN) for gRPC");
+    }
+
+    if !changes {
+        println!("nothing to change");
+    } else if !apply {
+        println!("dry run: nothing was changed; re-run with --apply to make the changes above");
+    }
+    Ok(())
+}
+
+/// Whether the plan had anything to create.
+async fn create_properties(
+    client: &AnytypeClient,
+    space_id: &str,
+    apply: bool,
+) -> Result<bool, InstallError> {
     let existing = client
         .properties(space_id)
         .list()
@@ -183,35 +326,21 @@ pub async fn run(client: &AnytypeClient, space_id: &str, apply: bool) -> Result<
         .await?;
     let steps = plan(SCHEMA, &existing).map_err(InstallError::Schema)?;
 
+    let mut missing = Vec::new();
     for step in &steps {
         match step {
             Step::Present { spec, id } => println!("  ok      {} ({}) {id}", spec.key, spec.format),
             Step::Create(spec) => {
-                println!("  create  {} ({}) \"{}\"", spec.key, spec.format, spec.name)
+                println!("  create  {} ({}) \"{}\"", spec.key, spec.format, spec.name);
+                missing.push(*spec);
             }
         }
     }
-
-    let missing: Vec<&PropertySpec> = steps
-        .iter()
-        .filter_map(|step| match step {
-            Step::Create(spec) => Some(*spec),
-            Step::Present { .. } => None,
-        })
-        .collect();
-
-    if missing.is_empty() {
-        println!("nothing to create");
-        return Ok(());
-    }
     if !apply {
-        println!(
-            "dry run: nothing was created; re-run with --apply to create the properties above"
-        );
-        return Ok(());
+        return Ok(!missing.is_empty());
     }
 
-    for spec in missing {
+    for spec in &missing {
         let mut request = client
             .new_property(space_id, spec.name, spec.format)
             .key(spec.key);
@@ -230,7 +359,253 @@ pub async fn run(client: &AnytypeClient, space_id: &str, apply: bool) -> Result<
         }
         println!("  created {} {}", spec.key, created.id);
     }
-    Ok(())
+    Ok(!missing.is_empty())
+}
+
+/// The space's properties by key. Run after [`create_properties`], so every
+/// key of [`SCHEMA`] is there once.
+async fn properties_by_key(
+    client: &AnytypeClient,
+    space_id: &str,
+) -> Result<BTreeMap<String, Property>, InstallError> {
+    let existing = client
+        .properties(space_id)
+        .list()
+        .await?
+        .collect_all()
+        .await?;
+    // A type update that created a second property with a key would show here.
+    plan(SCHEMA, &existing).map_err(InstallError::Schema)?;
+    Ok(existing
+        .into_iter()
+        .map(|property| (property.key.clone(), property))
+        .collect())
+}
+
+/// The space's types by key.
+async fn types_by_key(
+    client: &AnytypeClient,
+    space_id: &str,
+) -> Result<BTreeMap<String, Type>, InstallError> {
+    let types = client.types(space_id).list().await?.collect_all().await?;
+    Ok(types
+        .into_iter()
+        .map(|typ| (typ.key.clone(), typ))
+        .collect())
+}
+
+fn type_property(
+    properties: &BTreeMap<String, Property>,
+    key: &str,
+) -> Result<CreateTypeProperty, InstallError> {
+    let property = properties
+        .get(key)
+        .ok_or_else(|| InstallError::Type(format!("the space has no property {key}")))?;
+    Ok(CreateTypeProperty {
+        format: property.format(),
+        key: property.key.clone(),
+        name: property.name.clone(),
+    })
+}
+
+/// Creates the missing types and lists the missing properties on the rest.
+/// Whether anything was missing.
+async fn prepare_types(
+    client: &AnytypeClient,
+    space_id: &str,
+    apply: bool,
+) -> Result<bool, InstallError> {
+    let types = types_by_key(client, space_id).await?;
+    let properties = if apply {
+        properties_by_key(client, space_id).await?
+    } else {
+        BTreeMap::new()
+    };
+
+    let mut changes = false;
+    for spec in TYPES {
+        let Some(typ) = types.get(spec.key) else {
+            changes = true;
+            println!("  create  type {} \"{}\"", spec.key, spec.name);
+            if apply {
+                let listed = spec
+                    .properties
+                    .iter()
+                    .map(|key| type_property(&properties, key))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let created = client
+                    .new_type(space_id, spec.name)
+                    .key(spec.key)
+                    .plural_name(spec.plural_name)
+                    .layout(spec.layout.clone())
+                    .properties(listed)
+                    .create()
+                    .await?;
+                if created.key != spec.key {
+                    return Err(InstallError::Type(format!(
+                        "{}: anytype created the type with key {}; delete {} and investigate",
+                        spec.key, created.key, created.id
+                    )));
+                }
+                println!("  created type {} {}", spec.key, created.id);
+            }
+            continue;
+        };
+
+        let listed: Vec<&str> = typ.properties.iter().map(|p| p.key.as_str()).collect();
+        let missing = missing_keys(&listed, spec.properties);
+        if missing.is_empty() {
+            println!("  ok      type {} {}", spec.key, typ.id);
+            continue;
+        }
+        changes = true;
+        println!("  list    {} on type {}", missing.join(", "), spec.key);
+        if apply {
+            // An update replaces the type's list, so it carries the current
+            // one; anytype-heart keeps the header as it is.
+            let mut all = typ
+                .properties
+                .iter()
+                .map(|p| type_property(&properties, &p.key))
+                .collect::<Result<Vec<_>, _>>()?;
+            for key in missing {
+                all.push(type_property(&properties, key)?);
+            }
+            client
+                .update_type(space_id, &typ.id)
+                .properties(all)
+                .update()
+                .await?;
+        }
+    }
+    Ok(changes)
+}
+
+/// Adds the missing properties to each type's header. Whether any was missing.
+async fn set_headers(
+    client: &AnytypeClient,
+    space_id: &str,
+    apply: bool,
+) -> Result<bool, InstallError> {
+    let types = types_by_key(client, space_id).await?;
+    let properties = properties_by_key(client, space_id).await?;
+    // In a dry run a property may not exist yet; its key stands in for its id.
+    let id_of = |key: &str| {
+        properties
+            .get(key)
+            .map_or_else(|| key.to_string(), |property| property.id.clone())
+    };
+
+    let mut changes = false;
+    for spec in TYPES {
+        let Some(typ) = types.get(spec.key) else {
+            // Only in a dry run: with --apply the type was just created.
+            changes = true;
+            println!("  header  {}: {}", spec.key, spec.header.join(", "));
+            continue;
+        };
+        let classes = classify(client, space_id, &typ.id).await?;
+        let recommended: Vec<String> = classes.recommended.iter().map(|p| p.id.clone()).collect();
+        let wanted: Vec<String> = spec.header.iter().map(|key| id_of(key)).collect();
+        let Some((featured, recommended)) =
+            header_change(&classes.featured_ids, &recommended, &wanted)
+        else {
+            println!("  ok      header {}", spec.key);
+            continue;
+        };
+        changes = true;
+        let added: Vec<&str> = spec
+            .header
+            .iter()
+            .filter(|key| !classes.featured_ids.contains(&id_of(key)))
+            .copied()
+            .collect();
+        println!("  header  {}: {}", spec.key, added.join(", "));
+        if apply {
+            set_type_details(client, &typ.id, featured, recommended)
+                .await
+                .map_err(|message| InstallError::Header {
+                    key: spec.key,
+                    message,
+                })?;
+        }
+    }
+    Ok(changes)
+}
+
+/// Reads the header over gRPC. Right after a type is created, or its list
+/// changed, the read can fail for some seconds; it is tried again for up to
+/// half a minute.
+async fn classify(
+    client: &AnytypeClient,
+    space_id: &str,
+    type_id: &str,
+) -> Result<TypePropertyClassification, AnytypeError> {
+    let mut tries = 0;
+    loop {
+        match client
+            .get_type(space_id, type_id)
+            .classify_properties()
+            .await
+        {
+            Err(err) if tries < 6 => {
+                tries += 1;
+                println!("  wait    type {type_id}: {err}; trying again in 5 s");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// The one gRPC call: `ObjectSetDetails` on the type, writing both lists at
+/// once so no property is ever in both.
+async fn set_type_details(
+    client: &AnytypeClient,
+    type_id: &str,
+    featured: Vec<String>,
+    recommended: Vec<String>,
+) -> Result<(), String> {
+    use anytype_rpc::{anytype::rpc::object::set_details, model::Detail};
+    use prost_types::{ListValue, Value, value::Kind};
+
+    let list = |ids: Vec<String>| Value {
+        kind: Some(Kind::ListValue(ListValue {
+            values: ids
+                .into_iter()
+                .map(|id| Value {
+                    kind: Some(Kind::StringValue(id)),
+                })
+                .collect(),
+        })),
+    };
+    let request = set_details::Request {
+        context_id: type_id.to_string(),
+        details: vec![
+            Detail {
+                key: "recommendedFeaturedRelations".to_string(),
+                value: Some(list(featured)),
+            },
+            Detail {
+                key: "recommendedRelations".to_string(),
+                value: Some(list(recommended)),
+            },
+        ],
+    };
+
+    let grpc = client.grpc_client().await.map_err(|err| err.to_string())?;
+    let request = anytype_rpc::auth::with_token(tonic::Request::new(request), grpc.token())
+        .map_err(|err| err.to_string())?;
+    let response = grpc
+        .client_commands()
+        .object_set_details(request)
+        .await
+        .map_err(|status| status.to_string())?
+        .into_inner();
+    match response.error {
+        Some(error) if error.code != 0 => Err(error.description),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -322,5 +697,46 @@ mod tests {
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), SCHEMA.len());
+    }
+
+    #[test]
+    fn types_use_only_known_properties() {
+        // `tag` is bundled with Anytype and not part of the schema.
+        let known = |key: &str| key == "tag" || SCHEMA.iter().any(|spec| spec.key == key);
+        for spec in TYPES {
+            for key in spec.properties.iter().chain(spec.header) {
+                assert!(known(key), "{}: unknown property {key}", spec.key);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_keys_keeps_the_wanted_order() {
+        assert_eq!(missing_keys(&["b"], &["c", "b", "a"]), ["c", "a"]);
+        assert!(missing_keys(&["a", "b"], &["a"]).is_empty());
+    }
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn the_header_is_appended_to_and_the_ordinary_list_loses_what_moved() {
+        let (featured, recommended) = header_change(
+            &ids(&["type", "tag"]),
+            &ids(&["priority", "done", "rrule"]),
+            &ids(&["rrule", "tag", "priority"]),
+        )
+        .unwrap();
+        assert_eq!(featured, ids(&["type", "tag", "rrule", "priority"]));
+        assert_eq!(recommended, ids(&["done"]));
+    }
+
+    #[test]
+    fn a_complete_header_is_not_written_again() {
+        assert_eq!(
+            header_change(&ids(&["type", "rrule"]), &ids(&["done"]), &ids(&["rrule"])),
+            None
+        );
     }
 }

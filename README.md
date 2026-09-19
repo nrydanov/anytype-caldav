@@ -32,8 +32,10 @@ calendar client's own settings.
   restarts. A person's subscription receives only the reminders of their tasks.
 - **Recurring tasks and events**: a `recurring_task` or `recurring_event`
   object holds the rule; the server creates the next occurrence in Anytype.
-- **`init`** checks a space against the schema the server needs and creates
-  what is missing.
+- **`init`** checks a space against the schema the server needs and adds
+  what is missing: properties, the types `event`, `recurring_task` and
+  `recurring_event`, the properties each type lists, and the ones shown in a
+  type's header. It never removes anything.
 
 What it does not do: Apple Calendar and Reminders cannot show `VTODO` by any
 route. Calendar ignores it in a subscribed feed, and Reminders no longer
@@ -100,6 +102,7 @@ Secrets come only from the environment:
 | `ANYTYPE_API_KEY` | always |
 | `CALDAV_PASSWORD` | `caldav.enabled`, the shared login |
 | `ACCOUNTS_SECRET` | accounts per person (`properties.assignee` must be set) |
+| `ANYTYPE_SESSION_TOKEN` | `init` setting type headers (with `anytype.grpc_url`) |
 
 Each can also be read from a file named by the same variable with `_FILE`
 appended, such as `ANYTYPE_API_KEY_FILE`, as Docker secrets are passed.
@@ -107,6 +110,12 @@ appended, such as `ANYTYPE_API_KEY_FILE`, as Docker secrets are passed.
 Notifications, the default calendar names and the deadline line in a task's
 description are in English or Russian, set by `calendar.language` (`en` by
 default, or `ru`).
+
+Everything goes through Anytype's REST API except one step of `init`: the
+properties shown in a type's header can be set only over gRPC, Anytype's
+internal protocol. That step runs only when `anytype.grpc_url` and
+`ANYTYPE_SESSION_TOKEN` (the session token of the Anytype account) are given,
+and is skipped otherwise. The compose kit gives both.
 
 Properties are selected as `key:<stable-key>` or `id:<opaque-id>`, never by
 display name, so renaming a property in Anytype breaks nothing. The three
@@ -122,7 +131,7 @@ WARN property available on type task property=key:due_date id:bafy... name:"Dead
 | Command | What it does |
 |---|---|
 | `anytype-caldav [--config c.toml]` | runs the server |
-| `… init [--apply]` | checks the space's schema; `--apply` creates missing properties |
+| `… init [--apply]` | checks the space's schema; `--apply` adds what is missing |
 | `… generate [--apply]` | shows the occurrences of series due today; `--apply` creates them |
 | `… users` | prints every person's name, login and password (needs `ACCOUNTS_SECRET`) |
 

@@ -19,6 +19,10 @@ space_id = "bafyrei...REPLACE..."
 type_key = "task"
 # A refresh that would exceed this fails instead of running unbounded.
 max_objects = 5000
+# Optional. Anytype's gRPC endpoint, used only by `init` to set which
+# properties a type shows in its header; REST cannot. Needs the account's
+# session token in ANYTYPE_SESSION_TOKEN. Left out, init skips the headers.
+# grpc_url = "http://127.0.0.1:31010"
 
 [properties]
 # Each selector is "key:<stable-key>" or "id:<opaque-id>".
