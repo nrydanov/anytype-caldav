@@ -186,7 +186,6 @@ the same Basic credentials as CalDAV:
 | `src/`, `tests/` | the server; `cargo test` runs everything without a live Anytype |
 | `deploy/compose/` | Docker Compose kit: headless Anytype, the server, Caddy |
 | `deploy/systemd/` | unit file for a host without Docker |
-| `scripts/` | `type_header.py`, which sets the properties in a type's header; only gRPC can |
 | `cliff.toml` | [git-cliff](https://git-cliff.org) config; commits follow Conventional Commits |
 
 ## Development
