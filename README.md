@@ -68,13 +68,15 @@ cargo run -- init --apply   # prepare the space's schema
 cargo run                   # serve on 127.0.0.1:8080
 ```
 
-Without `anytype.space_id` the server serves the only space the account is a
-member of. [`deploy/systemd/`](deploy/systemd/) has a unit for a host without
+Set `anytype.space_id` to the space to serve; without it the server lists the
+account's spaces with their ids and stops. The compose kit takes the id from
+the invite link instead. [`deploy/systemd/`](deploy/systemd/) has a unit for a host without
 Docker.
 
 ## Configuration
 
-Every setting has a default or can be left out, except `anytype.url`.
+Every setting has a default or can be left out, except `anytype.url` and
+`anytype.space_id`, which the compose kit sets itself.
 [`config.example.toml`](config.example.toml) describes them all. They can be
 given in a TOML file (`--config`), as environment variables, or both; a
 variable wins over the file:

@@ -485,9 +485,9 @@ pub struct RemindersConfig {
 #[derive(Debug, Clone)]
 pub struct AnytypeConfig {
     pub url: String,
-    /// Empty when the configuration names no space: the service then serves
-    /// the only one the account is a member of, and fills this in at startup
-    /// (`anytype_source::only_space`) before anything reads it.
+    /// Empty when the configuration names no space. The service then lists the
+    /// account's spaces and stops (`anytype_source::no_space_given`), so it is
+    /// never empty once anything reads it.
     pub space_id: String,
     pub type_key: String,
     pub max_objects: usize,

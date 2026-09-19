@@ -65,47 +65,48 @@ pub fn build_client(config: &AnytypeConfig) -> Result<AnytypeClient, SourceError
     AnytypeClient::with_config(client_config).map_err(|err| SourceError::Transport(err.to_string()))
 }
 
-/// The space to serve when the configuration names none: the only one the
-/// account is a member of, as its id and name. Chats are listed as spaces too
-/// and are left out, since there are no tasks in them to serve.
-pub async fn only_space(client: &AnytypeClient) -> Result<(String, String), String> {
-    let spaces = client
-        .spaces()
-        .list()
-        .await
-        .map_err(|err| format!("cannot list the account's spaces: {err}"))?
-        .collect_all()
-        .await
-        .map_err(|err| format!("cannot list the account's spaces: {err}"))?;
-    pick_only_space(
-        spaces
-            .into_iter()
-            .filter(|space| matches!(space.object, SpaceModel::Space))
-            .map(|space| (space.id, space.name))
-            .collect(),
-    )
+/// What to say when the configuration names no space: the spaces the account
+/// is a member of, by name and id, to pick from. No space is picked: every
+/// account made by the CLI has a personal space of its own beside any it
+/// joined, so "the only one" would be the wrong one. Chats are listed as
+/// spaces too and are left out, since there are no tasks in them to serve.
+pub async fn no_space_given(client: &AnytypeClient) -> String {
+    match client.spaces().list().await {
+        Ok(page) => match page.collect_all().await {
+            Ok(spaces) => describe_spaces(
+                spaces
+                    .into_iter()
+                    .filter(|space| matches!(space.object, SpaceModel::Space))
+                    .map(|space| (space.id, space.name))
+                    .collect(),
+            ),
+            Err(err) => {
+                format!("anytype.space_id is not set, and the spaces cannot be listed: {err}")
+            }
+        },
+        Err(err) => format!("anytype.space_id is not set, and the spaces cannot be listed: {err}"),
+    }
 }
 
-/// Exactly one space is the answer; none or several is an error that says
-/// what to do, listing the spaces there are.
-pub fn pick_only_space(spaces: Vec<(String, String)>) -> Result<(String, String), String> {
-    match spaces.len() {
-        1 => Ok(spaces.into_iter().next().expect("one space")),
-        0 => Err(
-            "anytype.space_id is not set and the account is a member of no space: \
-                  let it into the space to serve, or set the id"
-                .to_string(),
-        ),
-        count => Err(format!(
-            "anytype.space_id is not set and the account is a member of {count} spaces; \
-             set it to one of: {}",
-            spaces
-                .iter()
-                .map(|(id, name)| format!("{name} ({id})"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
+/// The message for `no_space_given`, from the account's spaces.
+pub fn describe_spaces(spaces: Vec<(String, String)>) -> String {
+    if spaces.is_empty() {
+        return "anytype.space_id is not set, and the account is a member of no space: \
+                let it into the space to serve and set its id"
+            .to_string();
     }
+    let list = spaces
+        .iter()
+        .map(|(id, name)| {
+            let name = if name.trim().is_empty() {
+                "(no name)"
+            } else {
+                name.as_str()
+            };
+            format!("\n  {name}: {id}")
+        })
+        .collect::<String>();
+    format!("anytype.space_id is not set; set it to the space to serve, one of:{list}")
 }
 
 impl AnytypeTaskSource {

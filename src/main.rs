@@ -144,24 +144,17 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    // With no space in the configuration, the account's only space is served.
-    // Looked up on every start, so a space the account joined since is found.
-    let mut config = config;
+    // With no space in the configuration nothing is guessed: the account's
+    // spaces are listed so the right one can be set.
     if config.anytype.space_id.is_empty() {
-        let found = runtime.block_on(async {
-            let client = build_client(&config.anytype).map_err(|err| err.to_string())?;
-            anytype_caldav::anytype_source::only_space(&client).await
+        let message = runtime.block_on(async {
+            match build_client(&config.anytype) {
+                Ok(client) => anytype_caldav::anytype_source::no_space_given(&client).await,
+                Err(err) => format!("anytype.space_id is not set: {err}"),
+            }
         });
-        match found {
-            Ok((id, name)) => {
-                info!(space = %name, space_id = %id, "anytype.space_id not set: serving the only space of the account");
-                config.anytype.space_id = id;
-            }
-            Err(err) => {
-                eprintln!("{err}");
-                return std::process::ExitCode::FAILURE;
-            }
-        }
+        eprintln!("{message}");
+        return std::process::ExitCode::FAILURE;
     }
 
     let result = match args.command {
