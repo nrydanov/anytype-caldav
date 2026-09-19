@@ -1,22 +1,52 @@
-# The server and Calino behind Caddy, on one origin, so no CORS is needed.
-# Headless Anytype runs on the host (`anytype serve`); the server reaches it as
-# host.docker.internal, so set anytype.url in config.toml to
-# http://host.docker.internal:31012 (the port `anytype serve` listens on).
+# anytype-caldav with a headless Anytype of its own and Caddy for TLS.
+#
+#   cp env.example .env     # fill it in
+#   docker compose up -d
+#
+# Every step of the setup can run again without harm, so after changing .env
+# run `docker compose up -d` again.
 services:
-  server:
-    image: ghcr.io/${OWNER:?set OWNER in .env}/anytype-caldav:${VERSION:-latest}
+  anytype:
+    image: ghcr.io/anyproto/anytype-cli:${ANYTYPE_CLI_VERSION:-v0.3.7}
     restart: unless-stopped
-    env_file: .env
+    entrypoint: ["/bin/sh", "/setup/anytype.sh"]
+    environment:
+      ANYTYPE_INVITE_LINK: ${ANYTYPE_INVITE_LINK:-}
+      ANYTYPE_ACCOUNT_KEY: ${ANYTYPE_ACCOUNT_KEY:-}
     volumes:
-      - ./config.toml:/config/config.toml:ro
-      - ./vapid_private.pem:/config/vapid_private.pem:ro
+      - ./anytype.sh:/setup/anytype.sh:ro
+      - anytype-data:/root/.anytype
+      - anytype-config:/root/.config/anytype
+      - keys:/shared
+
+  server:
+    build: ../..
+    restart: unless-stopped
+    depends_on: [anytype]
+    # Waits for the API key, brings the space's schema up to date (init
+    # creates only what is missing) and starts.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - until [ -s /shared/api-key ]; do sleep 1; done;
+        anytype-caldav init --apply && exec anytype-caldav
+    env_file: .env
+    environment:
+      ANYTYPE_API_KEY_FILE: /shared/api-key
+      ANYTYPE_CALDAV__ANYTYPE__URL: http://anytype:31012
+      ANYTYPE_CALDAV__SERVER__LISTEN: 0.0.0.0:8080
+      ANYTYPE_CALDAV__CALDAV__ENABLED: "true"
+      ANYTYPE_CALDAV__CALDAV__WRITABLE: "true"
+      ANYTYPE_CALDAV__PUSH__ENABLED: "true"
+      ANYTYPE_CALDAV__PUSH__PRIVATE_KEY_FILE: /data/vapid.pem
+      ANYTYPE_CALDAV__PUSH__STATE_FILE: /data/state.sqlite3
+    volumes:
+      - keys:/shared:ro
       - state:/data
-    extra_hosts:
-      - host.docker.internal:host-gateway
 
   caddy:
     image: caddy:2
     restart: unless-stopped
+    depends_on: [server]
     ports:
       - "80:80"
       - "443:443"
@@ -24,9 +54,11 @@ services:
       DOMAIN: ${DOMAIN:?set DOMAIN in .env}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./calino:/srv/calino:ro
       - caddy:/data
 
 volumes:
+  anytype-data:
+  anytype-config:
+  keys:
   state:
   caddy:

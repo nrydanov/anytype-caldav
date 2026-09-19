@@ -1,35 +1,43 @@
 # Compose kit
 
-Runs the server and a build of Calino behind Caddy, which obtains the
-certificate itself. Headless Anytype runs on the host.
+anytype-caldav with a headless Anytype of its own and Caddy in front, which
+obtains the TLS certificate. Nothing but Docker is needed on the host.
 
-1. Start headless Anytype on the host, let its account into the space and
-   create an API key (`anytype serve`, see the Anytype CLI documentation).
-2. Put a build of Calino (its `dist/`) into `./calino`.
-3. Prepare the files:
+1. In Anytype, the owner of the space makes an invite link.
+2. Fill in the settings:
 
    ```sh
-   cp env.example .env && chmod 600 .env          # fill it in
-   cp ../../config.example.toml config.toml       # see below
-   openssl ecparam -name prime256v1 -genkey -noout -out vapid_private.pem
+   cp env.example .env && chmod 600 .env
    ```
 
-   In `config.toml` set `anytype.url = "http://host.docker.internal:31012"`,
-   `space_id`, `server.listen = "0.0.0.0:8080"`,
-   `push.private_key_file = "/config/vapid_private.pem"`,
-   `push.state_file = "/data/state.sqlite3"` and `push.app_url` to
-   `https://<DOMAIN>/`.
+   `DOMAIN`, `ANYTYPE_INVITE_LINK` and `CALDAV_PASSWORD` are required. Every
+   other setting of `config.example.toml` can be added as
+   `ANYTYPE_CALDAV__<SECTION>__<KEY>`.
 
-4. Check the space, then start:
+3. Start:
 
    ```sh
-   docker compose run --rm server --config /config/config.toml init
    docker compose up -d
+   docker compose logs -f
    ```
 
-5. With accounts per person on, print them to hand out:
-   `docker compose run --rm server --config /config/config.toml users`.
+   On the first start the `anytype` service creates a bot account and prints
+   its account key: keep it. The bot then asks to join the space; if the invite
+   needs approval, the owner approves it in Anytype. Until then the server
+   stops with "the account is a member of no space" and is restarted, so it
+   comes up by itself once the bot is in.
 
-Back up `.env`, `vapid_private.pem` and the `state` volume together. A second
-space is a second `server` service with its own config and a path or domain of
-its own in the Caddyfile.
+4. Connect a CalDAV client to `https://DOMAIN/dav/` with the username
+   `anytype` and `CALDAV_PASSWORD`. With `ACCOUNTS_SECRET` set, everyone's own
+   login is printed by
+   `docker compose exec server anytype-caldav users`.
+
+Every step can run again without harm: after changing `.env`, run
+`docker compose up -d` again. The bot is created only once and kept in a
+volume, joining again changes nothing, a fresh API key is issued on every
+start, `init --apply` creates only what is missing, and the VAPID key is made
+only when there is none.
+
+Back up the volumes `anytype-data`, `anytype-config` and `state` together
+with `.env`: they hold the bot, the push subscriptions and the VAPID key. The
+iCalendar feed is not routed by Caddy, since it has no password.

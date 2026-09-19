@@ -1,8 +1,8 @@
+# Only the CalDAV facade, push and capture are reachable from outside. The
+# iCalendar feed needs no password, so it is not routed here.
 {$DOMAIN} {
-	@server path /dav /dav/* /push/* /.well-known/caldav /healthz
+	redir /.well-known/caldav /dav/ 301
+	@server path /dav /dav/* /push/* /capture /healthz
 	reverse_proxy @server server:8080
-
-	root * /srv/calino
-	try_files {path} /index.html
-	file_server
+	respond 404
 }

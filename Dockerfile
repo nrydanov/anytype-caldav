@@ -14,4 +14,4 @@ USER anytype-caldav
 WORKDIR /data
 EXPOSE 8080
 ENTRYPOINT ["anytype-caldav"]
-CMD ["--config", "/config/config.toml"]
+CMD []
