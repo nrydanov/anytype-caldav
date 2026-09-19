@@ -1,8 +1,8 @@
-//! Read-only bridge from one Anytype space to an iCalendar VTODO subscription.
+//! CalDAV server, iCalendar feed and Web Push reminders over one Anytype space.
 
 use std::{path::PathBuf, sync::Arc};
 
-use anytype_task_exporter::{
+use anytype_caldav::{
     accounts::{self, Accounts},
     anytype_source::{AnytypeTaskSource, build_client},
     config::Config,
@@ -300,7 +300,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         tags_selector = config.properties.tags.is_some(),
         assignee_selector = config.properties.assignee.is_some(),
         reminder_selector = config.properties.reminder.is_some(),
-        "starting anytype-task-exporter"
+        "starting anytype-caldav"
     );
 
     let anytype = Arc::new(AnytypeTaskSource::connect(
@@ -345,12 +345,12 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 config.server.request_timeout,
             );
             let scheduler = Arc::new(match (config.caldav.events, config.reminders.enabled) {
-                (true, _) => scheduler.with_events(Arc::new(
-                    anytype_task_exporter::events::AnytypeEvents::new(
+                (true, _) => {
+                    scheduler.with_events(Arc::new(anytype_caldav::events::AnytypeEvents::new(
                         build_client(&config.anytype)?,
                         config.anytype.space_id.clone(),
-                    ),
-                )),
+                    )))
+                }
                 (false, _) => scheduler,
             });
             info!(
@@ -406,12 +406,12 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         }
         info!(
             username = %config.caldav.username,
-            base = anytype_task_exporter::caldav::BASE,
+            base = anytype_caldav::caldav::BASE,
             writable = config.caldav.writable,
             "caldav facade enabled"
         );
         let credentials =
-            anytype_task_exporter::caldav::Credentials::new(&config.caldav.username, &password);
+            anytype_caldav::caldav::Credentials::new(&config.caldav.username, &password);
         // With the secret set, every person of the space also has an account
         // of their own (`exporter users` prints them).
         let credentials = match std::env::var(ACCOUNTS_SECRET_ENV) {
@@ -427,7 +427,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let events = if config.caldav.events {
-        use anytype_task_exporter::events::{AnytypeEvents, EventService};
+        use anytype_caldav::events::{AnytypeEvents, EventService};
         info!(
             ttl = ?config.server.min_refresh_interval,
             writable = config.caldav.writable,
@@ -469,7 +469,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         writer: config
             .caldav
             .writable
-            .then(|| anytype.clone() as Arc<dyn anytype_task_exporter::source::TaskWriter>),
+            .then(|| anytype.clone() as Arc<dyn anytype_caldav::source::TaskWriter>),
         push,
     };
 

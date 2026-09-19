@@ -230,25 +230,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "anytype-rpc"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5a8f8c84bc2dd3c9f2ee241530f811052f5edb3ad93be5eaeb306d38096e765"
-dependencies = [
- "chrono",
- "http-body 1.1.0",
- "prost",
- "prost-types",
- "serde",
- "serde_json",
- "snafu",
- "tokio",
- "tonic",
- "tonic-prost",
-]
-
-[[package]]
-name = "anytype-task-exporter"
+name = "anytype-caldav"
 version = "0.1.0"
 dependencies = [
  "anytype",
@@ -282,6 +264,24 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "web-push",
+]
+
+[[package]]
+name = "anytype-rpc"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5a8f8c84bc2dd3c9f2ee241530f811052f5edb3ad93be5eaeb306d38096e765"
+dependencies = [
+ "chrono",
+ "http-body 1.1.0",
+ "prost",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

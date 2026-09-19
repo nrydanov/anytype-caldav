@@ -6,7 +6,7 @@ use std::sync::Once;
 use anytype::test_util::scripted_http::{
     ScriptedHttpContentType, ScriptedHttpFixture, ScriptedHttpResponse,
 };
-use anytype_task_exporter::{
+use anytype_caldav::{
     anytype_source::AnytypeTaskSource,
     config::{AnytypeConfig, PropertiesConfig, PropertySelector},
     source::{SourceError, TaskSource},

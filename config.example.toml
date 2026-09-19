@@ -71,7 +71,7 @@ all_day_time = "09:00"
 # private_key_file = "~/.config/vapid_private.pem"
 # Contains subscription encryption keys and handled reminder identities.
 # Keep it private and back it up together with the VAPID key.
-# state_file = "~/.local/share/anytype-task-exporter/state.sqlite3"
+# state_file = "~/.local/share/anytype-caldav/state.sqlite3"
 # poll_interval = "30s"
 # Reminders missed during shorter downtime are sent late; older ones are skipped.
 # late_window = "1h"

@@ -1,4 +1,4 @@
-//! Read-only bridge from one Anytype space to an iCalendar VTODO subscription.
+//! CalDAV server, iCalendar feed and Web Push reminders over one Anytype space.
 
 pub mod accounts;
 pub mod anytype_source;

@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use anytype_task_exporter::{
+use anytype_caldav::{
     config::{CalendarConfig, RemindersConfig},
     feed::FeedService,
     http::{self, AppState},

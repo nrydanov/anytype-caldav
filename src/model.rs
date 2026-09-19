@@ -80,7 +80,8 @@ pub struct Task {
 
 impl Task {
     /// Stable across renames and date edits: a calendar client updates the
-    /// existing component instead of creating a duplicate.
+    /// existing component instead of creating a duplicate. The suffix keeps
+    /// the project's old name: clients already hold these UIDs.
     pub fn uid(&self) -> String {
         match &self.ical_uid {
             Some(uid) => uid.clone(),

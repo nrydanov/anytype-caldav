@@ -4,7 +4,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use anytype_task_exporter::{
+use anytype_caldav::{
     caldav::Credentials,
     config::{CalendarConfig, RemindersConfig},
     feed::FeedService,
@@ -420,7 +420,7 @@ mod capture {
 }
 
 mod settings {
-    use anytype_task_exporter::state::StateStore;
+    use anytype_caldav::state::StateStore;
 
     use super::*;
 
@@ -611,7 +611,7 @@ mod settings {
 
 #[tokio::test]
 async fn push_outside_the_secret_prefix_needs_the_caldav_password() {
-    use anytype_task_exporter::{push::PushService, state::StateStore};
+    use anytype_caldav::{push::PushService, state::StateStore};
 
     let directory = tempfile::tempdir().unwrap();
     let state = Arc::new(StateStore::open(&directory.path().join("state.sqlite3")).unwrap());
@@ -729,7 +729,7 @@ async fn unknown_resources_are_missing_and_writes_are_refused() {
 mod writes {
     use std::sync::Mutex;
 
-    use anytype_task_exporter::{source::TaskWriter, writeback::Patch};
+    use anytype_caldav::{source::TaskWriter, writeback::Patch};
 
     use super::*;
 
@@ -840,7 +840,7 @@ mod writes {
         // Kept for the life of the process: a test router outlives this call.
         let directory = Box::leak(Box::new(tempfile::tempdir().unwrap()));
         let documents = Arc::new(
-            anytype_task_exporter::state::StateStore::open(&directory.path().join("state.sqlite3"))
+            anytype_caldav::state::StateStore::open(&directory.path().join("state.sqlite3"))
                 .unwrap(),
         );
         let renderer = VTodoRenderer::new(
@@ -1106,7 +1106,7 @@ mod writes {
     }
 
     mod events {
-        use anytype_task_exporter::events::{Event, EventPatch, EventService, EventStore};
+        use anytype_caldav::events::{Event, EventPatch, EventService, EventStore};
 
         use super::*;
 
@@ -1243,7 +1243,7 @@ mod writes {
 
         fn with_events_named(
             merged: bool,
-            calendar_names: anytype_task_exporter::caldav::CalendarNames,
+            calendar_names: anytype_caldav::caldav::CalendarNames,
         ) -> (Router, Arc<Events>) {
             let (_, tasks) = writable();
             let events = Arc::new(Events::default());
@@ -1487,7 +1487,7 @@ mod writes {
         async fn the_configured_names_are_served_to_everyone() {
             let (router, _) = with_events_named(
                 false,
-                anytype_task_exporter::caldav::CalendarNames {
+                anytype_caldav::caldav::CalendarNames {
                     tasks: "Дом".into(),
                     events: "События · Команда".into(),
                 },
@@ -1860,7 +1860,7 @@ mod writes {
     fn person_path(member: &str, name: &str) -> String {
         format!(
             "/dav/calendars/tasks-{}/{name}.ics",
-            anytype_task_exporter::feed::collection_key(member)
+            anytype_caldav::feed::collection_key(member)
         )
     }
 
@@ -2018,7 +2018,7 @@ mod writes {
     // ------------------------------------------------- an account per person
 
     fn account(member: &str) -> String {
-        use anytype_task_exporter::accounts;
+        use anytype_caldav::accounts;
         let pair = format!(
             "{}:{}",
             accounts::username(member),
@@ -2147,7 +2147,7 @@ mod writes {
             "Basic {}",
             base64::engine::general_purpose::STANDARD.encode(format!(
                 "{}:nope",
-                anytype_task_exporter::accounts::username(ALICE)
+                anytype_caldav::accounts::username(ALICE)
             ))
         );
         let (status, _) = send_as(&router, &wrong, "PROPFIND", "/dav/calendars/", "").await;
@@ -2172,7 +2172,7 @@ mod writes {
         let (router, _) = grouped();
         let bobs = format!(
             "/dav/calendars/tasks-{}/",
-            anytype_task_exporter::feed::collection_key(BOB)
+            anytype_caldav::feed::collection_key(BOB)
         );
         let body = r#"<propertyupdate xmlns="DAV:"><set><prop><displayname>Боб из команды</displayname></prop></set></propertyupdate>"#;
         let (status, _) = send_as(&router, &account(ALICE), "PROPPATCH", &bobs, body).await;
@@ -2208,7 +2208,7 @@ mod writes {
 mod grouped {
     use std::{collections::BTreeMap, sync::Mutex};
 
-    use anytype_task_exporter::feed::{UNASSIGNED, collection_key};
+    use anytype_caldav::feed::{UNASSIGNED, collection_key};
 
     use super::*;
 

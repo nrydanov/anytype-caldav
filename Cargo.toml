@@ -1,5 +1,7 @@
 [package]
-name = "anytype-task-exporter"
+name = "anytype-caldav"
+description = "CalDAV server, iCalendar feed and Web Push reminders over one Anytype space"
+license-file = "LICENSE"
 version = "0.1.0"
 edition = "2024"
 
