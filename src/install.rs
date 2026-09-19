@@ -314,8 +314,12 @@ pub async fn run(
 ) -> Result<(), InstallError> {
     // A space the account cannot read answers 404; one joined a moment ago
     // may be readable and still empty, which the property list shows.
-    if client.space(space_id).get().await.is_err() {
-        return Err(InstallError::NotLoaded(space_id.to_string()));
+    match client.space(space_id).get().await {
+        Err(AnytypeError::NotFound { .. }) => {
+            return Err(InstallError::NotLoaded(space_id.to_string()));
+        }
+        Err(err) => return Err(err.into()),
+        Ok(_) => {}
     }
     let mut changes = create_properties(client, space_id, apply).await?;
     changes |= prepare_types(client, space_id, apply).await?;
