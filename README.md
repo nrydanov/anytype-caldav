@@ -114,8 +114,9 @@ invalidates every subscription, and back it up together with the state file.
 - On iOS, Web Push works only after the site is added to the Home Screen and
   subscribed from there.
 
-[`deploy/calino/`](deploy/calino/) has the script that subscribes from inside
-Calino.
+Calino subscribes to these reminders by itself in our fork: it finds `/push/key` on the account's
+server, turns the reminders on under the account's credentials and ships the
+service worker that shows them outside Safari.
 
 ## Notes on behaviour
 
@@ -137,7 +138,7 @@ Calino.
 | `src/`, `tests/` | the server; `cargo test` runs everything without a live Anytype |
 | `deploy/compose/` | Docker Compose kit: Anytype, the server, Caddy |
 | `deploy/systemd/` | unit file for a host without Docker |
-| `deploy/calino/` | reminders inside Calino, and the patch for hidden calendars |
+| `deploy/calino/` | the patch to Calino for hidden calendars |
 | `scripts/` | optional tools for preparing a space; `scripts/history/` is one-off migrations |
 | `docs/dev/` | design, decision log, plans and the handoff notes |
 

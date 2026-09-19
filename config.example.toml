@@ -80,7 +80,7 @@ all_day_time = "09:00"
 # late_window = "1h"
 # The calendar app a tapped notification opens. When set, pushes also carry a
 # Declarative Web Push envelope, which Safari on iOS 18.4+ shows without a
-# service worker. See deploy/calino/ for subscribing from inside Calino.
+# service worker. The fork of Calino subscribes to them from its settings.
 # app_url = "https://calendar.example/"
 
 # Generator of recurring tasks and events. A `recurring_task` or
