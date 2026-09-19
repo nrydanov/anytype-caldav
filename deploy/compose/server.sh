@@ -36,6 +36,14 @@ if [ -z "${CALDAV_PASSWORD:-}" ]; then
     export CALDAV_PASSWORD_FILE=/data/caldav-password
 fi
 
+# With Calino beside the server, a tapped reminder opens it, and Safari on iOS,
+# which shows a reminder without a service worker, needs that address.
+case ",${COMPOSE_PROFILES:-}," in
+*,calino,*)
+    export ANYTYPE_CALDAV__PUSH__APP_URL="${ANYTYPE_CALDAV__PUSH__APP_URL:-https://${ANYTYPE_CALDAV_DOMAIN}/}"
+    ;;
+esac
+
 if [ -n "${ACCOUNTS_SECRET:-}" ]; then
     export ANYTYPE_CALDAV__PROPERTIES__ASSIGNEE="${ANYTYPE_CALDAV__PROPERTIES__ASSIGNEE:-key:assignee}"
 fi

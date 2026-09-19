@@ -63,16 +63,15 @@ the details.
 
 The client this server is used and tested with is
 [Calino](https://github.com/Ivan-Malinovski/calino), a calendar that runs in
-the browser and shows tasks and events together. Two things to know:
+the browser and shows tasks and events together. Its fork
+[nrydanov/calino](https://github.com/nrydanov/calino) also subscribes to this
+server's Web Push, so reminders arrive with the page closed; on iOS only for
+Calino added to the Home Screen.
 
-- The CalDAV routes send no CORS headers, so Calino has to be served from the
-  same origin as the server, or reach it through a CORS proxy as Calino's
-  README describes.
-- In the browser, upstream Calino reminds only while its page is open. The
-  branch `dsc/server-push` of the fork
-  [nrydanov/calino](https://github.com/nrydanov/calino) subscribes to this
-  server's Web Push instead, so reminders arrive with the page closed; on iOS
-  only for Calino added to the Home Screen.
+The compose kit runs that fork at the domain's root when asked to
+(`COMPOSE_PROFILES=calino`, see [its README](deploy/compose/README.md#calino)).
+Served elsewhere, Calino has to reach the server through a CORS proxy, as
+Calino's README describes, since the CalDAV routes send no CORS headers.
 
 ## Run from source
 

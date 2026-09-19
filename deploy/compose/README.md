@@ -70,6 +70,28 @@ The kit serves tasks and events, makes the occurrences of recurring series and
 reads the reminder and tag properties `init` creates; `.env` can turn events
 and series off.
 
+## Calino
+
+The kit can serve [the Calino fork](https://github.com/nrydanov/calino), a
+calendar in the browser, at the domain's root. Add to `.env`:
+
+```sh
+COMPOSE_PROFILES=calino
+```
+
+and run `docker compose up -d`. In Calino, add a CalDAV account with the
+address `https://<ANYTYPE_CALDAV_DOMAIN>/dav/`, the username `anytype` and
+the CalDAV password, or a person's own login. Then:
+
+- reminders: turn them on in Calino's settings; on an iPhone, first add
+  Calino to the Home Screen and open it from there;
+- offline: once opened, Calino starts without a network and shows the
+  calendar it last synced; after an update the next visit online loads the
+  new build.
+
+The same origin needs no CORS. To take Calino away again, remove the line and
+run `docker compose rm -sf calino`.
+
 ## Behind a proxy of your own
 
 When the host already runs a reverse proxy on ports 80 and 443, leave Caddy
@@ -85,7 +107,7 @@ Then start only the two services, `docker compose up -d anytype server`
 (`ANYTYPE_CALDAV_DOMAIN` is still read, so leave it set), and route the paths of
 [`Caddyfile`](Caddyfile) to `127.0.0.1:8080` in your proxy: `/dav`, `/dav/*`,
 `/push/*` and `/healthz`, plus a redirect of
-`/.well-known/caldav` to `/dav/`.
+`/.well-known/caldav` to `/dav/`. Calino is then yours to serve as well.
 
 ## Backups
 

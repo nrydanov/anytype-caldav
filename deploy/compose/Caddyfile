@@ -1,8 +1,26 @@
-# Only the CalDAV facade and push are reachable from outside. The
-# iCalendar feed needs no password, so it is not routed here.
+# The CalDAV facade and push go to the server; everything else to Calino, when
+# the calino profile is on. The iCalendar feed needs no password, so it is not
+# routed here.
 {$DOMAIN} {
 	redir /.well-known/caldav /dav/ 301
+
 	@server path /dav /dav/* /push/* /healthz
-	reverse_proxy @server server:8080
-	respond 404
+	handle @server {
+		reverse_proxy server:8080
+	}
+
+	# Calino's own server marks its assets immutable and its service worker
+	# no-cache; a page without a header of its own is not kept by the browser,
+	# so a new build reaches it.
+	handle {
+		header ?Cache-Control "no-cache"
+		reverse_proxy calino:8080
+	}
+
+	# Without the calino profile there is no calino to reach: such paths are
+	# not found, as before.
+	handle_errors 502 {
+		@calino not path /dav /dav/* /push/* /healthz
+		respond @calino 404
+	}
 }

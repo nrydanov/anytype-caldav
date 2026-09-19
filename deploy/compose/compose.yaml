@@ -35,7 +35,7 @@ services:
   server:
     # The published image; `docker compose up --build` builds it from this
     # checkout instead.
-    image: ghcr.io/nrydanov/anytype-caldav:${ANYTYPE_CALDAV_VERSION:-0.1.1}
+    image: ghcr.io/nrydanov/anytype-caldav:${ANYTYPE_CALDAV_VERSION:-0.1.2}
     build: ../..
     restart: unless-stopped
     depends_on: [anytype]
@@ -66,6 +66,13 @@ services:
     volumes:
       - keys:/shared:ro
       - state:/data
+
+  # The calendar app, optional: COMPOSE_PROFILES=calino in .env. The Calino
+  # fork, which subscribes to this server's reminders; see README.md.
+  calino:
+    image: ghcr.io/nrydanov/calino:${ANYTYPE_CALDAV_CALINO_VERSION:-0.33.7-anytype.1}
+    profiles: [calino]
+    restart: unless-stopped
 
   caddy:
     image: caddy:2
