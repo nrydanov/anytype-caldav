@@ -98,6 +98,21 @@ pub struct VTodoRenderer {
     fallback_stamp: DateTime<Utc>,
 }
 
+/// The link that opens an object in the Anytype app itself. The web link the
+/// API gives (`https://object.any.coop/<id>?spaceId=<space>`) lands on a page
+/// with an "Open in App" button first; the app's own scheme skips it. A link
+/// of any other shape is passed through as it is.
+pub fn app_link(web_link: &str) -> String {
+    web_link
+        .strip_prefix("https://object.any.coop/")
+        .and_then(|rest| rest.split_once("?spaceId="))
+        .map(|(object_id, space_id)| {
+            let space_id = space_id.split(['&', '#']).next().unwrap_or(space_id);
+            format!("anytype://object?objectId={object_id}&spaceId={space_id}")
+        })
+        .unwrap_or_else(|| web_link.to_string())
+}
+
 impl VTodoRenderer {
     pub fn new(
         config: CalendarConfig,
@@ -168,6 +183,10 @@ impl VTodoRenderer {
             .timestamp(modified)
             .sequence(sequence_for(modified));
 
+        // What a client shows under the title. Nothing here is read back on a
+        // write, so it can carry what the calendar has no property for.
+        let mut description: Vec<String> = Vec::new();
+
         let tz = self.config.date_only_timezone;
         match self.schedule(
             task.scheduled.as_ref().map(|value| value.classify(tz)),
@@ -181,7 +200,8 @@ impl VTodoRenderer {
                 todo.starts(start).due(due);
             }
             Schedule::Described { due, deadline } => {
-                todo.due(due).description(&deadline);
+                todo.due(due);
+                description.push(deadline);
             }
         }
 
@@ -196,6 +216,12 @@ impl VTodoRenderer {
 
         if let Some(url) = &task.object_url {
             todo.url(url);
+            // Also in the description, on a line of its own: a client shows
+            // `URL` in few places, if at all, and makes a link of this one.
+            description.push(app_link(url));
+        }
+        if !description.is_empty() {
+            todo.description(&description.join("\n"));
         }
 
         let mut todo = todo.done();
@@ -460,6 +486,23 @@ mod tests {
     /// exactly this reason. The plan therefore goes to `DUE`, and only there:
     /// its parser reads `start = DTSTART || DUE`, so the hour survives, while a
     /// second property could only disagree with the first.
+    #[test]
+    fn the_description_link_opens_the_app_directly() {
+        assert_eq!(
+            app_link("https://object.any.coop/bafyobj?spaceId=bafyspace.abc"),
+            "anytype://object?objectId=bafyobj&spaceId=bafyspace.abc"
+        );
+        // An invite link carries more after the space; only the space is kept.
+        assert_eq!(
+            app_link("https://object.any.coop/bafyobj?spaceId=bafyspace.abc&inviteId=x#key"),
+            "anytype://object?objectId=bafyobj&spaceId=bafyspace.abc"
+        );
+        assert_eq!(
+            app_link("anytype://object?objectId=a"),
+            "anytype://object?objectId=a"
+        );
+    }
+
     #[test]
     fn a_planned_time_with_no_deadline_is_written_as_due_alone() {
         let mut t = task("plan", "Записаться на обклейку электроники в гитаре");

@@ -245,6 +245,8 @@ fn vevent_for(
     }
     if let Some(url) = &event.object_url {
         vevent.url(url);
+        // Also where a client shows it: see `render_task`.
+        vevent.description(&crate::render::app_link(url));
     }
     let mut vevent = vevent.done();
     for tag in &event.tags {
