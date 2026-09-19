@@ -69,13 +69,6 @@ pub fn router(state: AppState, feed_path: &str) -> Router {
             .route("/push/test", post(authorized_test));
     }
 
-    // Voice capture: one line of text becomes a task. Separate from CalDAV
-    // because the clients that can reach it — Shortcuts, a script on a
-    // laptop — speak JSON, not iCalendar.
-    if state.writer.is_some() && state.caldav.is_some() {
-        router = router.route("/capture", post(capture));
-    }
-
     if state.caldav.is_some() {
         router = router
             .route("/dav", any(crate::caldav::handle))
@@ -173,23 +166,9 @@ async fn push_subscribe(
     }
 }
 
-/// 401 without `WWW-Authenticate`: a challenge would make the browser open its
-/// own sign-in dialog over the app.
-fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
-    let accepted = state
-        .caldav
-        .as_ref()
-        .is_some_and(|credentials| credentials.accepts(headers));
-    if !accepted {
-        warn!(
-            presented = headers.contains_key(header::AUTHORIZATION),
-            "push request without valid credentials"
-        );
-    }
-    accepted
-}
-
-/// Like `authorized`, and also accepts a person's own account.
+/// Who a push request comes from: the shared login or a person's own account.
+/// A refusal is a 401 without `WWW-Authenticate`, since a challenge would make
+/// the browser open its own sign-in dialog over the app.
 async fn reader(state: &AppState, headers: &HeaderMap) -> Option<crate::caldav::Reader> {
     let reader = match &state.caldav {
         Some(credentials) => credentials.reader(&state.feed, headers).await,
@@ -274,120 +253,6 @@ async fn send_test(state: &AppState, assignees: Option<&[String]>) -> Response {
     };
     let (delivered, attempted) = push.notify(&notification, assignees).await;
     Json(serde_json::json!({ "delivered": delivered, "subscriptions": attempted })).into_response()
-}
-
-/// One captured thought.
-#[derive(Debug, serde::Deserialize)]
-pub struct Capture {
-    /// What to call the task.
-    pub text: String,
-    /// When it is planned, RFC 3339. A date without a time is taken as a whole
-    /// day, which is how Anytype stores one.
-    #[serde(default)]
-    pub due: Option<String>,
-    /// The sender's own id for this thought, so a repeated send writes one
-    /// task. Apple's reminders have one; a shortcut can send any stable text.
-    #[serde(default)]
-    pub id: Option<String>,
-    /// Tag names; missing options are created.
-    #[serde(default)]
-    pub tags: Vec<String>,
-}
-
-/// Creates a task from a line of text. Idempotent through `id`: the same id
-/// twice leaves one task, so a client may retry without looking first.
-async fn capture(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
-    if !authorized(&state, &headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let Some(writer) = state.writer.clone() else {
-        return (StatusCode::NOT_FOUND, "capture is disabled").into_response();
-    };
-    let capture: Capture = match serde_json::from_str(&body) {
-        Ok(capture) => capture,
-        Err(err) => {
-            warn!(error = %err, "capture body is not a capture");
-            return (StatusCode::UNPROCESSABLE_ENTITY, "expected {\"text\": …}").into_response();
-        }
-    };
-    let text = capture.text.trim();
-    if text.is_empty() {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "text is empty").into_response();
-    }
-    let uid = match capture
-        .id
-        .as_deref()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    {
-        Some(id) => format!("{id}@capture.anytype-task-exporter"),
-        None => format!("{}@capture.anytype-task-exporter", uuid_like(text)),
-    };
-
-    // A resource under that UID means this thought was already written.
-    if let Outcome::Fresh(snapshot) | Outcome::Stale(snapshot) = state.feed.get().await
-        && let Some(resource) = snapshot.objects.get(&crate::feed::calino_filename(&uid))
-    {
-        info!(%uid, object_id = %resource.object_id, "capture: already written");
-        return Json(serde_json::json!({
-            "object_id": resource.object_id,
-            "created": false,
-        }))
-        .into_response();
-    }
-
-    let due = match capture
-        .due
-        .as_deref()
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-    {
-        None => None,
-        Some(due) => match crate::capture::anytype_date(due, state.feed.renderer().config()) {
-            Some(value) => Some(value),
-            None => {
-                warn!(due, "capture: unreadable date");
-                return (StatusCode::UNPROCESSABLE_ENTITY, "due is not a date").into_response();
-            }
-        },
-    };
-    let patch = crate::writeback::Patch {
-        name: Some(text.to_string()),
-        done: Some(false),
-        scheduled: Some(due),
-        deadline: None,
-        tags: (!capture.tags.is_empty()).then(|| capture.tags.clone()),
-        // A captured thought belongs to nobody until someone sorts it.
-        assignees: None,
-    };
-    info!(%uid, ?patch, "capture: creating task");
-    match writer.create_task(&uid, &patch).await {
-        Ok(object_id) => {
-            state.feed.invalidate();
-            info!(%uid, %object_id, "capture: task created");
-            Json(serde_json::json!({ "object_id": object_id, "created": true })).into_response()
-        }
-        Err(err) => {
-            error!(error = %err, "capture: creating the task failed");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                err.public_category().to_string(),
-            )
-                .into_response()
-        }
-    }
-}
-
-/// A stable id for a text with no id of its own, so a retry of the same words
-/// within the same minute does not make a second task.
-fn uuid_like(text: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let minute = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() / 60)
-        .unwrap_or(0);
-    let digest = Sha256::digest(format!("{minute}:{text}").as_bytes());
-    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Liveness only: deliberately independent of Anytype, so a probe reports on

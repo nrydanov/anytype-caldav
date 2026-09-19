@@ -63,7 +63,7 @@ services:
 Then start only the two services, `docker compose up -d anytype server`
 (`DOMAIN` is still read, so leave it set), and route the paths of
 [`Caddyfile`](Caddyfile) to `127.0.0.1:8080` in your proxy: `/dav`, `/dav/*`,
-`/push/*`, `/capture` and `/healthz`, plus a redirect of
+`/push/*` and `/healthz`, plus a redirect of
 `/.well-known/caldav` to `/dav/`.
 
 ## Backups

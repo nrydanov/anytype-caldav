@@ -10,8 +10,7 @@ reminders arrive as Web Push on the phone, including iOS.
         ▼
  anytype-caldav ──── /dav/        CalDAV: tasks (VTODO), events (VEVENT), read and write
                  ├── /push/       Web Push subscriptions and reminders
-                 ├── /f/…/todos.ics  read-only iCalendar feed
-                 └── /capture     one line of text becomes a task
+                 └── /f/…/todos.ics  read-only iCalendar feed
 ```
 
 Anytype stays the source of truth. The server keeps no copy of the space; its
