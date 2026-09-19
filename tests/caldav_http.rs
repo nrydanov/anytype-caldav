@@ -1508,10 +1508,7 @@ mod writes {
             );
             let (_, _, own) =
                 send(&router, "PROPFIND", "/dav/calendars/tasks/", Some("0"), "").await;
-            assert!(
-                own.contains("<d:displayname>Дом</d:displayname>"),
-                "{own}"
-            );
+            assert!(own.contains("<d:displayname>Дом</d:displayname>"), "{own}");
         }
 
         // ------------------------------------ events inside the task calendar
