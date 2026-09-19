@@ -106,6 +106,8 @@ WARN property available on type task property=key:due_date id:bafy... name:"Dead
 Web Push is optional. Subscriptions and handled reminders are stored in SQLite,
 so they survive restarts. Keep the VAPID key stable, since replacing it
 invalidates every subscription, and back it up together with the state file.
+When `push.private_key_file` does not exist, the key is made there on the first
+start, readable by its owner only; an existing file is never replaced.
 
 - Delivery is **at most once**: a reminder is claimed before it is sent, so a
   restart never repeats one, and a crash right after the claim loses it.

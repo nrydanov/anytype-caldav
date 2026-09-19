@@ -250,6 +250,7 @@ dependencies = [
  "humantime-serde",
  "ical",
  "icalendar",
+ "openssl",
  "reqwest",
  "rrule",
  "rusqlite",

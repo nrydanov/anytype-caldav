@@ -79,6 +79,7 @@ all_day_time = "09:00"
 # [push]
 # enabled = true
 # Keep this key stable: replacing it invalidates existing subscriptions.
+# Made on the first start when the file does not exist.
 # private_key_file = "~/.config/vapid_private.pem"
 # Contains subscription encryption keys and handled reminder identities.
 # Keep it private and back it up together with the VAPID key.

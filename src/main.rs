@@ -17,7 +17,7 @@ use anytype_caldav::{
 };
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Environment variable this service reads the Anytype API key from.
@@ -366,6 +366,13 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         durable_state.clone(),
     ) {
         (true, Some(key_path), Some(state_path), Some(durable_state)) => {
+            if anytype_caldav::push::ensure_vapid_key(key_path)? {
+                warn!(
+                    path = %key_path.display(),
+                    "made a new VAPID key; back it up together with the state file, \
+                     since replacing it cuts off every subscription"
+                );
+            }
             let service =
                 PushService::load(key_path, durable_state.clone(), config.push.app_url.clone())?;
             let scheduler = PushScheduler::new(

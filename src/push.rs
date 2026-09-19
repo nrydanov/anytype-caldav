@@ -27,6 +27,12 @@ pub enum PushError {
     },
     #[error("the VAPID private key is not a usable P-256 PEM key: {0}")]
     KeyInvalid(String),
+    #[error("cannot write a new VAPID private key at {path}: {source}")]
+    KeyWrite {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("building the push message failed: {0}")]
     Build(String),
     #[error("the push service rejected the message: {0}")]
@@ -105,6 +111,46 @@ pub struct PushService {
     state: Arc<StateStore>,
     app_url: Option<String>,
     client: HyperWebPushClient,
+}
+
+/// Makes the VAPID key at `path` when there is none: a P-256 key in SEC1 PEM,
+/// readable by its owner only, in a directory made if missing. An existing
+/// file is never touched, not even an unreadable one: a new key would cut off
+/// every subscription made with the old. The key is made before the file, so
+/// a failure cannot leave an empty file behind. Returns whether it made one.
+pub fn ensure_vapid_key(path: &std::path::Path) -> Result<bool, PushError> {
+    use std::io::Write;
+
+    if path.exists() {
+        return Ok(false);
+    }
+    let pem = openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1)
+        .and_then(|group| openssl::ec::EcKey::generate(&group))
+        .and_then(|key| key.private_key_to_pem())
+        .map_err(|err| PushError::KeyInvalid(err.to_string()))?;
+
+    let write_error = |source| PushError::KeyWrite {
+        path: path.display().to_string(),
+        source,
+    };
+    if let Some(directory) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(directory).map_err(write_error)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        // Made by someone else in the meantime: theirs stands.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(err) => return Err(write_error(err)),
+    };
+    file.write_all(&pem).map_err(write_error)?;
+    Ok(true)
 }
 
 impl PushService {
@@ -367,6 +413,32 @@ mod tests {
             "https://calendar.example/"
         );
         assert!(value["notification"].get("tag").is_none(), "{value}");
+    }
+
+    /// A key made on first start loads like one made by hand, is readable by
+    /// its owner only, and is never replaced by a later start.
+    #[test]
+    fn a_missing_key_is_made_once_and_then_left_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("keys").join("vapid.pem");
+
+        assert!(ensure_vapid_key(&path).unwrap(), "made on first call");
+        let made = std::fs::read(&path).unwrap();
+        assert!(String::from_utf8_lossy(&made).contains("BEGIN EC PRIVATE KEY"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let service = PushService::load(&path, test_state(), None).unwrap();
+        assert!(!service.public_key().is_empty());
+
+        assert!(
+            !ensure_vapid_key(&path).unwrap(),
+            "left alone on the next call"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), made);
     }
 
     #[test]

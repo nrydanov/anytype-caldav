@@ -20,6 +20,7 @@ http = "1.5.0"
 httpdate = "1.0.3"
 humantime = "2.3.0"
 humantime-serde = "1.1.1"
+openssl = "0.10"
 icalendar = "0.17.13"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 rrule = "0.14"
