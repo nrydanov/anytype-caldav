@@ -7,7 +7,12 @@
 # run `docker compose up -d` again.
 services:
   anytype:
-    image: ghcr.io/anyproto/anytype-cli:${ANYTYPE_CLI_VERSION:-v0.3.7}
+    # The CLI's image with socat, which relays Anytype's gRPC port (see
+    # anytype.sh).
+    build:
+      dockerfile_inline: |
+        FROM ghcr.io/anyproto/anytype-cli:${ANYTYPE_CLI_VERSION:-v0.3.7}
+        RUN apk add --no-cache socat
     restart: unless-stopped
     entrypoint: ["/bin/sh", "/setup/anytype.sh"]
     environment:
@@ -28,12 +33,12 @@ services:
     build: ../..
     restart: unless-stopped
     depends_on: [anytype]
-    # Waits for the API key and the id of the joined space (unless .env names
-    # the space), brings the space's schema up to date (init creates only what
+    # Waits for the API key, the session token and the id of the joined space
+    # (unless .env names the space), brings the space's schema up to date (init creates only what
     # is missing) and starts.
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - until [ -s /shared/api-key ]; do sleep 2; done;
+      - until [ -s /shared/api-key ] && [ -s /shared/session-token ]; do sleep 2; done;
         if [ -z "$${ANYTYPE_CALDAV__ANYTYPE__SPACE_ID:-}" ]; then
           until [ -s /shared/space-id ]; do sleep 2; done;
           export ANYTYPE_CALDAV__ANYTYPE__SPACE_ID="$$(cat /shared/space-id)";
@@ -42,7 +47,9 @@ services:
     env_file: .env
     environment:
       ANYTYPE_API_KEY_FILE: /shared/api-key
+      ANYTYPE_SESSION_TOKEN_FILE: /shared/session-token
       ANYTYPE_CALDAV__ANYTYPE__URL: http://anytype:31012
+      ANYTYPE_CALDAV__ANYTYPE__GRPC_URL: http://anytype:31020
       ANYTYPE_CALDAV__SERVER__LISTEN: 0.0.0.0:8080
       ANYTYPE_CALDAV__CALDAV__ENABLED: "true"
       ANYTYPE_CALDAV__CALDAV__WRITABLE: "true"

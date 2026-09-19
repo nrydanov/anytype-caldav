@@ -12,8 +12,14 @@
 #   again, since an endless round of joins would be the only harm, and a new
 #   link joins anew;
 # - a new API key is issued on every start and handed to the server through
-#   the shared volume; older keys keep working.
+#   the shared volume; older keys keep working;
+# - the session token is handed over too, with a relay to Anytype's gRPC port,
+#   which listens on localhost only: the server sets the header of a type,
+#   which the API cannot, over gRPC.
 set -u
+
+# Stale until the account is up again.
+rm -f /shared/session-token
 
 cli() { anytype --no-update-check "$@"; }
 
@@ -67,6 +73,15 @@ done
 if [ "$ready" -ne 1 ]; then
     echo "the account did not come up within two minutes" >&2
     exit 1
+fi
+
+socat TCP-LISTEN:31020,fork,reuseaddr TCP:127.0.0.1:31010 &
+token=$(sed -n 's/.*"sessionToken": *"\([^"]*\)".*/\1/p' /root/.anytype/config.json)
+if [ -n "$token" ]; then
+    printf '%s\n' "$token" > /shared/session-token.new &&
+        mv /shared/session-token.new /shared/session-token
+else
+    echo "no session token in the CLI config; init leaves type headers alone" >&2
 fi
 
 join_space() {

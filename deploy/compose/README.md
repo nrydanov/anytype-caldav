@@ -27,7 +27,8 @@ obtains the TLS certificate. Nothing but Docker is needed on the host.
    On the first start the `anytype` service creates a bot account and prints
    its account key: keep it. The bot then asks to join the space by the invite
    link, trying again every minute until the request goes through, and hands
-   the space's id to the server. If the invite needs approval, the owner
+   the space's id to the server, together with the API key and the session
+   token `init` uses to set type headers over gRPC. If the invite needs approval, the owner
    approves the bot in Anytype; until then `init` fails and the server is
    restarted, so it comes up by itself once the bot is in.
 
