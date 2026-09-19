@@ -611,8 +611,10 @@ mod settings {
     }
 }
 
-#[tokio::test]
-async fn push_outside_the_secret_prefix_needs_the_caldav_password() {
+/// Push outside the feed's secret prefix needs the CalDAV password, and with
+/// no secret prefix at all (the default feed path) there are no open push
+/// routes to clash with it or to subscribe through without a password.
+async fn push_outside_the_secret_prefix_needs_the_caldav_password(feed_path: &str) {
     use anytype_caldav::{push::PushService, state::StateStore};
 
     let directory = tempfile::tempdir().unwrap();
@@ -657,7 +659,7 @@ async fn push_outside_the_secret_prefix_needs_the_caldav_password() {
             calendar_names: Default::default(),
             documents: None,
         },
-        "/f/secret/todos.ics",
+        feed_path,
     );
     let subscription =
         r#"{"endpoint":"https://web.push.apple.com/abc","keys":{"p256dh":"k","auth":"a"}}"#;
@@ -702,6 +704,16 @@ async fn push_outside_the_secret_prefix_needs_the_caldav_password() {
         .await
         .unwrap();
     assert_eq!(key.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn push_needs_the_caldav_password_beside_a_secret_feed_path() {
+    push_outside_the_secret_prefix_needs_the_caldav_password("/f/secret/todos.ics").await;
+}
+
+#[tokio::test]
+async fn push_needs_the_caldav_password_beside_the_default_feed_path() {
+    push_outside_the_secret_prefix_needs_the_caldav_password("/todos.ics").await;
 }
 
 #[tokio::test]

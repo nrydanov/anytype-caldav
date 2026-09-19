@@ -48,8 +48,11 @@ pub fn router(state: AppState, feed_path: &str) -> Router {
     // Push endpoints live under the feed's own secret prefix. On a public
     // deployment that prefix is the only thing protecting the feed, and an
     // open /push/subscribe would let anyone register to receive the reminders.
-    if state.push.is_some() {
-        let prefix = secret_prefix(feed_path);
+    // A feed path with no prefix, such as the default /todos.ics, has no
+    // secret to hide them behind, so they are not offered at all: they would
+    // stand open at the root and clash with the password-guarded ones below.
+    let prefix = secret_prefix(feed_path);
+    if state.push.is_some() && !prefix.is_empty() {
         router = router
             .route(&format!("{prefix}/push/key"), get(push_key))
             .route(&format!("{prefix}/push/subscribe"), post(push_subscribe))
