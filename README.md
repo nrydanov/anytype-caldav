@@ -39,7 +39,8 @@ calendar app's own settings.
   what is missing.
 
 What it does not do: Apple Calendar and Reminders cannot show `VTODO` by any
-route (see [`docs/dev/2026-08-31-tasks-and-events-decision-log.md`](docs/dev/2026-08-31-tasks-and-events-decision-log.md)).
+route. Calendar ignores it in a subscribed feed, and Reminders no longer
+speaks CalDAV.
 One process serves one space; run a second process for a second space.
 
 ## Quick start
@@ -114,9 +115,10 @@ invalidates every subscription, and back it up together with the state file.
 - On iOS, Web Push works only after the site is added to the Home Screen and
   subscribed from there.
 
-Calino subscribes to these reminders by itself in our fork: it finds `/push/key` on the account's
-server, turns the reminders on under the account's credentials and ships the
-service worker that shows them outside Safari.
+Calino subscribes to these reminders by itself in our fork: it finds
+`/push/key` on the account's server, turns the reminders on under the
+account's credentials and ships the service worker that shows them outside
+Safari.
 
 ## Notes on behaviour
 
@@ -138,9 +140,7 @@ service worker that shows them outside Safari.
 | `src/`, `tests/` | the server; `cargo test` runs everything without a live Anytype |
 | `deploy/compose/` | Docker Compose kit: Anytype, the server, Caddy |
 | `deploy/systemd/` | unit file for a host without Docker |
-| `deploy/calino/` | the patch to Calino for hidden calendars |
-| `scripts/` | optional tools for preparing a space; `scripts/history/` is one-off migrations |
-| `docs/dev/` | design, decision log, plans and the handoff notes |
+| `scripts/` | `type_header.py`, which sets the properties in a type's header; only gRPC can |
 
 ## Development
 
@@ -151,9 +151,6 @@ cargo test
 Generated calendars are parsed back by a different crate than the one that
 wrote them. The Anytype boundary is covered by fixtures; a live test against a
 real installation is gated by the environment (`tests/live_feed.rs`).
-
-Start with [`docs/dev/HANDOFF.md`](docs/dev/HANDOFF.md) for the current state
-and the constraints that were expensive to learn.
 
 ## License
 
