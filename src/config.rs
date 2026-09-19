@@ -71,12 +71,68 @@ impl fmt::Display for PropertySelector {
     }
 }
 
+/// Sets the value `ANYTYPE_CALDAV__A__B` names at `a.b`, making the tables on
+/// the way. A section given as a scalar, or an empty part, is an error rather
+/// than a value silently dropped.
+fn overlay(
+    table: &mut toml::Table,
+    name: &str,
+    path: &str,
+    value: &str,
+) -> Result<(), ConfigError> {
+    let parts: Vec<String> = path.split("__").map(str::to_ascii_lowercase).collect();
+    if parts.iter().any(String::is_empty) {
+        return Err(ConfigError::Invalid(format!(
+            "{name}: every part between double underscores must be non-empty"
+        )));
+    }
+    let (key, sections) = parts.split_last().expect("split yields at least one part");
+    let mut current = table;
+    for section in sections {
+        current = match current
+            .entry(section.clone())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        {
+            toml::Value::Table(inner) => inner,
+            _ => {
+                return Err(ConfigError::Invalid(format!(
+                    "{name}: {section} is a value, not a section"
+                )));
+            }
+        };
+    }
+    current.insert(key.clone(), env_value(value));
+    Ok(())
+}
+
+/// A boolean, a number or an array is read as TOML, so `true`, `42` and
+/// `["https://a.example"]` keep their types; anything else is taken as the
+/// string it is, so `Europe/Berlin`, `30m` and `09:00` need no quotes. A time
+/// such as `09:00` is TOML too, which is why only these three kinds count.
+fn env_value(value: &str) -> toml::Value {
+    toml::from_str::<toml::Table>(&format!("v = {value}"))
+        .ok()
+        .and_then(|mut table| table.remove("v"))
+        .filter(|parsed| {
+            matches!(
+                parsed,
+                toml::Value::Boolean(_)
+                    | toml::Value::Integer(_)
+                    | toml::Value::Float(_)
+                    | toml::Value::Array(_)
+            )
+        })
+        .unwrap_or_else(|| toml::Value::String(value.to_string()))
+}
+
 // ---------------------------------------------------------------- raw shapes
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     anytype: RawAnytype,
+    #[serde(default)]
     properties: RawProperties,
+    #[serde(default)]
     calendar: RawCalendar,
     #[serde(default)]
     server: RawServer,
@@ -172,14 +228,42 @@ struct RawAnytype {
     max_objects: usize,
 }
 
+/// The three required selectors default to the keys `init` creates, so a
+/// space prepared by it needs none of them written down.
 #[derive(Debug, Deserialize)]
 struct RawProperties {
+    #[serde(default = "default_scheduled")]
     scheduled: String,
+    #[serde(default = "default_deadline")]
     deadline: String,
+    #[serde(default = "default_done")]
     done: String,
     reminder: Option<String>,
     tags: Option<String>,
     assignee: Option<String>,
+}
+
+impl Default for RawProperties {
+    fn default() -> Self {
+        Self {
+            scheduled: default_scheduled(),
+            deadline: default_deadline(),
+            done: default_done(),
+            reminder: None,
+            tags: None,
+            assignee: None,
+        }
+    }
+}
+
+fn default_scheduled() -> String {
+    "key:scheduled".to_string()
+}
+fn default_deadline() -> String {
+    "key:due_date".to_string()
+}
+fn default_done() -> String {
+    "key:done".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +276,17 @@ struct RawCalendar {
     date_only_timezone: Option<String>,
     #[serde(default)]
     language: crate::locale::Language,
+}
+
+impl Default for RawCalendar {
+    fn default() -> Self {
+        Self {
+            timezone: default_timezone(),
+            name: default_calendar_name(),
+            date_only_timezone: None,
+            language: crate::locale::Language::default(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,20 +516,50 @@ impl ServerConfig {
     }
 }
 
+/// Environment variables that set a configuration value start with this, and
+/// separate the section from the key with a double underscore:
+/// `ANYTYPE_CALDAV__CALENDAR__TIMEZONE` sets `calendar.timezone`. Keys have
+/// single underscores of their own (`space_id`), hence the double one.
+pub const ENV_PREFIX: &str = "ANYTYPE_CALDAV__";
+
 impl Config {
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
-        Self::from_toml(&text, &path.display().to_string())
+    /// Reads the file, when there is one, and lays every `ANYTYPE_CALDAV__…`
+    /// variable of the environment over it. Without a file the whole
+    /// configuration comes from the environment.
+    pub fn load(path: Option<&Path>) -> Result<Self, ConfigError> {
+        let (text, origin) = match path {
+            Some(path) => {
+                let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+                (text, path.display().to_string())
+            }
+            None => (String::new(), "the environment".to_string()),
+        };
+        Self::from_toml_and_env(&text, &origin, std::env::vars())
     }
 
     pub fn from_toml(text: &str, path: &str) -> Result<Self, ConfigError> {
-        let raw: RawConfig = toml::from_str(text).map_err(|source| ConfigError::Parse {
+        Self::from_toml_and_env(text, path, std::iter::empty())
+    }
+
+    pub fn from_toml_and_env(
+        text: &str,
+        path: &str,
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, ConfigError> {
+        let parse_error = |source| ConfigError::Parse {
             path: path.to_string(),
             source,
-        })?;
+        };
+        let mut table: toml::Table = toml::from_str(text).map_err(parse_error)?;
+        for (name, value) in env {
+            if let Some(rest) = name.strip_prefix(ENV_PREFIX) {
+                overlay(&mut table, &name, rest, &value)?;
+            }
+        }
+        let raw: RawConfig = toml::Value::Table(table).try_into().map_err(parse_error)?;
         Self::validate(raw)
     }
 
@@ -797,6 +922,80 @@ allowed_origins = ["https://calino.io"]
 
     fn load(text: &str) -> Result<Config, ConfigError> {
         Config::from_toml(text, "test.toml")
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_file() {
+        let config = Config::from_toml_and_env(
+            &base(),
+            "test.toml",
+            env(&[
+                ("ANYTYPE_CALDAV__CALENDAR__TIMEZONE", "Europe/Berlin"),
+                ("ANYTYPE_CALDAV__ANYTYPE__MAX_OBJECTS", "42"),
+                ("UNRELATED", "x"),
+            ]),
+        )
+        .expect("valid");
+        assert_eq!(config.calendar.timezone, chrono_tz::Europe::Berlin);
+        assert_eq!(config.anytype.max_objects, 42);
+    }
+
+    #[test]
+    fn a_whole_configuration_can_come_from_the_environment() {
+        let config = Config::from_toml_and_env(
+            "",
+            "the environment",
+            env(&[
+                ("ANYTYPE_CALDAV__ANYTYPE__URL", "http://anytype:31012"),
+                ("ANYTYPE_CALDAV__ANYTYPE__SPACE_ID", SPACE_ID),
+                ("ANYTYPE_CALDAV__CALDAV__ENABLED", "true"),
+                ("ANYTYPE_CALDAV__CALDAV__USERNAME", "me"),
+                ("ANYTYPE_CALDAV__REMINDERS__ALL_DAY_TIME", "08:30"),
+                ("ANYTYPE_CALDAV__PUSH__POLL_INTERVAL", "45s"),
+                (
+                    "ANYTYPE_CALDAV__SERVER__ALLOWED_ORIGINS",
+                    r#"["https://a.example"]"#,
+                ),
+            ]),
+        )
+        .expect("valid");
+        assert_eq!(config.anytype.url, "http://anytype:31012");
+        assert!(config.caldav.enabled);
+        assert_eq!(config.caldav.username, "me");
+        assert_eq!(config.server.allowed_origins, vec!["https://a.example"]);
+        // The selectors a space prepared by `init` has.
+        assert_eq!(
+            config.properties.deadline,
+            PropertySelector::Key("due_date".into())
+        );
+        assert_eq!(config.calendar.timezone, chrono_tz::Europe::Saratov);
+    }
+
+    #[test]
+    fn a_malformed_variable_is_refused() {
+        let empty_part = Config::from_toml_and_env(
+            &base(),
+            "test.toml",
+            env(&[("ANYTYPE_CALDAV__CALENDAR____TIMEZONE", "UTC")]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(empty_part.contains("non-empty"), "{empty_part}");
+        let scalar_section = Config::from_toml_and_env(
+            &base(),
+            "test.toml",
+            env(&[("ANYTYPE_CALDAV__ANYTYPE__URL__X", "y")]),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(scalar_section.contains("not a section"), "{scalar_section}");
     }
 
     #[test]

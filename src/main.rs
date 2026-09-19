@@ -32,9 +32,11 @@ const SDK_TOKEN_ENV: &str = "ANYTYPE_KEY_HTTP_TOKEN";
 #[derive(Parser)]
 #[command(about, version)]
 struct Args {
-    /// Path to the TOML configuration file.
+    /// Path to the TOML configuration file. Every value can also come from an
+    /// `ANYTYPE_CALDAV__SECTION__KEY` environment variable, which wins over the
+    /// file; without a file the whole configuration comes from there.
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
 
     /// Without a subcommand the service runs.
     #[command(subcommand)]
@@ -110,7 +112,14 @@ fn main() -> std::process::ExitCode {
     }
     drop(api_key);
 
-    let config = match Config::load(&args.config) {
+    let overrides: Vec<String> = std::env::vars()
+        .map(|(name, _)| name)
+        .filter(|name| name.starts_with(anytype_caldav::config::ENV_PREFIX))
+        .collect();
+    if !overrides.is_empty() {
+        info!(?overrides, "configuration values from the environment");
+    }
+    let config = match Config::load(args.config.as_deref()) {
         Ok(config) => config,
         Err(err) => {
             eprintln!("configuration error: {err}");

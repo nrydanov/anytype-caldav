@@ -1,6 +1,13 @@
-# Anytype VTODO exporter — example configuration.
+# anytype-caldav — example configuration.
 # The API key is NOT stored here; it is read from the ANYTYPE_API_KEY
 # environment variable.
+#
+# Every value below can also be set by an environment variable, which wins
+# over this file: ANYTYPE_CALDAV__<SECTION>__<KEY>, for example
+# ANYTYPE_CALDAV__CALENDAR__TIMEZONE=Europe/Berlin. Booleans, numbers and
+# arrays are written as in TOML; anything else is taken as a string. Without
+# --config the whole configuration comes from the environment. The three
+# required property selectors default to the keys `init` creates.
 
 [anytype]
 url = "http://127.0.0.1:31009"
