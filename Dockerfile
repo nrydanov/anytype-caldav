@@ -10,6 +10,10 @@ RUN apt-get update \
  && useradd --system --home /data anytype-caldav \
  && mkdir /data && chown anytype-caldav /data
 COPY --from=build /anytype-caldav /usr/local/bin/anytype-caldav
+# The compose kit's entrypoint. Shipped in the image rather than mounted, so
+# the host's file modes do not decide whether this user can read it.
+COPY deploy/compose/server.sh /usr/local/bin/anytype-caldav-compose
+RUN chmod 755 /usr/local/bin/anytype-caldav-compose
 USER anytype-caldav
 WORKDIR /data
 EXPOSE 8080

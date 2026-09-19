@@ -2,5 +2,6 @@ target
 config.toml
 .git
 deploy
+!deploy/compose/server.sh
 docs
 scripts

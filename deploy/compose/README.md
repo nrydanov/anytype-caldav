@@ -1,7 +1,18 @@
 # Compose kit
 
 anytype-caldav with a headless Anytype of its own and Caddy in front, which
-obtains the TLS certificate. Nothing but Docker is needed on the host.
+obtains the TLS certificate. Nothing but Docker is needed on the host:
+
+- Docker Engine or Docker Desktop with Compose v2.17 or later (`docker
+  compose`, not the old `docker-compose`);
+- a 64-bit host, x86-64 or ARM64;
+- ports 80 and 443 free, which rootless Docker and Podman cannot bind; see
+  [Behind a proxy of your own](#behind-a-proxy-of-your-own) otherwise;
+- outbound access to Anytype's network, or to the self-hosted one.
+
+The server's image is pulled, so the host does not build Rust; building it
+from source (`docker compose up --build`) takes far more memory than running
+it.
 
 1. In Anytype, the owner of the space makes an invite link with editor
    rights (the bot creates types and writes tasks) and without approval, so

@@ -25,8 +25,9 @@ services:
       ANYTYPE_INVITE_LINK: ${ANYTYPE_INVITE_LINK:-}
       ANYTYPE_ACCOUNT_KEY: ${ANYTYPE_ACCOUNT_KEY:-}
     volumes:
-      - ./anytype.sh:/setup/anytype.sh:ro
-      - ./network:/setup/network:ro
+      # z: readable in the container on hosts with SELinux.
+      - ./anytype.sh:/setup/anytype.sh:ro,z
+      - ./network:/setup/network:ro,z
       - anytype-data:/root/.anytype
       - anytype-config:/root/.config/anytype
       - keys:/shared
@@ -34,13 +35,13 @@ services:
   server:
     # The published image; `docker compose up --build` builds it from this
     # checkout instead.
-    image: ghcr.io/nrydanov/anytype-caldav:${ANYTYPE_CALDAV_VERSION:-0.1.0}
+    image: ghcr.io/nrydanov/anytype-caldav:${ANYTYPE_CALDAV_VERSION:-0.1.1}
     build: ../..
     restart: unless-stopped
     depends_on: [anytype]
     # Waits for what the anytype service hands over, prepares the space and
-    # serves (see server.sh).
-    entrypoint: ["/bin/sh", "/setup/server.sh"]
+    # serves (server.sh, shipped in the image).
+    entrypoint: ["anytype-caldav-compose"]
     command: []
     env_file: .env
     environment:
@@ -63,7 +64,6 @@ services:
       ANYTYPE_CALDAV__PUSH__PRIVATE_KEY_FILE: /data/vapid.pem
       ANYTYPE_CALDAV__PUSH__STATE_FILE: /data/state.sqlite3
     volumes:
-      - ./server.sh:/setup/server.sh:ro
       - keys:/shared:ro
       - state:/data
 
@@ -77,7 +77,7 @@ services:
     environment:
       DOMAIN: ${ANYTYPE_CALDAV_DOMAIN:?set ANYTYPE_CALDAV_DOMAIN in .env}
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro,z
       - caddy:/data
 
 volumes:

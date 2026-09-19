@@ -1,6 +1,7 @@
 #!/bin/sh
-# Runs anytype-caldav with what the anytype service hands over through the
-# shared volume. Without arguments it brings the space's schema up to date
+# The entrypoint of the server in the compose kit, shipped in the image as
+# anytype-caldav-compose. Runs anytype-caldav with what the anytype service
+# hands over through the shared volume. Without arguments it brings the space's schema up to date
 # (init adds only what is missing) and serves; with arguments it runs that
 # command instead, as in `docker compose run --rm server users`.
 #
@@ -39,12 +40,15 @@ if [ -n "${ACCOUNTS_SECRET:-}" ]; then
     export ANYTYPE_CALDAV__PROPERTIES__ASSIGNEE="${ANYTYPE_CALDAV__PROPERTIES__ASSIGNEE:-key:assignee}"
 fi
 
-# Until the owner lets the bot in, the space cannot be read; init is tried
+# Until the bot is in the space and has loaded it, init fails; it is tried
 # again rather than the container restarted.
 if [ "$#" -eq 0 ]; then
     until anytype-caldav init --apply; do
-        echo "init failed (see above). If the invite needs approval, the owner" \
-            "lets the bot into the space in Anytype. Trying again in 30 s."
+        echo "init failed (see above); trying again in 30 s. This passes by itself" \
+            "while the owner has yet to let the bot in or the space is still" \
+            "loading. If it does not, check that the host reaches the sync network" \
+            "(docker compose logs anytype), fix what the error names in .env and" \
+            "run docker compose up -d."
         sleep 30
     done
 fi

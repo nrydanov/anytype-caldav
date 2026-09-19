@@ -1,0 +1,7 @@
+# The compose kit's scripts and configs run in Linux containers, which a
+# checkout with CRLF line endings would break.
+*.sh text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+Caddyfile text eol=lf
+*.example text eol=lf
