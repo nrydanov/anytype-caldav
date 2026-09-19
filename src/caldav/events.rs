@@ -345,7 +345,7 @@ async fn deadline_owner(
         }
         Err(err) => return Err(Box::new(source_failure(&err))),
     };
-    let current_etag = ev::deadline_entry(&current)
+    let current_etag = ev::deadline_entry(&current, service.config.language)
         .and_then(|entry| service.resource(&entry, &[]))
         .map(|resource| resource.etag);
     if let Some(expected) = &if_match
@@ -397,7 +397,8 @@ async fn put_deadline(
     service.invalidate();
     let mut builder = Response::builder().status(StatusCode::NO_CONTENT);
     if let Ok(Some(event)) = service.source.get(&current.object_id).await
-        && let Some(resource) = ev::deadline_entry(&event).and_then(|e| service.resource(&e, &[]))
+        && let Some(resource) = ev::deadline_entry(&event, service.config.language)
+            .and_then(|e| service.resource(&e, &[]))
     {
         builder = builder.header(header::ETAG, resource.etag);
     }

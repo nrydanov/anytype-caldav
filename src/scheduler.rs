@@ -9,13 +9,14 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
 use crate::{
     config::{CalendarConfig, RemindersConfig},
     events::{Event, EventStore},
+    locale::Language,
     model::{CalendarValue, Task},
     push::{Notification, PushService},
     reminder::{ReminderAnchor, ReminderMoment, reminders_for},
@@ -145,7 +146,7 @@ impl PushScheduler {
         let deadlines: Vec<Event> = events
             .iter()
             .filter_map(|event| {
-                crate::events::deadline_entry(event).map(|entry| Event {
+                crate::events::deadline_entry(event, self.calendar.language).map(|entry| Event {
                     name: event.name.clone(),
                     ..entry
                 })
@@ -415,7 +416,7 @@ fn notification_for(
 ) -> Notification {
     Notification {
         title: task.name.clone(),
-        body: describe(moment, now, calendar.timezone),
+        body: describe(moment, now, calendar.timezone, calendar.language),
         url: task.object_url.clone(),
         tag: Some(task.object_id.clone()),
         day: Some(match moment.value {
@@ -431,106 +432,33 @@ fn notification_for(
 /// the reminder. A push held back by the late window can arrive after the
 /// deadline it warns about, and "through 15 minutes" would then be a lie; the
 /// only honest source is the distance from the moment of sending.
-fn describe(moment: ReminderMoment, now: DateTime<Utc>, tz: Tz) -> String {
+fn describe(moment: ReminderMoment, now: DateTime<Utc>, tz: Tz, language: Language) -> String {
     let today = now.with_timezone(&tz).date_naive();
     match moment.value {
         CalendarValue::AllDay(day) => {
             format!(
                 "{} {}",
-                label(moment.anchor, day < today),
-                day_phrase(day, today)
+                language.anchor(moment.anchor, day < today),
+                language.day(day, today)
             )
         }
         CalendarValue::Instant(at) => {
             let local = at.with_timezone(&tz);
             let day = local.date_naive();
-            let time = local.format("%H:%M");
+            let time = language.at(local.format("%H:%M"));
             let when = if at > now && day == today {
                 // Only today needs "in N minutes": for any other day the day
                 // itself already answers "why now".
-                format!("{} — сегодня в {time}", in_words(at - now))
+                format!(
+                    "{} — {} {time}",
+                    language.in_time(at - now),
+                    language.day(day, today)
+                )
             } else {
-                format!("{} в {time}", day_phrase(day, today))
+                format!("{} {time}", language.day(day, today))
             };
-            format!("{} {when}", label(moment.anchor, at <= now))
+            format!("{} {when}", language.anchor(moment.anchor, at <= now))
         }
-    }
-}
-
-fn label(anchor: ReminderAnchor, past: bool) -> &'static str {
-    match (anchor, past) {
-        (ReminderAnchor::Deadline, false) => "Дедлайн",
-        (ReminderAnchor::Deadline, true) => "Дедлайн был",
-        (ReminderAnchor::Scheduled, false) => "По плану",
-        (ReminderAnchor::Scheduled, true) => "По плану было",
-        (ReminderAnchor::Start, false) => "Начало",
-        (ReminderAnchor::Start, true) => "Началось",
-    }
-}
-
-fn day_phrase(day: NaiveDate, today: NaiveDate) -> String {
-    const MONTHS: [&str; 12] = [
-        "января",
-        "февраля",
-        "марта",
-        "апреля",
-        "мая",
-        "июня",
-        "июля",
-        "августа",
-        "сентября",
-        "октября",
-        "ноября",
-        "декабря",
-    ];
-    match (day - today).num_days() {
-        0 => "сегодня".to_string(),
-        1 => "завтра".to_string(),
-        -1 => "вчера".to_string(),
-        _ => format!("{} {}", day.day(), MONTHS[day.month0() as usize]),
-    }
-}
-
-/// Both units round to the nearest, from the raw seconds.
-///
-/// Truncating reads as an off-by-one to anyone who chose the lead time: the
-/// scheduler wakes on a 30-second tick, so a reminder set an hour ahead is
-/// sent at 59m40s and "через 59 минут" is what the phone shows. Deriving the
-/// hours from the minutes instead would round twice, turning 1h29m40s into
-/// "через 2 часа" by way of 90 minutes.
-fn in_words(delta: chrono::Duration) -> String {
-    let seconds = delta.num_seconds();
-    let minutes = (seconds + 30) / 60;
-    if minutes < 1 {
-        return "меньше чем через минуту".to_string();
-    }
-    if minutes < 60 {
-        return match plural(minutes) {
-            Plural::One => "через минуту".to_string(),
-            Plural::Few => format!("через {minutes} минуты"),
-            Plural::Many => format!("через {minutes} минут"),
-        };
-    }
-    let hours = (seconds + 1800) / 3600;
-    match plural(hours) {
-        Plural::One => "через час".to_string(),
-        Plural::Few => format!("через {hours} часа"),
-        Plural::Many => format!("через {hours} часов"),
-    }
-}
-
-enum Plural {
-    One,
-    Few,
-    Many,
-}
-
-/// Russian counts agree in three forms, chosen by the last digits.
-fn plural(count: i64) -> Plural {
-    match (count % 10, count % 100) {
-        (1, tens) if tens != 11 => Plural::One,
-        (2..=4, tens) if !(12..=14).contains(&tens) => Plural::Few,
-        _ => Plural::Many,
     }
 }
 
@@ -549,6 +477,7 @@ mod tests {
     use chrono_tz::Europe::Saratov;
 
     use super::{NotificationSink, PushScheduler, describe};
+    use crate::locale::Language;
     use crate::{
         config::{CalendarConfig, RemindersConfig},
         model::{AnytypeDate, Task, TaskBatch},
@@ -649,6 +578,7 @@ mod tests {
             timezone: Saratov,
             name: "Anytype Tasks".into(),
             date_only_timezone: Saratov,
+            language: crate::locale::Language::Ru,
         }
     }
 
@@ -1073,7 +1003,8 @@ mod tests {
             describe(
                 moment,
                 Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap(),
-                Saratov
+                Saratov,
+                Language::Ru
             ),
             "Дедлайн через 2 часа — сегодня в 18:00"
         );
@@ -1082,7 +1013,8 @@ mod tests {
             describe(
                 moment,
                 Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap(),
-                Saratov
+                Saratov,
+                Language::Ru
             ),
             "Дедлайн завтра в 18:00"
         );
@@ -1091,7 +1023,8 @@ mod tests {
             describe(
                 moment,
                 Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap(),
-                Saratov
+                Saratov,
+                Language::Ru
             ),
             "Дедлайн 3 сентября в 18:00"
         );
@@ -1100,10 +1033,60 @@ mod tests {
             describe(
                 moment,
                 Utc.with_ymd_and_hms(2026, 9, 3, 15, 0, 0).unwrap(),
-                Saratov
+                Saratov,
+                Language::Ru
             ),
             "Дедлайн был сегодня в 18:00"
         );
+    }
+
+    /// The same moments as above, worded in English.
+    #[test]
+    fn an_english_body_says_why_now_as_well_as_when() {
+        let mut timed = task("timed", "Report");
+        timed.deadline = AnytypeDate::parse("2026-09-03T18:00:00+04:00");
+        let moment = reminders_for(&timed, &calendar(), &reminders())[0];
+        let at = |month: u32, day: u32, hour: u32| {
+            describe(
+                moment,
+                Utc.with_ymd_and_hms(2026, month, day, hour, 0, 0).unwrap(),
+                Saratov,
+                Language::En,
+            )
+        };
+
+        assert_eq!(at(9, 3, 12), "Deadline in 2 hours — today at 18:00");
+        assert_eq!(at(9, 2, 12), "Deadline tomorrow at 18:00");
+        assert_eq!(at(8, 30, 12), "Deadline on 3 September at 18:00");
+        assert_eq!(at(9, 3, 15), "Deadline was today at 18:00");
+    }
+
+    /// English has one form for every count but one; 21 is not singular.
+    #[test]
+    fn english_counts_are_singular_only_for_one() {
+        let mut task = task("t", "T");
+        // 19:00 UTC.
+        task.deadline = AnytypeDate::parse("2026-08-30T23:00:00+04:00");
+        let moment = reminders_for(&task, &calendar(), &reminders())[0];
+        let at = |h: u32, m: u32, s: u32| {
+            describe(
+                moment,
+                Utc.with_ymd_and_hms(2026, 8, 30, h, m, s).unwrap(),
+                Saratov,
+                Language::En,
+            )
+        };
+
+        assert!(
+            at(18, 59, 50).contains("in less than a minute"),
+            "{}",
+            at(18, 59, 50)
+        );
+        assert!(at(18, 59, 0).contains("in a minute"), "{}", at(18, 59, 0));
+        assert!(at(18, 39, 0).contains("in 21 minutes"), "{}", at(18, 39, 0));
+        assert!(at(18, 0, 0).contains("in an hour"), "{}", at(18, 0, 0));
+        assert!(at(16, 0, 0).contains("in 3 hours"), "{}", at(16, 0, 0));
+        assert!(at(4, 0, 0).contains("in 15 hours"), "{}", at(4, 0, 0));
     }
 
     #[test]
@@ -1116,7 +1099,8 @@ mod tests {
             describe(
                 moment,
                 Utc.with_ymd_and_hms(2026, 8, 30, 5, 0, 0).unwrap(),
-                Saratov
+                Saratov,
+                Language::Ru
             ),
             "Дедлайн сегодня"
         );
@@ -1124,7 +1108,8 @@ mod tests {
             describe(
                 moment,
                 Utc.with_ymd_and_hms(2026, 8, 29, 5, 0, 0).unwrap(),
-                Saratov
+                Saratov,
+                Language::Ru
             ),
             "Дедлайн завтра"
         );
@@ -1132,7 +1117,8 @@ mod tests {
             describe(
                 moment,
                 Utc.with_ymd_and_hms(2026, 8, 31, 5, 0, 0).unwrap(),
-                Saratov
+                Saratov,
+                Language::Ru
             ),
             "Дедлайн был вчера"
         );
@@ -1150,7 +1136,8 @@ mod tests {
             describe(
                 moment,
                 Utc.with_ymd_and_hms(2026, 8, 30, 10, 58, 0).unwrap(),
-                Saratov
+                Saratov,
+                Language::Ru
             ),
             "По плану через 15 минут — сегодня в 15:13"
         );
@@ -1158,7 +1145,8 @@ mod tests {
             describe(
                 moment,
                 Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap(),
-                Saratov
+                Saratov,
+                Language::Ru
             ),
             "По плану было сегодня в 15:13"
         );
@@ -1175,6 +1163,7 @@ mod tests {
                 moment,
                 Utc.with_ymd_and_hms(2026, 8, 30, h, m, 0).unwrap(),
                 Saratov,
+                Language::Ru,
             )
         };
 
@@ -1201,6 +1190,7 @@ mod tests {
                 moment,
                 Utc.with_ymd_and_hms(2026, 8, 30, h, m, s).unwrap(),
                 Saratov,
+                Language::Ru,
             )
         };
 

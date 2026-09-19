@@ -88,12 +88,18 @@ pub struct CalendarNames {
     pub events: String,
 }
 
-impl Default for CalendarNames {
-    fn default() -> Self {
+impl CalendarNames {
+    pub fn for_language(language: crate::locale::Language) -> Self {
         Self {
             tasks: "Anytype".to_string(),
-            events: "События".to_string(),
+            events: language.events().to_string(),
         }
+    }
+}
+
+impl Default for CalendarNames {
+    fn default() -> Self {
+        Self::for_language(crate::locale::Language::default())
     }
 }
 

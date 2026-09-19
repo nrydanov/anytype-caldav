@@ -74,6 +74,10 @@ describes every option. Secrets come from the environment:
 | `CALDAV_PASSWORD` | `[caldav]`, the shared login |
 | `ACCOUNTS_SECRET` | accounts per person (`properties.assignee` must be set) |
 
+Notifications, the default calendar names and the deadline line in a task's
+description are in English or Russian, set by `calendar.language` (`"en"` by
+default, or `"ru"`).
+
 Properties are selected as `key:<stable-key>` or `id:<opaque-id>`, never by
 display name, so renaming a property in Anytype breaks nothing. If a selector
 matches nothing, the refresh fails and every property the type offers is logged:

@@ -151,6 +151,11 @@ impl FeedService {
     }
 
     /// Serves the feed, refreshing if the cached body has aged out.
+    /// The language of the calendars this feed names.
+    pub fn language(&self) -> crate::locale::Language {
+        self.renderer.language()
+    }
+
     pub async fn get(&self) -> Outcome {
         if let Some(outcome) = self.cached_within_interval() {
             debug!("serving cached feed within min_refresh_interval");
@@ -292,7 +297,7 @@ impl FeedService {
             .iter()
             .map(|task| (resource_name(task), self.resource_for(task)))
             .collect();
-        let collections = partition(&batch, &objects);
+        let collections = partition(&batch, &objects, self.renderer.language());
         let names_by_uid = batch
             .tasks
             .iter()
@@ -384,6 +389,7 @@ fn keep_distinct_uids(tasks: &mut Vec<crate::model::Task>) {
 fn partition(
     batch: &crate::model::TaskBatch,
     objects: &BTreeMap<String, Resource>,
+    language: crate::locale::Language,
 ) -> BTreeMap<String, Collection> {
     if batch.members.is_empty() {
         return BTreeMap::new();
@@ -406,7 +412,7 @@ fn partition(
         .collect();
     collections.insert(
         UNASSIGNED.to_string(),
-        empty("Без исполнителя".to_string(), None),
+        empty(language.unassigned().to_string(), None),
     );
 
     for task in &batch.tasks {

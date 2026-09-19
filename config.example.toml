@@ -40,6 +40,9 @@ name = "Anytype Tasks"
 # Defaults to `timezone`. Set to "UTC" if Anytype turns out to persist
 # date-only values as midnight UTC.
 date_only_timezone = "Europe/Saratov"
+# Language of what a person reads: notifications, calendar names, the deadline
+# line in a description. "en" (default) or "ru".
+# language = "en"
 
 [server]
 listen = "127.0.0.1:8080"

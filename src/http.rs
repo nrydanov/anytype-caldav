@@ -264,7 +264,7 @@ async fn send_test(state: &AppState, assignees: Option<&[String]>) -> Response {
     };
     let notification = Notification {
         title: "Anytype".to_string(),
-        body: "Тестовое уведомление от экспортёра".to_string(),
+        body: state.feed.language().test_notification().to_string(),
         url: None,
         tag: Some("test".to_string()),
         day: None,

@@ -408,14 +408,18 @@ impl VTodoRenderer {
     }
 
     fn describe(&self, deadline: CalendarValue) -> String {
+        let language = self.config.language;
         match deadline {
-            CalendarValue::AllDay(day) => format!("Дедлайн: {}", day.format("%d.%m.%Y")),
-            CalendarValue::Instant(at) => format!(
-                "Дедлайн: {}",
-                at.with_timezone(&self.config.timezone)
-                    .format("%d.%m.%Y %H:%M")
-            ),
+            CalendarValue::AllDay(day) => language.deadline_line(day, None::<&str>),
+            CalendarValue::Instant(at) => {
+                let local = at.with_timezone(&self.config.timezone);
+                language.deadline_line(local.date_naive(), Some(local.format("%H:%M")))
+            }
         }
+    }
+
+    pub fn language(&self) -> crate::locale::Language {
+        self.config.language
     }
 
     fn to_calendar_date(&self, value: CalendarValue) -> DatePerhapsTime {
@@ -439,6 +443,7 @@ mod tests {
             timezone: Saratov,
             name: "Anytype Tasks".into(),
             date_only_timezone: Saratov,
+            language: crate::locale::Language::Ru,
         }
     }
 

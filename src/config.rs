@@ -190,6 +190,8 @@ struct RawCalendar {
     name: String,
     /// Defaults to `timezone` when absent.
     date_only_timezone: Option<String>,
+    #[serde(default)]
+    language: crate::locale::Language,
 }
 
 #[derive(Debug, Deserialize)]
@@ -390,6 +392,8 @@ pub struct CalendarConfig {
     /// date-only. Separate from `timezone` because it is a property of how
     /// Anytype persists dates, not of how the calendar displays them.
     pub date_only_timezone: Tz,
+    /// The language of everything a person reads.
+    pub language: crate::locale::Language,
 }
 
 #[derive(Debug, Clone)]
@@ -659,7 +663,7 @@ impl Config {
             ))),
             Some(value) => Ok(value.trim().to_string()),
         };
-        let defaults = crate::caldav::CalendarNames::default();
+        let defaults = crate::caldav::CalendarNames::for_language(raw.calendar.language);
         let calendar_names = crate::caldav::CalendarNames {
             tasks: name("tasks_name", &raw.caldav.tasks_name, defaults.tasks)?,
             events: name("events_name", &raw.caldav.events_name, defaults.events)?,
@@ -694,6 +698,7 @@ impl Config {
                 timezone,
                 name: raw.calendar.name.trim().to_string(),
                 date_only_timezone,
+                language: raw.calendar.language,
             },
             server: ServerConfig {
                 listen,
@@ -1016,11 +1021,24 @@ allowed_origins = ["https://calino.io"]
     }
 
     #[test]
-    fn calendar_names_default_to_the_old_ones_and_are_never_empty() {
+    fn calendar_names_follow_the_language_and_are_never_empty() {
         let caldav = "[caldav]\nenabled = true\nusername = \"me\"";
         let config = load(&format!("{}\n{caldav}", base())).expect("valid");
+        assert_eq!(config.calendar.language, crate::locale::Language::En);
         assert_eq!(config.caldav.names.tasks, "Anytype");
+        assert_eq!(config.caldav.names.events, "Events");
+        let russian = base().replace(
+            "timezone = \"Europe/Saratov\"",
+            "timezone = \"Europe/Saratov\"\nlanguage = \"ru\"",
+        );
+        let config = load(&format!("{russian}\n{caldav}")).expect("valid");
+        assert_eq!(config.calendar.language, crate::locale::Language::Ru);
         assert_eq!(config.caldav.names.events, "События");
+        let unknown = base().replace(
+            "timezone = \"Europe/Saratov\"",
+            "timezone = \"Europe/Saratov\"\nlanguage = \"de\"",
+        );
+        assert!(load(&unknown).is_err());
         let config = load(&format!(
             "{}\n{caldav}\ntasks_name = \" Дом \"\nevents_name = \"Команда\"",
             base()

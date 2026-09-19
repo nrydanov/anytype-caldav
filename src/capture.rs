@@ -40,6 +40,7 @@ mod tests {
             timezone: Saratov,
             name: "t".into(),
             date_only_timezone: Saratov,
+            language: crate::locale::Language::Ru,
         }
     }
 

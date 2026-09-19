@@ -61,6 +61,7 @@ fn router() -> Router {
             timezone: Saratov,
             name: "Anytype Tasks".into(),
             date_only_timezone: Saratov,
+            language: anytype_caldav::locale::Language::Ru,
         },
         RemindersConfig {
             enabled: false,
@@ -434,6 +435,7 @@ mod settings {
                 timezone: Saratov,
                 name: "t".into(),
                 date_only_timezone: Saratov,
+                language: anytype_caldav::locale::Language::Ru,
             },
             RemindersConfig {
                 enabled: false,
@@ -631,6 +633,7 @@ async fn push_outside_the_secret_prefix_needs_the_caldav_password() {
                 timezone: Saratov,
                 name: "t".into(),
                 date_only_timezone: Saratov,
+                language: anytype_caldav::locale::Language::Ru,
             },
             RemindersConfig {
                 enabled: false,
@@ -848,6 +851,7 @@ mod writes {
                 timezone: Saratov,
                 name: "Anytype Tasks".into(),
                 date_only_timezone: Saratov,
+                language: anytype_caldav::locale::Language::Ru,
             },
             RemindersConfig {
                 enabled: false,
@@ -1255,6 +1259,7 @@ mod writes {
                 timezone: Saratov,
                 name: "Anytype Tasks".into(),
                 date_only_timezone: Saratov,
+                language: anytype_caldav::locale::Language::Ru,
             };
             let renderer = VTodoRenderer::new(
                 config.clone(),
@@ -2255,6 +2260,7 @@ mod grouped {
                 timezone: Saratov,
                 name: "Anytype Tasks".into(),
                 date_only_timezone: Saratov,
+                language: anytype_caldav::locale::Language::Ru,
             },
             RemindersConfig {
                 enabled: false,

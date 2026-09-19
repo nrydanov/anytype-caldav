@@ -104,6 +104,7 @@ mod tests {
             timezone: Saratov,
             name: "Anytype Tasks".into(),
             date_only_timezone: Saratov,
+            language: crate::locale::Language::Ru,
         }
     }
 

@@ -9,6 +9,7 @@ pub mod events;
 pub mod feed;
 pub mod http;
 pub mod install;
+pub mod locale;
 pub mod model;
 pub mod push;
 pub mod reminder;

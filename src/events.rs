@@ -26,6 +26,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     config::CalendarConfig,
     feed::{Resource, calino_filename, etag_for},
+    locale::Language,
     model::{AnytypeDate, CalendarValue},
     render::{sequence_for, stable_alarm},
     series::{date, text},
@@ -70,13 +71,13 @@ pub const DEADLINE_SUFFIX: &str = "-deadline";
 /// on the deadline, all day when it has no time, reminded with the event's own
 /// leads, counted from the deadline. A series has one deadline for every
 /// occurrence and none of them in particular, so it gets no entry.
-pub fn deadline_entry(event: &Event) -> Option<Event> {
+pub fn deadline_entry(event: &Event, language: Language) -> Option<Event> {
     if event.rrule.is_some() {
         return None;
     }
     Some(Event {
         object_id: event.object_id.clone(),
-        name: format!("{} (дедлайн)", event.name),
+        name: language.deadline_entry(&event.name),
         start: Some(event.deadline.clone()?),
         end: None,
         location: None,
@@ -1093,7 +1094,7 @@ impl EventService {
                 }
                 None => undated += 1,
             }
-            if let Some(entry) = deadline_entry(event)
+            if let Some(entry) = deadline_entry(event, self.config.language)
                 && let Some(resource) = self.resource(&entry, &[])
             {
                 objects.insert(entry.resource_name(), resource);
@@ -1282,6 +1283,7 @@ mod tests {
             timezone: Saratov,
             name: "t".into(),
             date_only_timezone: Saratov,
+            language: crate::locale::Language::Ru,
         }
     }
 

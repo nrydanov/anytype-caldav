@@ -131,6 +131,7 @@ fn build_at(
             timezone: Saratov,
             name: "Anytype Tasks".into(),
             date_only_timezone: Saratov,
+            language: anytype_caldav::locale::Language::Ru,
         },
         RemindersConfig {
             enabled: true,
