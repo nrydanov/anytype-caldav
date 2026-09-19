@@ -49,7 +49,7 @@ the server's image is pulled from `ghcr.io/nrydanov/anytype-caldav`.
 
 ```sh
 cd deploy/compose
-cp env.example .env && chmod 600 .env   # DOMAIN, ANYTYPE_INVITE_LINK, CALDAV_PASSWORD, timezone
+cp env.example .env && chmod 600 .env   # domain, invite link, time zone
 docker compose up -d
 ```
 

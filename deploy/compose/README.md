@@ -10,10 +10,12 @@ obtains the TLS certificate. Nothing but Docker is needed on the host.
    cp env.example .env && chmod 600 .env
    ```
 
-   `DOMAIN`, `ANYTYPE_INVITE_LINK`, `CALDAV_PASSWORD` and
-   `ANYTYPE_CALDAV__CALENDAR__TIMEZONE` are required. Every
-   other setting of `config.example.toml` can be added as
-   `ANYTYPE_CALDAV__<SECTION>__<KEY>`.
+   `ANYTYPE_CALDAV_DOMAIN`, `ANYTYPE_INVITE_LINK` and
+   `ANYTYPE_CALDAV__CALENDAR__TIMEZONE` are required. Every other setting of
+   `config.example.toml` can be added as `ANYTYPE_CALDAV__<SECTION>__<KEY>`.
+   The variables of the kit itself are prefixed too, since Compose prefers a
+   variable of the shell it runs in over `.env`, and a shell may well have a
+   `DOMAIN` or a `LANGUAGE` of its own.
 
    If the space lives on a self-hosted any-sync network, put the network's
    `client.yml` into [`network/`](network/) before the first start.
@@ -29,14 +31,16 @@ obtains the TLS certificate. Nothing but Docker is needed on the host.
    its account key: keep it. The bot then asks to join the space by the invite
    link, trying again every minute until the request goes through, and hands
    the space's id to the server, together with the API key and the session
-   token `init` uses to set type headers over gRPC. If the invite needs approval, the owner
-   approves the bot in Anytype; until then `init` fails and the server is
+   token `init` uses to set type headers over gRPC. If the invite needs
+   approval, the owner approves the bot in Anytype; until then `init` fails and the server is
    restarted, so it comes up by itself once the bot is in.
 
-4. Connect a CalDAV client to `https://DOMAIN/dav/` with the username
-   `anytype` and `CALDAV_PASSWORD`. With `ACCOUNTS_SECRET` set, everyone's own
-   login is printed by
-   `docker compose exec server anytype-caldav users`.
+4. Connect a CalDAV client to `https://<ANYTYPE_CALDAV_DOMAIN>/dav/` with the
+   username `anytype` and `CALDAV_PASSWORD`. Without one in `.env`, the server
+   made it on the first start and printed it in its log;
+   `docker compose exec server cat /data/caldav-password` shows it again. With
+   `ACCOUNTS_SECRET` set, everyone's own login is printed by
+   `docker compose run --rm server users`.
 
 Every step can run again without harm: after changing `.env`, run
 `docker compose up -d` again. The bot is created only once and kept in a
@@ -61,7 +65,7 @@ services:
 ```
 
 Then start only the two services, `docker compose up -d anytype server`
-(`DOMAIN` is still read, so leave it set), and route the paths of
+(`ANYTYPE_CALDAV_DOMAIN` is still read, so leave it set), and route the paths of
 [`Caddyfile`](Caddyfile) to `127.0.0.1:8080` in your proxy: `/dav`, `/dav/*`,
 `/push/*` and `/healthz`, plus a redirect of
 `/.well-known/caldav` to `/dav/`.

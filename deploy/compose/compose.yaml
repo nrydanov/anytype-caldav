@@ -36,23 +36,10 @@ services:
     build: ../..
     restart: unless-stopped
     depends_on: [anytype]
-    # Waits for the API key, the session token and the id of the joined space
-    # (unless .env names the space), brings the space's schema up to date (init
-    # adds only what is missing) and starts. The iCalendar feed gets a random
-    # path, made once and kept in the state volume; Caddy does not route it.
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - until [ -s /shared/api-key ] && [ -s /shared/session-token ]; do sleep 2; done;
-        if [ -z "$${ANYTYPE_CALDAV__ANYTYPE__SPACE_ID:-}" ]; then
-          until [ -s /shared/space-id ]; do sleep 2; done;
-          export ANYTYPE_CALDAV__ANYTYPE__SPACE_ID="$$(cat /shared/space-id)";
-        fi;
-        if [ -z "$${ANYTYPE_CALDAV__SERVER__FEED_PATH:-}" ]; then
-          [ -s /data/feed-path ] ||
-            echo "/f/$$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')/todos.ics" > /data/feed-path;
-          export ANYTYPE_CALDAV__SERVER__FEED_PATH="$$(cat /data/feed-path)";
-        fi;
-        anytype-caldav init --apply && exec anytype-caldav
+    # Waits for what the anytype service hands over, prepares the space and
+    # serves (see server.sh).
+    entrypoint: ["/bin/sh", "/setup/server.sh"]
+    command: []
     env_file: .env
     environment:
       ANYTYPE_API_KEY_FILE: /shared/api-key
@@ -74,6 +61,7 @@ services:
       ANYTYPE_CALDAV__PUSH__PRIVATE_KEY_FILE: /data/vapid.pem
       ANYTYPE_CALDAV__PUSH__STATE_FILE: /data/state.sqlite3
     volumes:
+      - ./server.sh:/setup/server.sh:ro
       - keys:/shared:ro
       - state:/data
 
@@ -85,7 +73,7 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+      DOMAIN: ${ANYTYPE_CALDAV_DOMAIN:?set ANYTYPE_CALDAV_DOMAIN in .env}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy:/data
