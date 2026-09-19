@@ -1,0 +1,32 @@
+# The server and Calino behind Caddy, on one origin, so no CORS is needed.
+# Headless Anytype runs on the host (`anytype serve`); the server reaches it as
+# host.docker.internal, so set anytype.url in config.toml to
+# http://host.docker.internal:31012 (the port `anytype serve` listens on).
+services:
+  server:
+    image: ghcr.io/${OWNER:?set OWNER in .env}/anytype-caldav:${VERSION:-latest}
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config.toml:/config/config.toml:ro
+      - ./vapid_private.pem:/config/vapid_private.pem:ro
+      - state:/data
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./calino:/srv/calino:ro
+      - caddy:/data
+
+volumes:
+  state:
+  caddy:

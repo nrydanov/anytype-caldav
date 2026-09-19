@@ -1,0 +1,6 @@
+target
+config.toml
+.git
+deploy
+docs
+scripts

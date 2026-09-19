@@ -1,0 +1,24 @@
+# A user unit: ~/.config/systemd/user/anytype-caldav.service
+# Secrets (ANYTYPE_API_KEY, CALDAV_PASSWORD, ACCOUNTS_SECRET) go in the env
+# file, mode 0600. For a second space, copy the unit under another name with
+# its own config, env file and port.
+[Unit]
+Description=anytype-caldav
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/anytype-caldav.env
+Environment=RUST_LOG=info
+ExecStart=%h/.local/bin/anytype-caldav --config %h/.config/anytype-caldav.toml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/anytype-caldav
+MemoryMax=128M
+
+[Install]
+WantedBy=default.target
