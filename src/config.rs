@@ -246,7 +246,8 @@ impl Default for RawPush {
 #[derive(Debug, Deserialize)]
 struct RawAnytype {
     url: String,
-    space_id: String,
+    #[serde(default)]
+    space_id: Option<String>,
     #[serde(default = "default_type_key")]
     type_key: String,
     #[serde(default = "default_max_objects")]
@@ -484,6 +485,9 @@ pub struct RemindersConfig {
 #[derive(Debug, Clone)]
 pub struct AnytypeConfig {
     pub url: String,
+    /// Empty when the configuration names no space: the service then serves
+    /// the only one the account is a member of, and fills this in at startup
+    /// (`anytype_source::only_space`) before anything reads it.
     pub space_id: String,
     pub type_key: String,
     pub max_objects: usize,
@@ -598,16 +602,17 @@ impl Config {
                 "anytype.url must start with http:// or https://, got \"{url}\""
             )));
         }
-        let space_id = raw.anytype.space_id.trim().to_string();
-        if space_id.is_empty() {
-            return Err(ConfigError::Invalid(
-                "anytype.space_id must not be empty".into(),
-            ));
-        }
+        let space_id = raw
+            .anytype
+            .space_id
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         // The SDK rejects a malformed id with a redacted validation error on the
         // first refresh, which reads as "anytype is broken". Catching the shape
         // here turns that into an actionable startup message.
-        if !anytype::validation::looks_like_object_id(&space_id) {
+        if !space_id.is_empty() && !anytype::validation::looks_like_object_id(&space_id) {
             return Err(ConfigError::Invalid(format!(
                 "anytype.space_id = \"{space_id}\" is not an Anytype id; \
                  expected a 59-character id beginning with \"bafyrei\", \
@@ -1044,6 +1049,17 @@ allowed_origins = ["https://calino.io"]
             PropertySelector::Key("due_date".into())
         );
         assert_eq!(config.calendar.timezone, chrono_tz::Europe::Saratov);
+    }
+
+    #[test]
+    fn the_space_may_be_left_out() {
+        let config = Config::from_toml_and_env(
+            "",
+            "the environment",
+            env(&[("ANYTYPE_CALDAV__ANYTYPE__URL", "http://anytype:31012")]),
+        )
+        .expect("valid");
+        assert_eq!(config.anytype.space_id, "");
     }
 
     #[test]

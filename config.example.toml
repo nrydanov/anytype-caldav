@@ -12,6 +12,7 @@
 [anytype]
 url = "http://127.0.0.1:31009"
 # A 59-character id starting with "bafyrei", optionally with a ".<hash>" suffix.
+# Optional: left out, the only space the account is a member of is served.
 space_id = "bafyrei...REPLACE..."
 # Type whose objects become VTODOs. Override if your space uses a custom
 # or localized task type.

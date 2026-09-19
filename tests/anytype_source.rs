@@ -682,3 +682,28 @@ async fn zero_objects_is_a_successful_empty_batch() {
     let batch = source.list_tasks().await.expect("lists tasks");
     assert!(batch.tasks.is_empty());
 }
+
+/// With no space in the configuration, the account's only space is served;
+/// none or several stops the service with what to do about it.
+#[test]
+fn only_the_single_space_of_the_account_is_picked() {
+    use anytype_caldav::anytype_source::pick_only_space;
+    let one = vec![(SPACE.to_string(), "Tasks".to_string())];
+    assert_eq!(
+        pick_only_space(one).unwrap(),
+        (SPACE.to_string(), "Tasks".to_string())
+    );
+
+    let none = pick_only_space(Vec::new()).unwrap_err();
+    assert!(none.contains("no space"), "{none}");
+
+    let two = pick_only_space(vec![
+        ("id-a".to_string(), "Home".to_string()),
+        ("id-b".to_string(), "Team".to_string()),
+    ])
+    .unwrap_err();
+    assert!(
+        two.contains("2 spaces") && two.contains("Home (id-a)") && two.contains("Team (id-b)"),
+        "{two}"
+    );
+}

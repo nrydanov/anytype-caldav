@@ -6,6 +6,7 @@ use anytype::{
     client::{AnytypeClient, ClientConfig},
     objects::Object,
     properties::{PropertyValue, PropertyWithValue, SetProperty},
+    spaces::SpaceModel,
 };
 use async_trait::async_trait;
 use chrono::Utc;
@@ -62,6 +63,49 @@ pub fn build_client(config: &AnytypeConfig) -> Result<AnytypeClient, SourceError
         ..Default::default()
     };
     AnytypeClient::with_config(client_config).map_err(|err| SourceError::Transport(err.to_string()))
+}
+
+/// The space to serve when the configuration names none: the only one the
+/// account is a member of, as its id and name. Chats are listed as spaces too
+/// and are left out, since there are no tasks in them to serve.
+pub async fn only_space(client: &AnytypeClient) -> Result<(String, String), String> {
+    let spaces = client
+        .spaces()
+        .list()
+        .await
+        .map_err(|err| format!("cannot list the account's spaces: {err}"))?
+        .collect_all()
+        .await
+        .map_err(|err| format!("cannot list the account's spaces: {err}"))?;
+    pick_only_space(
+        spaces
+            .into_iter()
+            .filter(|space| matches!(space.object, SpaceModel::Space))
+            .map(|space| (space.id, space.name))
+            .collect(),
+    )
+}
+
+/// Exactly one space is the answer; none or several is an error that says
+/// what to do, listing the spaces there are.
+pub fn pick_only_space(spaces: Vec<(String, String)>) -> Result<(String, String), String> {
+    match spaces.len() {
+        1 => Ok(spaces.into_iter().next().expect("one space")),
+        0 => Err(
+            "anytype.space_id is not set and the account is a member of no space: \
+                  let it into the space to serve, or set the id"
+                .to_string(),
+        ),
+        count => Err(format!(
+            "anytype.space_id is not set and the account is a member of {count} spaces; \
+             set it to one of: {}",
+            spaces
+                .iter()
+                .map(|(id, name)| format!("{name} ({id})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 impl AnytypeTaskSource {
