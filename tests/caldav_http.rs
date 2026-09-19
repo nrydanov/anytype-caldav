@@ -33,6 +33,8 @@ impl TaskSource for Fixed {
         Ok(TaskBatch {
             tasks: self.0.clone(),
             warnings: Vec::new(),
+            members: Default::default(),
+            account_holders: Default::default(),
         })
     }
 }
@@ -46,6 +48,7 @@ fn task(id: &str, name: &str) -> Task {
         done: false,
         reminder_leads: Vec::new(),
         tags: vec!["Финансы".into()],
+        assignees: Vec::new(),
         ical_uid: None,
         object_url: None,
         last_modified: Some(Utc.with_ymd_and_hms(2026, 9, 15, 12, 0, 0).unwrap()),
@@ -83,6 +86,8 @@ fn router() -> Router {
             caldav: Some(Arc::new(Credentials::new("me", "pw"))),
             writer: None,
             events: None,
+            events_in_tasks: false,
+            calendar_names: Default::default(),
             documents: None,
         },
         "/f/secret/todos.ics",
@@ -217,6 +222,39 @@ async fn discovery_leads_from_the_base_to_a_read_only_task_collection() {
         "{body}"
     );
     assert!(!body.contains("<d:write"), "{body}");
+}
+
+/// Thunderbird lists a calendar with a PROPFIND and fetches only the members
+/// whose `getcontenttype` is `text/calendar` (`CalDavRequestHandlers.sys.mjs`,
+/// the etags handler).
+#[tokio::test]
+async fn listed_members_carry_their_content_type() {
+    let router = router();
+    let listing = r#"<?xml version="1.0" encoding="UTF-8"?>
+<D:propfind xmlns:D="DAV:"><D:prop><D:getcontenttype/><D:resourcetype/><D:getetag/></D:prop></D:propfind>"#;
+    let calendar = "/dav/calendars/tasks/";
+    let (status, _, body) = send(&router, "PROPFIND", calendar, Some("1"), listing).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    let members = body.matches("<d:getetag>").count();
+    assert!(members > 0, "{body}");
+    assert_eq!(
+        body.matches("<d:getcontenttype>text/calendar</d:getcontenttype>")
+            .count(),
+        members,
+        "{body}"
+    );
+
+    let member = body
+        .split("<d:href>")
+        .filter_map(|part| part.split("</d:href>").next())
+        .find(|href| href.ends_with(".ics"))
+        .unwrap()
+        .to_string();
+    let (_, _, body) = send(&router, "PROPFIND", &member, Some("0"), listing).await;
+    assert!(
+        body.contains("<d:getcontenttype>text/calendar</d:getcontenttype>"),
+        "{body}"
+    );
 }
 
 /// Thunderbird reads `resourcetype` of every discovery answer before anything
@@ -418,6 +456,8 @@ mod settings {
                 caldav: Some(Arc::new(Credentials::new("me", "pw"))),
                 writer: None,
                 events: None,
+                events_in_tasks: false,
+                calendar_names: Default::default(),
                 documents: Some(store),
             },
             "/f/secret/todos.ics",
@@ -509,6 +549,56 @@ mod settings {
         assert_eq!(body, changed);
     }
 
+    /// What Calino sends on a rename (`CalDAVClient.updateCalendar`).
+    fn rename_body(name: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8" ?>
+<propertyupdate xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <set>
+    <prop>
+      <displayname>{name}</displayname>
+    </prop>
+  </set>
+</propertyupdate>"#
+        )
+    }
+
+    #[tokio::test]
+    async fn a_renamed_calendar_keeps_its_new_name_until_it_is_cleared() {
+        let (router, _directory) = router_with_documents();
+        let tasks = "/dav/calendars/tasks/";
+
+        let (status, _, _) = send(
+            &router,
+            "PROPPATCH",
+            tasks,
+            None,
+            &rename_body("Мои &amp; задачи"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::MULTI_STATUS);
+        let (_, _, home) = send(&router, "PROPFIND", "/dav/calendars/", Some("1"), "").await;
+        assert!(
+            home.contains("<d:displayname>Мои &amp; задачи</d:displayname>"),
+            "{home}"
+        );
+        let (_, _, own) = send(&router, "PROPFIND", tasks, Some("0"), "").await;
+        assert!(own.contains("Мои &amp; задачи"), "{own}");
+
+        let (status, _, _) = send(&router, "PROPPATCH", tasks, None, &rename_body("")).await;
+        assert_eq!(status, StatusCode::MULTI_STATUS);
+        let (_, _, home) = send(&router, "PROPFIND", "/dav/calendars/", Some("1"), "").await;
+        assert!(
+            home.contains("<d:displayname>Anytype</d:displayname>"),
+            "{home}"
+        );
+
+        // Anything but a name is still refused.
+        let color = r#"<propertyupdate xmlns="DAV:"><set><prop><calendar-color xmlns="http://apple.com/ns/ical/">#ff0000</calendar-color></prop></set></propertyupdate>"#;
+        let (status, _, _) = send(&router, "PROPPATCH", tasks, None, color).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
     #[tokio::test]
     async fn without_a_store_the_calendar_is_not_offered() {
         let (status, _, body) = send(&router(), "PROPFIND", "/dav/calendars/", Some("1"), "").await;
@@ -560,6 +650,8 @@ async fn push_outside_the_secret_prefix_needs_the_caldav_password() {
             caldav: Some(Arc::new(Credentials::new("me", "pw"))),
             writer: None,
             events: None,
+            events_in_tasks: false,
+            calendar_names: Default::default(),
             documents: None,
         },
         "/f/secret/todos.ics",
@@ -646,6 +738,8 @@ mod writes {
     #[derive(Default)]
     pub(super) struct Store {
         pub(super) tasks: Mutex<Vec<Task>>,
+        /// The directory of people; empty means no calendars per person.
+        members: Mutex<std::collections::BTreeMap<String, String>>,
         patches: Mutex<Vec<(String, Patch)>>,
         next: Mutex<u32>,
     }
@@ -653,9 +747,13 @@ mod writes {
     #[async_trait]
     impl TaskSource for Store {
         async fn list_tasks(&self) -> Result<TaskBatch, SourceError> {
+            // Everyone in the directory may sign in.
+            let members = self.members.lock().unwrap().clone();
             Ok(TaskBatch {
                 tasks: self.tasks.lock().unwrap().clone(),
                 warnings: Vec::new(),
+                account_holders: members.keys().cloned().collect(),
+                members,
             })
         }
     }
@@ -675,6 +773,9 @@ mod writes {
         }
         if let Some(tags) = &patch.tags {
             task.tags = tags.clone();
+        }
+        if let Some(assignees) = &patch.assignees {
+            task.assignees = assignees.clone();
         }
         // Anytype bumps last-modified on every write, which changes DTSTAMP.
         task.last_modified = Some(Utc::now());
@@ -729,6 +830,19 @@ mod writes {
             .lock()
             .unwrap()
             .push(task("bafyreiaaa", "Pay rent"));
+        serve(store)
+    }
+
+    /// The secret the accounts per person are derived from.
+    const SECRET: &str = "test-secret";
+
+    fn serve(store: Arc<Store>) -> (Router, Arc<Store>) {
+        // Kept for the life of the process: a test router outlives this call.
+        let directory = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+        let documents = Arc::new(
+            anytype_task_exporter::state::StateStore::open(&directory.path().join("state.sqlite3"))
+                .unwrap(),
+        );
         let renderer = VTodoRenderer::new(
             CalendarConfig {
                 timezone: Saratov,
@@ -753,10 +867,12 @@ mod writes {
                 feed,
                 allowed_origins: Arc::new(Vec::new()),
                 push: None,
-                caldav: Some(Arc::new(Credentials::new("me", "pw"))),
+                caldav: Some(Arc::new(Credentials::new("me", "pw").with_accounts(SECRET))),
                 writer: Some(store.clone()),
                 events: None,
-                documents: None,
+                events_in_tasks: false,
+                calendar_names: Default::default(),
+                documents: Some(documents),
             },
             "/f/secret/todos.ics",
         );
@@ -1118,6 +1234,17 @@ mod writes {
         }
 
         fn with_events() -> (Router, Arc<Events>) {
+            with_events_in_tasks(false)
+        }
+
+        fn with_events_in_tasks(merged: bool) -> (Router, Arc<Events>) {
+            with_events_named(merged, Default::default())
+        }
+
+        fn with_events_named(
+            merged: bool,
+            calendar_names: anytype_task_exporter::caldav::CalendarNames,
+        ) -> (Router, Arc<Events>) {
             let (_, tasks) = writable();
             let events = Arc::new(Events::default());
             events.events.lock().unwrap().push(lecture("bafyreieee"));
@@ -1159,6 +1286,8 @@ mod writes {
                     caldav: Some(Arc::new(Credentials::new("me", "pw"))),
                     writer: Some(tasks),
                     events: Some(Arc::new(service)),
+                    events_in_tasks: merged,
+                    calendar_names,
                     documents: None,
                 },
                 "/f/secret/todos.ics",
@@ -1354,6 +1483,146 @@ mod writes {
             assert_eq!(stored.end.unwrap().raw, "2026-10-01T20:00:00Z");
         }
 
+        #[tokio::test]
+        async fn the_configured_names_are_served_to_everyone() {
+            let (router, _) = with_events_named(
+                false,
+                anytype_task_exporter::caldav::CalendarNames {
+                    tasks: "Дом".into(),
+                    events: "События · Команда".into(),
+                },
+            );
+            let (_, _, home) = send(&router, "PROPFIND", "/dav/calendars/", Some("1"), "").await;
+            assert!(
+                home.contains("<d:displayname>Дом</d:displayname>"),
+                "{home}"
+            );
+            assert!(
+                home.contains("<d:displayname>События · Команда</d:displayname>"),
+                "{home}"
+            );
+            let (_, _, own) =
+                send(&router, "PROPFIND", "/dav/calendars/tasks/", Some("0"), "").await;
+            assert!(
+                own.contains("<d:displayname>Дом</d:displayname>"),
+                "{own}"
+            );
+        }
+
+        // ------------------------------------ events inside the task calendar
+
+        #[tokio::test]
+        async fn merged_events_share_the_task_calendar_and_leave_their_own() {
+            let (router, _) = with_events_in_tasks(true);
+            let (_, _, home) = send(&router, "PROPFIND", "/dav/calendars/", Some("1"), "").await;
+            assert!(
+                !home.contains("<d:href>/dav/calendars/events/</d:href>"),
+                "{home}"
+            );
+            assert!(
+                home.contains(r#"<c:comp name="VTODO"/><c:comp name="VEVENT"/>"#),
+                "{home}"
+            );
+
+            let (_, _, listing) =
+                send(&router, "PROPFIND", "/dav/calendars/tasks/", Some("1"), "").await;
+            assert!(
+                listing.contains("/dav/calendars/tasks/bafyreiaaa.ics"),
+                "{listing}"
+            );
+            assert!(
+                listing.contains("/dav/calendars/tasks/bafyreieee.ics"),
+                "{listing}"
+            );
+
+            // A filtered query gets one kind; an unfiltered one both.
+            let (_, _, events) = send(
+                &router,
+                "REPORT",
+                "/dav/calendars/tasks/",
+                Some("1"),
+                EVENT_QUERY,
+            )
+            .await;
+            assert!(events.contains("tasks/bafyreieee.ics"), "{events}");
+            assert!(!events.contains("bafyreiaaa"), "{events}");
+            let (_, _, tasks) = send(
+                &router,
+                "REPORT",
+                "/dav/calendars/tasks/",
+                Some("1"),
+                TODO_QUERY,
+            )
+            .await;
+            assert!(tasks.contains("tasks/bafyreiaaa.ics"), "{tasks}");
+            assert!(!tasks.contains("bafyreieee"), "{tasks}");
+            let all = r#"<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"/></c:filter></c:calendar-query>"#;
+            let (_, _, both) =
+                send(&router, "REPORT", "/dav/calendars/tasks/", Some("1"), all).await;
+            assert!(
+                both.contains("bafyreiaaa") && both.contains("bafyreieee"),
+                "{both}"
+            );
+
+            // The event is read under the task calendar too.
+            let (status, _, ics) = send(
+                &router,
+                "GET",
+                "/dav/calendars/tasks/bafyreieee.ics",
+                None,
+                "",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(ics.contains("BEGIN:VEVENT"), "{ics}");
+        }
+
+        #[tokio::test]
+        async fn a_merged_event_is_created_edited_and_deleted_through_the_task_calendar() {
+            let (router, events) = with_events_in_tasks(true);
+            let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:sync1\r\nSUMMARY:Sync\r\nDTSTART:20261001T100000Z\r\nDTEND:20261001T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+            let path = "/dav/calendars/tasks/sync1.ics";
+            let (status, etag) = put(&router, path, Some(("If-None-Match", "*")), body).await;
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(events.events.lock().unwrap().last().unwrap().name, "Sync");
+
+            let renamed = body.replace("SUMMARY:Sync", "SUMMARY:Sync по ЯП");
+            let (status, _) =
+                put(&router, path, Some(("If-Match", &etag.unwrap())), &renamed).await;
+            assert!(status.is_success(), "{status}");
+            assert_eq!(
+                events.events.lock().unwrap().last().unwrap().name,
+                "Sync по ЯП"
+            );
+
+            let (status, _, _) = send(&router, "DELETE", path, None, "").await;
+            assert!(status.is_success(), "{status}");
+            assert!(
+                events
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e.name != "Sync по ЯП")
+            );
+        }
+
+        #[tokio::test]
+        async fn a_task_put_to_the_merged_calendar_stays_a_task() {
+            let (router, events) = with_events_in_tasks(true);
+            let before = events.events.lock().unwrap().len();
+            let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:t1\r\nSUMMARY:Купить хлеб\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+            let (status, _) = put(
+                &router,
+                "/dav/calendars/tasks/t1.ics",
+                Some(("If-None-Match", "*")),
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(events.events.lock().unwrap().len(), before);
+        }
+
         /// Calino's bodies (0.32–0.33): TZID wall-clock times without
         /// VTIMEZONE, one EXDATE per date, the whole group PUT to the master's
         /// href with If-Match.
@@ -1522,6 +1791,39 @@ mod writes {
         }
 
         #[tokio::test]
+        async fn listed_events_carry_their_content_type() {
+            let (router, _) = with_events();
+            let (_, _, body) = send(
+                &router,
+                "PROPFIND",
+                "/dav/calendars/events/",
+                Some("1"),
+                PROBE,
+            )
+            .await;
+            let members = body.matches("<d:getetag>").count();
+            assert!(members > 0, "{body}");
+            assert_eq!(
+                body.matches("<d:getcontenttype>text/calendar</d:getcontenttype>")
+                    .count(),
+                members,
+                "{body}"
+            );
+            let (_, _, body) = send(
+                &router,
+                "PROPFIND",
+                "/dav/calendars/events/bafyreieee.ics",
+                Some("0"),
+                PROBE,
+            )
+            .await;
+            assert!(
+                body.contains("<d:getcontenttype>text/calendar</d:getcontenttype>"),
+                "{body}"
+            );
+        }
+
+        #[tokio::test]
         async fn deleting_an_event_archives_it() {
             let (router, events) = with_events();
             let (etag, _) = get_event(&router, "bafyreieee").await;
@@ -1548,5 +1850,563 @@ mod writes {
                     .all(|e| e.object_id != "bafyreieee")
             );
         }
+    }
+
+    // ------------------------------------------ writes in a person's calendar
+
+    const ALICE: &str = "bafyreialice";
+    const BOB: &str = "bafyreibob";
+
+    fn person_path(member: &str, name: &str) -> String {
+        format!(
+            "/dav/calendars/tasks-{}/{name}.ics",
+            anytype_task_exporter::feed::collection_key(member)
+        )
+    }
+
+    /// Alice and Bob each have a calendar; the piano is shared, Alice first.
+    fn grouped() -> (Router, Arc<Store>) {
+        let store = Arc::new(Store::default());
+        *store.members.lock().unwrap() = [(ALICE, "Алиса"), (BOB, "Боб")]
+            .into_iter()
+            .map(|(id, name)| (id.to_string(), name.to_string()))
+            .collect();
+        for (id, name, assignees) in [
+            ("bafyreiaaa", "Pay rent", vec![ALICE]),
+            ("bafyreiccc", "Move the piano", vec![ALICE, BOB]),
+        ] {
+            let mut task = task(id, name);
+            task.assignees = assignees.into_iter().map(String::from).collect();
+            store.tasks.lock().unwrap().push(task);
+        }
+        serve(store)
+    }
+
+    async fn delete_at(router: &Router, path: &str) -> StatusCode {
+        let (status, _, _) = send(router, "DELETE", path, None, "").await;
+        status
+    }
+
+    fn assignees_of(store: &Store, object_id: &str) -> Option<Vec<String>> {
+        store
+            .tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.object_id == object_id)
+            .map(|t| t.assignees.clone())
+    }
+
+    #[tokio::test]
+    async fn a_task_created_in_a_persons_calendar_is_assigned_to_them() {
+        let (router, store) = grouped();
+        let uid = "0b9a4f2c-5d1e-4c3a-9f7e-2a6b8c1d0e3f";
+        let body = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:{uid}\r\nSUMMARY:Tune the piano\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n"
+        );
+        let path = person_path(BOB, uid);
+        let (status, _) = put(&router, &path, Some(("If-None-Match", "*")), &body).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let created = store.tasks.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(created.assignees, vec![BOB.to_string()]);
+        // And it is served where it was put.
+        let (status, _, _) = send(&router, "GET", &path, None, "").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_task_created_among_the_unassigned_has_nobody() {
+        let (router, store) = grouped();
+        let body = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:abc\r\nSUMMARY:x\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let (status, _) = put(
+            &router,
+            "/dav/calendars/tasks-unassigned/abc.ics",
+            Some(("If-None-Match", "*")),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let created = store.tasks.lock().unwrap().last().cloned().unwrap();
+        assert!(created.assignees.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_from_a_persons_calendar_takes_them_off_the_task() {
+        let (router, store) = grouped();
+
+        // Shared with Bob: it becomes his.
+        assert_eq!(
+            delete_at(&router, &person_path(ALICE, "bafyreiccc")).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            assignees_of(&store, "bafyreiccc"),
+            Some(vec![BOB.to_string()])
+        );
+        let (status, _, _) = send(&router, "GET", &person_path(BOB, "bafyreiccc"), None, "").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Hers alone: it joins the unassigned, and nothing is archived.
+        assert_eq!(
+            delete_at(&router, &person_path(ALICE, "bafyreiaaa")).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(assignees_of(&store, "bafyreiaaa"), Some(Vec::new()));
+        let unassigned = "/dav/calendars/tasks-unassigned/bafyreiaaa.ics";
+        let (status, _, _) = send(&router, "GET", unassigned, None, "").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Among the unassigned there is nobody to take off: it is archived.
+        assert_eq!(delete_at(&router, unassigned).await, StatusCode::NO_CONTENT);
+        assert_eq!(assignees_of(&store, "bafyreiaaa"), None);
+    }
+
+    /// Calino moves a task to another calendar with a PUT there, under a name
+    /// made from the UID, and then a DELETE of the old resource.
+    #[tokio::test]
+    async fn moving_a_task_to_another_calendar_hands_it_over() {
+        let (router, store) = grouped();
+        let (_, _, ics) = send(&router, "GET", &person_path(ALICE, "bafyreiaaa"), None, "").await;
+        let moved = person_path(BOB, "bafyreiaaa~40anytype-task-exporter");
+        let (status, _) = put(&router, &moved, None, &ics).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            delete_at(&router, &person_path(ALICE, "bafyreiaaa")).await,
+            StatusCode::NO_CONTENT
+        );
+
+        assert_eq!(
+            assignees_of(&store, "bafyreiaaa"),
+            Some(vec![BOB.to_string()])
+        );
+        assert_eq!(store.tasks.lock().unwrap().len(), 2);
+        let (status, _, _) = send(&router, "GET", &person_path(BOB, "bafyreiaaa"), None, "").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A shared task: only the person it is moved away from leaves it.
+        let (_, _, ics) = send(&router, "GET", &person_path(ALICE, "bafyreiccc"), None, "").await;
+        let unassigned = "/dav/calendars/tasks-unassigned/bafyreiccc~40anytype-task-exporter.ics";
+        let (status, _) = put(&router, unassigned, None, &ics).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            assignees_of(&store, "bafyreiccc"),
+            Some(vec![BOB.to_string()])
+        );
+    }
+
+    /// What 2026-09-18 left behind: a second object carrying the UID of the
+    /// first. The original is served and the copy is left out.
+    #[tokio::test]
+    async fn a_copy_with_the_uid_of_another_task_does_not_take_the_calendars_down() {
+        let (router, store) = grouped();
+        let mut copy = task("bafyreicopy", "Pay rent");
+        copy.ical_uid = Some("bafyreiaaa@anytype-task-exporter".to_string());
+        copy.assignees = vec![BOB.to_string()];
+        store.tasks.lock().unwrap().push(copy);
+
+        let (status, _, _) = send(&router, "PROPFIND", "/dav/calendars/", Some("1"), PROBE).await;
+        assert_eq!(status, StatusCode::MULTI_STATUS);
+        let (status, _, _) =
+            send(&router, "GET", &person_path(ALICE, "bafyreiaaa"), None, "").await;
+        assert_eq!(status, StatusCode::OK);
+        let copy = person_path(BOB, "bafyreiaaa~40anytype-task-exporter");
+        let (status, _, _) = send(&router, "GET", &copy, None, "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ------------------------------------------------- an account per person
+
+    fn account(member: &str) -> String {
+        use anytype_task_exporter::accounts;
+        let pair = format!(
+            "{}:{}",
+            accounts::username(member),
+            accounts::password(SECRET.as_bytes(), member)
+        );
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(pair)
+        )
+    }
+
+    async fn send_as(
+        router: &Router,
+        authorization: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::AUTHORIZATION, authorization)
+                    .header("Depth", "1")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_person_signs_in_and_finds_their_own_calendar_first() {
+        let (router, _) = grouped();
+        let (status, body) =
+            send_as(&router, &account(BOB), "PROPFIND", "/dav/calendars/", "").await;
+        assert_eq!(status, StatusCode::MULTI_STATUS);
+
+        let own = person_path(BOB, "").replace(".ics", "");
+        let other = person_path(ALICE, "").replace(".ics", "");
+        let at = |href: &str| body.find(&format!("<d:href>{href}</d:href>")).unwrap();
+        assert!(at(&own) < at(&other), "{body}");
+        // Everything but his own arrives switched off.
+        let hidden = "<cs:calendar-hidden>1</cs:calendar-hidden>";
+        assert_eq!(body.matches(hidden).count(), 2, "{body}");
+        let his = &body[at(&own)..at(&other).max(at(&own))];
+        assert!(!his.contains(hidden), "{his}");
+
+        // Nobody in particular gets no flags at all.
+        let (_, shared) = send_as(&router, &auth(), "PROPFIND", "/dav/calendars/", "").await;
+        assert!(!shared.contains(hidden), "{shared}");
+    }
+
+    /// The piano is Alice's first and Bob's second. Each of them finds it in
+    /// their own calendar and nowhere else; anyone else finds it in Alice's.
+    #[tokio::test]
+    async fn a_shared_task_is_in_each_assignees_own_calendar() {
+        let (router, _) = grouped();
+        let alice = person_path(ALICE, "").replace(".ics", "");
+        let bob = person_path(BOB, "").replace(".ics", "");
+        let piano = |body: &str| body.contains("SUMMARY:Move the piano");
+        for (who, own, other) in [(account(BOB), &bob, &alice), (account(ALICE), &alice, &bob)] {
+            let (_, body) = send_as(&router, &who, "REPORT", own, TODO_QUERY).await;
+            assert!(piano(&body), "{body}");
+            let (_, body) = send_as(&router, &who, "REPORT", other, TODO_QUERY).await;
+            assert!(!piano(&body), "{body}");
+        }
+        let (_, body) = send_as(&router, &auth(), "REPORT", &alice, TODO_QUERY).await;
+        assert!(piano(&body), "{body}");
+        let (_, body) = send_as(&router, &auth(), "REPORT", &bob, TODO_QUERY).await;
+        assert!(!piano(&body), "{body}");
+
+        // Bob reads the piano in his calendar and takes himself off it there.
+        let (status, _) = send_as(
+            &router,
+            &account(BOB),
+            "GET",
+            &person_path(BOB, "bafyreiccc"),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = send_as(
+            &router,
+            &account(BOB),
+            "DELETE",
+            &person_path(BOB, "bafyreiccc"),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = send_as(&router, &account(BOB), "REPORT", &alice, TODO_QUERY).await;
+        assert!(piano(&body), "{body}");
+    }
+
+    /// Bob's calendar holds more for Bob than for anyone else, so its ctag
+    /// has to say so, or his client would never fetch the difference.
+    #[tokio::test]
+    async fn the_ctag_of_a_calendar_follows_what_its_reader_is_shown() {
+        let (router, _) = grouped();
+        let bob = person_path(BOB, "").replace(".ics", "");
+        let ctag = |body: String| {
+            let start = body.find("<cs:getctag>").unwrap();
+            let end = body[start..].find("</cs:getctag>").unwrap();
+            body[start..start + end].to_string()
+        };
+        let (_, his) = send_as(&router, &account(BOB), "PROPFIND", &bob, "").await;
+        let (_, shared) = send_as(&router, &auth(), "PROPFIND", &bob, "").await;
+        assert_ne!(ctag(his), ctag(shared));
+        let (_, home) = send_as(&router, &account(BOB), "PROPFIND", "/dav/calendars/", "").await;
+        let (_, his) = send_as(&router, &account(BOB), "PROPFIND", &bob, "").await;
+        assert!(home.contains(&ctag(his)), "{home}");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_or_a_person_with_no_account_is_refused() {
+        let (router, store) = grouped();
+        let wrong = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode(format!(
+                "{}:nope",
+                anytype_task_exporter::accounts::username(ALICE)
+            ))
+        );
+        let (status, _) = send_as(&router, &wrong, "PROPFIND", "/dav/calendars/", "").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Someone the directory does not list has no account, whatever the
+        // secret would derive for them.
+        let (status, _) = send_as(
+            &router,
+            &account("bafyreistranger"),
+            "PROPFIND",
+            "/dav/calendars/",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(store.tasks.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn each_person_names_the_calendars_for_themselves() {
+        let (router, _) = grouped();
+        let bobs = format!(
+            "/dav/calendars/tasks-{}/",
+            anytype_task_exporter::feed::collection_key(BOB)
+        );
+        let body = r#"<propertyupdate xmlns="DAV:"><set><prop><displayname>Боб из команды</displayname></prop></set></propertyupdate>"#;
+        let (status, _) = send_as(&router, &account(ALICE), "PROPPATCH", &bobs, body).await;
+        assert_eq!(status, StatusCode::MULTI_STATUS);
+
+        let (_, hers) = send_as(&router, &account(ALICE), "PROPFIND", "/dav/calendars/", "").await;
+        assert!(hers.contains("Боб из команды"), "{hers}");
+        let (_, his) = send_as(&router, &account(BOB), "PROPFIND", "/dav/calendars/", "").await;
+        assert!(!his.contains("Боб из команды"), "{his}");
+        assert!(his.contains("<d:displayname>Боб</d:displayname>"), "{his}");
+    }
+
+    #[tokio::test]
+    async fn each_person_keeps_client_documents_of_their_own() {
+        let (router, _) = grouped();
+        let path = "/dav/calendars/calino-settings/calino-settings.ics";
+        let document = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:calino-settings\r\nSUMMARY:alice\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let (status, _) = send_as(&router, &account(ALICE), "PUT", path, document).await;
+        assert!(status.is_success(), "{status}");
+
+        let (status, hers) = send_as(&router, &account(ALICE), "GET", path, "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(hers.contains("SUMMARY:alice"), "{hers}");
+        let (status, _) = send_as(&router, &account(BOB), "GET", path, "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = send_as(&router, &auth(), "GET", path, "").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+}
+
+// ------------------------------------------------- one calendar per assignee
+
+mod grouped {
+    use std::{collections::BTreeMap, sync::Mutex};
+
+    use anytype_task_exporter::feed::{UNASSIGNED, collection_key};
+
+    use super::*;
+
+    const ALICE: &str = "_participant_space_alice";
+    const BOB: &str = "_participant_space_bob";
+    /// Described by the space, named by no task, with no account.
+    const CAROL: &str = "bafyreicarol";
+
+    /// Reads the tasks afresh on every request, so a test can change one and
+    /// see the collections move.
+    struct Assigned(Mutex<Vec<Task>>);
+
+    #[async_trait]
+    impl TaskSource for Assigned {
+        async fn list_tasks(&self) -> Result<TaskBatch, SourceError> {
+            Ok(TaskBatch {
+                tasks: self.0.lock().unwrap().clone(),
+                warnings: Vec::new(),
+                members: BTreeMap::from([
+                    (ALICE.to_string(), "Алиса".to_string()),
+                    (BOB.to_string(), "Боб".to_string()),
+                    (CAROL.to_string(), "Кэрол".to_string()),
+                ]),
+                account_holders: Default::default(),
+            })
+        }
+    }
+
+    fn assigned(id: &str, name: &str, assignees: &[&str]) -> Task {
+        let mut task = super::task(id, name);
+        task.assignees = assignees.iter().map(|id| id.to_string()).collect();
+        task
+    }
+
+    fn grouped_router() -> (Router, Arc<Assigned>) {
+        let source = Arc::new(Assigned(Mutex::new(vec![
+            assigned("bafyreiaaa", "Pay rent", &[ALICE]),
+            assigned("bafyreibbb", "Guitar", &[BOB]),
+            assigned("bafyreiccc", "Move the piano", &[ALICE, BOB]),
+            assigned("bafyreiddd", "Nobody's", &[]),
+        ])));
+        let renderer = VTodoRenderer::new(
+            CalendarConfig {
+                timezone: Saratov,
+                name: "Anytype Tasks".into(),
+                date_only_timezone: Saratov,
+            },
+            RemindersConfig {
+                enabled: false,
+                lead_time: chrono::Duration::minutes(30),
+                all_day_time: chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            },
+            Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        );
+        // No caching interval: a test changes a task and asks again.
+        let feed = Arc::new(FeedService::new(
+            source.clone(),
+            renderer,
+            Duration::from_secs(0),
+            Duration::from_secs(5),
+        ));
+        let router = http::router(
+            AppState {
+                feed,
+                allowed_origins: Arc::new(Vec::new()),
+                push: None,
+                caldav: Some(Arc::new(Credentials::new("me", "pw"))),
+                writer: None,
+                events: None,
+                events_in_tasks: false,
+                calendar_names: Default::default(),
+                documents: None,
+            },
+            "/f/secret/todos.ics",
+        );
+        (router, source)
+    }
+
+    fn path_of(key: &str) -> String {
+        format!("/dav/calendars/tasks-{key}/")
+    }
+
+    fn ctag_of(body: &str, href: &str) -> String {
+        body.split(&format!("<d:href>{href}</d:href>"))
+            .nth(1)
+            .and_then(|rest| rest.split("<cs:getctag>").nth(1))
+            .and_then(|rest| rest.split("</cs:getctag>").next())
+            .unwrap_or_else(|| panic!("no ctag for {href} in {body}"))
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn the_home_set_lists_one_calendar_per_assignee_and_not_the_flat_one() {
+        let (router, _) = grouped_router();
+        let (status, _, body) = send(&router, "PROPFIND", "/dav/calendars/", Some("1"), "").await;
+        assert_eq!(status, StatusCode::MULTI_STATUS);
+        // Calino keeps one entry per UID, so a task is listed once.
+        assert!(
+            !body.contains("<d:href>/dav/calendars/tasks/</d:href>"),
+            "{body}"
+        );
+        for (member, name) in [(ALICE, "Алиса"), (BOB, "Боб")] {
+            let href = path_of(&collection_key(member));
+            assert!(body.contains(&format!("<d:href>{href}</d:href>")), "{body}");
+            assert!(
+                body.contains(&format!("<d:displayname>{name}</d:displayname>")),
+                "{body}"
+            );
+        }
+        assert!(
+            body.contains(&format!("<d:href>{}</d:href>", path_of(UNASSIGNED))),
+            "{body}"
+        );
+        // Nobody's tasks and no account: no calendar.
+        assert!(!body.contains(&path_of(&collection_key(CAROL))), "{body}");
+        assert_eq!(
+            body.matches("<c:comp name=\"VTODO\"/>").count(),
+            3,
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_query_in_one_calendar_returns_only_that_assignees_tasks() {
+        let (router, _) = grouped_router();
+        let (status, _, body) = send(
+            &router,
+            "REPORT",
+            &path_of(&collection_key(BOB)),
+            Some("1"),
+            TODO_QUERY,
+        )
+        .await;
+        assert_eq!(status, StatusCode::MULTI_STATUS);
+        assert_eq!(body.matches("<d:response>").count(), 1, "{body}");
+        assert!(body.contains("SUMMARY:Guitar"), "{body}");
+        assert!(!body.contains("SUMMARY:Pay rent"), "{body}");
+        // Shared with Alice, who comes first: it is hers alone.
+        assert!(!body.contains("SUMMARY:Move the piano"), "{body}");
+
+        let alice = path_of(&collection_key(ALICE));
+        let (_, _, hers) = send(&router, "REPORT", &alice, Some("1"), TODO_QUERY).await;
+        assert!(
+            hers.contains(&format!("<d:href>{alice}bafyreiccc.ics</d:href>")),
+            "{hers}"
+        );
+        // And it does not answer under his path either.
+        let (status, _, _) = send(
+            &router,
+            "GET",
+            &format!("{}bafyreiccc.ics", path_of(&collection_key(BOB))),
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (_, _, flat) = send(
+            &router,
+            "REPORT",
+            "/dav/calendars/tasks/",
+            Some("1"),
+            TODO_QUERY,
+        )
+        .await;
+        assert_eq!(flat.matches("<d:response>").count(), 4, "{flat}");
+    }
+
+    #[tokio::test]
+    async fn a_changed_task_moves_only_the_ctag_of_its_own_calendar() {
+        let (router, source) = grouped_router();
+        let (_, _, before) = send(&router, "PROPFIND", "/dav/calendars/", Some("1"), "").await;
+
+        source.0.lock().unwrap()[0].name = "Pay rent today".into();
+        let (_, _, after) = send(&router, "PROPFIND", "/dav/calendars/", Some("1"), "").await;
+
+        let alice = path_of(&collection_key(ALICE));
+        let bob = path_of(&collection_key(BOB));
+        assert_ne!(ctag_of(&before, &alice), ctag_of(&after, &alice));
+        assert_eq!(ctag_of(&before, &bob), ctag_of(&after, &bob));
+        assert_eq!(
+            ctag_of(&before, &path_of(UNASSIGNED)),
+            ctag_of(&after, &path_of(UNASSIGNED))
+        );
+    }
+
+    /// A subscription saved before an assignee left the space.
+    #[tokio::test]
+    async fn an_unknown_collection_is_missing() {
+        let (router, _) = grouped_router();
+        let (status, _, _) = send(
+            &router,
+            "REPORT",
+            "/dav/calendars/tasks-deadbeef1234/",
+            Some("1"),
+            TODO_QUERY,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

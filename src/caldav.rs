@@ -13,6 +13,7 @@
 //! - `/dav/calendars/`              → the one collection
 //! - `/dav/calendars/tasks/`        → collection properties, REPORT
 //! - `/dav/calendars/tasks/<id>.ics` → one task
+//! - `/dav/calendars/tasks-<key>/`  → the same, for one assignee's tasks
 //! - `/dav/calendars/events/`       → events, when `caldav.events` is on
 //! - `/dav/calendars/events/<id>.ics` → one event
 //! - `/dav/calendars/calino-settings/` → the client's own documents, stored as they arrive
@@ -21,6 +22,8 @@
 //! collection then advertises `write` and Calino allows editing. PUT and DELETE
 //! check `If-Match`/`If-None-Match` against a fresh read of the task, never
 //! against the cached snapshot, which may be up to `min_refresh_interval` old.
+
+use std::{borrow::Cow, collections::BTreeMap};
 
 use axum::{
     body::Body,
@@ -34,7 +37,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     events::{self as ev, EventService, EventWriteError},
-    feed::{Outcome, Snapshot, calino_filename, etag_for},
+    feed::{Outcome, Resource, Snapshot, calino_filename, collection_ctag, etag_for},
     http::AppState,
     source::SourceError,
     state::StateStore,
@@ -45,6 +48,9 @@ pub const BASE: &str = "/dav/";
 const PRINCIPAL: &str = "/dav/principal/";
 const HOME: &str = "/dav/calendars/";
 const TASKS: &str = "/dav/calendars/tasks/";
+/// One calendar per assignee lives beside the flat one, under a key the
+/// snapshot computed (`feed::collection_key`).
+const TASKS_PREFIX: &str = "/dav/calendars/tasks-";
 const EVENTS: &str = "/dav/calendars/events/";
 /// Calino keeps its own settings in a calendar of its own, marked with a dead
 /// property (`settingsSync.ts`, `CalDAVClient.discoverSettingsCalendar`). The
@@ -56,11 +62,62 @@ const SETTINGS_DISPLAY_NAME: &str = "Calino Settings";
 /// A settings document is a few kilobytes; this only stops a runaway client.
 const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 const REALM: &str = "anytype";
+/// Where the names a reader gave the calendars are kept, one document per
+/// collection path.
+const NAMES: &str = "names/";
+
+/// What the collections are called unless a reader renamed them.
+#[derive(Debug, Clone)]
+pub struct CalendarNames {
+    pub tasks: String,
+    pub events: String,
+}
+
+impl Default for CalendarNames {
+    fn default() -> Self {
+        Self {
+            tasks: "Anytype".to_string(),
+            events: "События".to_string(),
+        }
+    }
+}
 
 /// Who may use the facade. The password is only ever held as a digest.
 pub struct Credentials {
     username: String,
     password_digest: [u8; 32],
+    /// Set when every person of the space has an account of their own.
+    accounts: Option<crate::accounts::Accounts>,
+}
+
+/// Who a request was made by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reader {
+    /// The one configured username and password: nobody in particular.
+    Shared,
+    /// A person of the space, by the id their calendar is kept under.
+    Person(String),
+}
+
+impl Reader {
+    /// Where this reader's client documents are kept. A person's are their
+    /// own: Calino syncs its settings as one document per account, so people
+    /// sharing a collection would overwrite each other's.
+    fn settings_storage(&self) -> String {
+        match self {
+            Reader::Shared => SETTINGS.to_string(),
+            Reader::Person(id) => format!("{SETTINGS}{}/", crate::accounts::username(id)),
+        }
+    }
+
+    /// Where this reader's names for the calendars are kept. Two instances,
+    /// or two people, see the same collections under names of their own.
+    fn names_storage(&self) -> String {
+        match self {
+            Reader::Shared => NAMES.to_string(),
+            Reader::Person(id) => format!("{NAMES}{}/", crate::accounts::username(id)),
+        }
+    }
 }
 
 impl Credentials {
@@ -68,27 +125,48 @@ impl Credentials {
         Self {
             username: username.to_string(),
             password_digest: Sha256::digest(password.as_bytes()).into(),
+            accounts: None,
         }
+    }
+
+    /// Also accepts the account of every person who may sign in, derived from
+    /// this secret (`accounts`).
+    pub fn with_accounts(mut self, secret: &str) -> Self {
+        self.accounts = Some(crate::accounts::Accounts::new(secret));
+        self
+    }
+
+    /// Who signed in, if anyone. A person is looked up among the calendars of
+    /// the current snapshot, so an account exists exactly as long as the
+    /// directory says it does.
+    pub async fn reader(
+        &self,
+        feed: &crate::feed::FeedService,
+        headers: &HeaderMap,
+    ) -> Option<Reader> {
+        if self.accepts(headers) {
+            return Some(Reader::Shared);
+        }
+        let accounts = self.accounts.as_ref()?;
+        let (username, password) = basic(headers)?;
+        let (Outcome::Fresh(snapshot) | Outcome::Stale(snapshot)) = feed.get().await else {
+            return None;
+        };
+        let people = snapshot
+            .collections
+            .values()
+            .filter(|collection| collection.account)
+            .filter_map(|collection| collection.member_id.as_deref());
+        accounts
+            .person(&username, &password, people)
+            .map(|id| Reader::Person(id.to_string()))
     }
 
     /// Checks an `Authorization: Basic …` header. The password comparison
     /// runs over fixed-length digests so its duration does not depend on how
     /// much of the password matched.
     pub fn accepts(&self, headers: &HeaderMap) -> bool {
-        let Some(encoded) = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Basic "))
-        else {
-            return false;
-        };
-        let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
-            return false;
-        };
-        let Ok(text) = String::from_utf8(decoded) else {
-            return false;
-        };
-        let Some((user, password)) = text.split_once(':') else {
+        let Some((user, password)) = basic(headers) else {
             return false;
         };
         let digest: [u8; 32] = Sha256::digest(password.as_bytes()).into();
@@ -99,6 +177,20 @@ impl Credentials {
             == 0;
         same_password & (user == self.username)
     }
+}
+
+/// The username and password of an `Authorization: Basic …` header.
+fn basic(headers: &HeaderMap) -> Option<(String, String)> {
+    let encoded = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    let (user, password) = text.split_once(':')?;
+    Some((user.to_string(), password.to_string()))
 }
 
 /// Every method on every `/dav/` path lands here.
@@ -125,7 +217,8 @@ pub async fn handle(
     let Some(credentials) = &state.caldav else {
         return status(StatusCode::NOT_FOUND);
     };
-    if !credentials.accepts(&headers) {
+    let reader = credentials.reader(&state.feed, &headers).await;
+    let Some(reader) = reader else {
         let presented = headers.contains_key(header::AUTHORIZATION);
         if presented {
             warn!(%method, %path, "caldav request with wrong credentials");
@@ -146,7 +239,9 @@ pub async fn handle(
             );
         }
         return builder.body(Body::empty()).expect("static response");
-    }
+    };
+    let settings_storage = reader.settings_storage();
+    let names = reader.names_storage();
 
     let path = normalize(path);
     debug!(%method, path = %path, depth, body_bytes = body.len(), "caldav request");
@@ -171,25 +266,86 @@ pub async fn handle(
         )]),
         ("PROPFIND", HOME) => {
             let writable = state.writer.is_some();
-            let events = match &state.events {
+            let event_snapshot = match &state.events {
                 Some(service) => match service.snapshot().await {
-                    Ok(snapshot) => Some(response(
-                        EVENTS,
-                        &collection_props("VEVENT", "События", &snapshot.ctag, writable),
-                    )),
+                    Ok(snapshot) => Some(snapshot),
                     Err(err) => return source_failure(&err),
                 },
                 None => None,
             };
-            let settings = state
-                .documents
+            let events = event_snapshot
                 .as_ref()
-                .map(|store| response(SETTINGS, &settings_collection_props(store)));
+                .filter(|_| !state.events_in_tasks)
+                .map(|snapshot| {
+                    response(
+                        EVENTS,
+                        &collection_props(
+                            &["VEVENT"],
+                            &named(&state, &names, EVENTS, &state.calendar_names.events),
+                            &snapshot.ctag,
+                            writable,
+                        ),
+                    )
+                });
+            let settings = state.documents.as_ref().map(|store| {
+                response(
+                    SETTINGS,
+                    &settings_collection_props(store, &settings_storage),
+                )
+            });
             with_snapshot(&state, |snapshot| {
-                let mut responses = vec![response(
-                    TASKS,
-                    &collection_props("VTODO", "Anytype", &snapshot.etag, writable),
-                )];
+                // Calino keeps one entry per UID across all its calendars, so
+                // a home set lists a task once: the flat collection or the
+                // calendars per person, never both.
+                let mut responses = Vec::new();
+                if snapshot.collections.is_empty() {
+                    let merged = event_snapshot.as_deref().filter(|_| state.events_in_tasks);
+                    let (components, ctag) = flat_contents(&snapshot.etag, merged);
+                    responses.push(response(
+                        TASKS,
+                        &collection_props(
+                            components,
+                            &named(&state, &names, TASKS, &state.calendar_names.tasks),
+                            &ctag,
+                            writable,
+                        ),
+                    ));
+                }
+                // A person's own calendar comes first, because Calino makes
+                // the first collection the default one for a new task. The
+                // others arrive switched off: a fork of Calino reads the flag
+                // once, when it first sees the url, and the stock client
+                // ignores it. Nobody in particular gets them all switched on.
+                let own = match &reader {
+                    Reader::Person(id) => Some(id.as_str()),
+                    Reader::Shared => None,
+                };
+                let is_own = |collection: &crate::feed::Collection| {
+                    own.is_some() && collection.member_id.as_deref() == own
+                };
+                let mut collections: Vec<_> = snapshot.collections.iter().collect();
+                collections.sort_by_key(|(_, collection)| !is_own(collection));
+                responses.extend(collections.into_iter().map(|(key, collection)| {
+                    let mut props = collection_props(
+                        &["VTODO"],
+                        &named(
+                            &state,
+                            &names,
+                            &collection_path(key),
+                            &collection.display_name,
+                        ),
+                        &collection_view(snapshot, key, &reader)
+                            .map(|view| view.ctag.into_owned())
+                            .unwrap_or_default(),
+                        writable,
+                    );
+                    if own.is_some() && !is_own(collection) {
+                        // An explicit value: the client parses an empty
+                        // element into an object, which is truthy.
+                        props.push(prop_text("cs:calendar-hidden", "1"));
+                    }
+                    response(&collection_path(key), &props)
+                }));
                 responses.extend(events);
                 responses.extend(settings);
                 multistatus(responses)
@@ -198,104 +354,32 @@ pub async fn handle(
         }
         (_, _) if path.starts_with(SETTINGS) && state.documents.is_some() => {
             let store = state.documents.clone().expect("checked");
-            settings_route(&store, &method, &path, &depth, &headers, &body)
+            settings_route(
+                &store,
+                &settings_storage,
+                &method,
+                &path,
+                &depth,
+                &headers,
+                &body,
+            )
+        }
+        ("PROPPATCH", _) if state.documents.is_some() && is_calendar(&path) => {
+            let store = state.documents.clone().expect("checked");
+            rename(&store, &names, &path, &body)
         }
         (_, _) if path.starts_with(EVENTS) && state.events.is_some() => {
             let service = state.events.clone().expect("checked");
-            events_route(&state, &service, &method, &path, &depth, &headers, &body).await
-        }
-        ("PROPFIND", TASKS) => {
-            let writable = state.writer.is_some();
-            with_snapshot(&state, |snapshot| {
-                let mut responses = vec![response(
-                    TASKS,
-                    &collection_props("VTODO", "Anytype", &snapshot.etag, writable),
-                )];
-                // Depth 1 also lists members with their ETags, which is how a
-                // generic client finds out what changed without a REPORT.
-                if depth == "1" {
-                    responses.extend(snapshot.objects.iter().map(|(id, resource)| {
-                        response(&href_for(id), &[prop_text("d:getetag", &resource.etag)])
-                    }));
-                }
-                multistatus(responses)
-            })
+            events_route(
+                &state, &service, &names, &method, &path, &depth, &headers, &body,
+            )
             .await
         }
-        ("REPORT", TASKS) => {
-            let kind = report_kind(&body);
-            with_snapshot(&state, |snapshot| match kind {
-                Report::SyncCollection => {
-                    // Never advertised, so Calino does not send it; a 403
-                    // makes any client fall back to a full listing.
-                    info!("caldav sync-collection requested but not supported");
-                    status(StatusCode::FORBIDDEN)
-                }
-                Report::EventsOnly => {
-                    debug!("caldav calendar-query for events: none");
-                    multistatus(Vec::new())
-                }
-                Report::Tasks | Report::TasksOnly => {
-                    debug!(
-                        resources = snapshot.objects.len(),
-                        "caldav calendar-query for tasks"
-                    );
-                    multistatus(
-                        snapshot
-                            .objects
-                            .iter()
-                            .map(|(id, resource)| {
-                                response(
-                                    &href_for(id),
-                                    &[
-                                        prop_text("d:getetag", &resource.etag),
-                                        prop_text("d:getcontenttype", "text/calendar"),
-                                        prop_text("c:calendar-data", &resource.ics),
-                                    ],
-                                )
-                            })
-                            .collect(),
-                    )
-                }
-            })
+        (_, _) if tasks_key(&path).is_some() => {
+            tasks_route(
+                &state, &reader, &names, &method, &path, &depth, &headers, &body,
+            )
             .await
-        }
-        ("PROPFIND" | "GET" | "HEAD", _) if object_id(&path).is_some() => {
-            let id = object_id(&path).expect("checked").to_string();
-            let is_get = method.as_str() != "PROPFIND";
-            let head = method == Method::HEAD;
-            with_snapshot(&state, move |snapshot| {
-                let Some(resource) = snapshot.objects.get(&id) else {
-                    debug!(object_id = %id, "caldav resource not found");
-                    return status(StatusCode::NOT_FOUND);
-                };
-                if !is_get {
-                    return multistatus(vec![response(
-                        &href_for(&id),
-                        &[prop_text("d:getetag", &resource.etag)],
-                    )]);
-                }
-                let body = if head {
-                    Body::empty()
-                } else {
-                    Body::from(resource.ics.to_string())
-                };
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "text/calendar; charset=utf-8")
-                    .header(header::ETAG, &resource.etag)
-                    .body(body)
-                    .expect("valid response")
-            })
-            .await
-        }
-        ("PUT", _) if object_id(&path).is_some() && state.writer.is_some() => {
-            let name = object_id(&path).expect("checked").to_string();
-            put(&state, &name, &headers, &body).await
-        }
-        ("DELETE", _) if object_id(&path).is_some() && state.writer.is_some() => {
-            let name = object_id(&path).expect("checked").to_string();
-            delete(&state, &name, &headers).await
         }
         // A query at the base, principal or home set: not a calendar collection.
         // RFC 4791 wants 403 here; Calino's diagnostics read 404 as a
@@ -315,11 +399,279 @@ pub async fn handle(
     }
 }
 
-/// Finds the object behind a resource name in the current snapshot.
-async fn locate(state: &AppState, name: &str) -> Result<Option<String>, Box<Response>> {
+/// Every request under `tasks/` and under a `tasks-<key>/` of its own. The two
+/// differ only in which resources they list: a member GET still looks the name
+/// up in the flat index, because the same task is served under the same name in
+/// every collection it belongs to.
+#[allow(clippy::too_many_arguments)]
+async fn tasks_route(
+    state: &AppState,
+    reader: &Reader,
+    names: &str,
+    method: &Method,
+    path: &str,
+    depth: &str,
+    headers: &HeaderMap,
+    body: &str,
+) -> Response {
+    let key = tasks_key(path).expect("routed by the key").to_string();
+    let collection = collection_path(&key);
+    let writable = state.writer.is_some();
+    let name = object_id(path).map(|(_, name)| name.to_string());
+    // With `events_in_tasks`, the flat collection also serves the events. An
+    // event, or a new resource whose body is one, is handled by the events
+    // code as if it had been addressed under `events/`.
+    let events = match (&state.events, key.is_empty() && state.events_in_tasks) {
+        (Some(service), true) => match service.snapshot().await {
+            Ok(snapshot) => Some((service, snapshot)),
+            Err(err) => return source_failure(&err),
+        },
+        _ => None,
+    };
+    if let (Some((service, snapshot)), Some(name)) = (&events, &name) {
+        let is_event = snapshot.objects.contains_key(name)
+            || (method == Method::PUT && body.contains("BEGIN:VEVENT"));
+        if is_event {
+            let path = event_href(name);
+            return events_route(state, service, names, method, &path, depth, headers, body).await;
+        }
+    }
+    let events = events.map(|(_, snapshot)| snapshot);
+    match (method.as_str(), path == collection, name) {
+        ("PROPFIND", true, _) => {
+            with_snapshot(state, |snapshot| {
+                let Some(view) = collection_view(snapshot, &key, reader) else {
+                    return status(StatusCode::NOT_FOUND);
+                };
+                let (components, ctag) = flat_contents(&view.ctag, events.as_deref());
+                let mut responses = vec![response(
+                    &collection,
+                    &collection_props(
+                        components,
+                        &named(
+                            state,
+                            names,
+                            &collection,
+                            view.display_name.unwrap_or(&state.calendar_names.tasks),
+                        ),
+                        &ctag,
+                        writable,
+                    ),
+                )];
+                // Depth 1 also lists members with their ETags, which is how a
+                // generic client finds out what changed without a REPORT.
+                if depth == "1" {
+                    let merged = events.iter().flat_map(|events| events.objects.iter());
+                    responses.extend(view.objects.iter().chain(merged).map(|(id, resource)| {
+                        response(&href_for(&key, id), &member_props(&resource.etag))
+                    }));
+                }
+                multistatus(responses)
+            })
+            .await
+        }
+        ("REPORT", true, _) => {
+            let kind = report_kind(body);
+            with_snapshot(state, |snapshot| match kind {
+                Report::SyncCollection => {
+                    // Never advertised, so Calino does not send it; a 403
+                    // makes any client fall back to a full listing.
+                    info!("caldav sync-collection requested but not supported");
+                    status(StatusCode::FORBIDDEN)
+                }
+                Report::EventsOnly if events.is_none() => {
+                    debug!("caldav calendar-query for events: none");
+                    multistatus(Vec::new())
+                }
+                kind => {
+                    let Some(view) = collection_view(snapshot, &key, reader) else {
+                        return status(StatusCode::NOT_FOUND);
+                    };
+                    let tasks = view.objects.iter().filter(|_| kind != Report::EventsOnly);
+                    let merged = events
+                        .iter()
+                        .flat_map(|events| events.objects.iter())
+                        .filter(|_| kind != Report::TasksOnly);
+                    debug!(
+                        resources = view.objects.len(),
+                        events = events.as_ref().map(|events| events.objects.len()),
+                        key,
+                        ?kind,
+                        "caldav calendar-query for tasks"
+                    );
+                    multistatus(
+                        tasks
+                            .chain(merged)
+                            .map(|(id, resource)| {
+                                response(
+                                    &href_for(&key, id),
+                                    &[
+                                        prop_text("d:getetag", &resource.etag),
+                                        prop_text("d:getcontenttype", "text/calendar"),
+                                        prop_text("c:calendar-data", &resource.ics),
+                                    ],
+                                )
+                            })
+                            .collect(),
+                    )
+                }
+            })
+            .await
+        }
+        ("PROPFIND" | "GET" | "HEAD", _, Some(name)) => {
+            let is_get = method.as_str() != "PROPFIND";
+            let head = method == Method::HEAD;
+            with_snapshot(state, move |snapshot| {
+                let view = collection_view(snapshot, &key, reader);
+                let resource = view.as_ref().and_then(|view| view.objects.get(&name));
+                let Some(resource) = resource else {
+                    debug!(object_id = %name, key, "caldav resource not found");
+                    return status(StatusCode::NOT_FOUND);
+                };
+                if !is_get {
+                    return multistatus(vec![response(
+                        &href_for(&key, &name),
+                        &member_props(&resource.etag),
+                    )]);
+                }
+                let body = if head {
+                    Body::empty()
+                } else {
+                    Body::from(resource.ics.to_string())
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/calendar; charset=utf-8")
+                    .header(header::ETAG, &resource.etag)
+                    .body(body)
+                    .expect("valid response")
+            })
+            .await
+        }
+        ("PUT", _, Some(name)) if writable => put(state, reader, &key, &name, headers, body).await,
+        ("DELETE", _, Some(name)) if writable => delete(state, reader, &key, &name, headers).await,
+        ("PUT" | "DELETE" | "PROPPATCH" | "MKCOL" | "MKCALENDAR" | "MOVE" | "COPY", _, _) => {
+            info!(%method, path, writable, "caldav write refused");
+            status(StatusCode::FORBIDDEN)
+        }
+        _ => {
+            debug!(%method, path, "caldav path not found");
+            status(StatusCode::NOT_FOUND)
+        }
+    }
+}
+
+/// What one task collection serves.
+struct View<'a> {
+    /// A person's name, or `None` for the flat collection, whose name is configured.
+    display_name: Option<&'a str>,
+    ctag: Cow<'a, str>,
+    objects: Cow<'a, BTreeMap<String, Resource>>,
+}
+
+/// The flat collection is the whole snapshot; a keyed one is its own subset,
+/// with a ctag that moves only when its own members do. `None` for a key the
+/// snapshot does not hold: a subscription saved before an assignee left the
+/// space, or before grouping was configured at all.
+///
+/// A task shared with the person reading is shown in their own calendar and
+/// in no other, wherever `collections` serves it: they see it without looking
+/// in someone else's calendar, and a client still meets each UID once.
+fn collection_view<'a>(snapshot: &'a Snapshot, key: &str, reader: &Reader) -> Option<View<'a>> {
+    if key.is_empty() {
+        return Some(View {
+            display_name: None,
+            ctag: Cow::Borrowed(&snapshot.etag),
+            objects: Cow::Borrowed(&snapshot.objects),
+        });
+    }
+    let collection = snapshot.collections.get(key)?;
+    let mut objects = Cow::Borrowed(&collection.objects);
+    if let Reader::Person(me) = reader {
+        let own = collection.member_id.as_ref() == Some(me);
+        for (name, assignees) in snapshot.shared.iter() {
+            if !assignees.contains(me) {
+                continue;
+            }
+            let listed = objects.contains_key(name);
+            if own && !listed {
+                if let Some(resource) = snapshot.objects.get(name) {
+                    objects.to_mut().insert(name.clone(), resource.clone());
+                }
+            } else if !own && listed {
+                objects.to_mut().remove(name);
+            }
+        }
+    }
+    let ctag = match &objects {
+        Cow::Borrowed(_) => Cow::Borrowed(collection.ctag.as_str()),
+        Cow::Owned(objects) => Cow::Owned(collection_ctag(objects)),
+    };
+    Some(View {
+        display_name: Some(&collection.display_name),
+        ctag,
+        objects,
+    })
+}
+
+/// What the current snapshot knows about a resource name under a collection.
+struct Located {
+    /// The object behind the name, wherever in the space it is served.
+    object_id: Option<String>,
+    /// Whether the addressed collection is the one that serves it.
+    here: bool,
+    /// Whose calendar the collection is; `None` for the flat one and for the
+    /// unassigned.
+    member_id: Option<String>,
+    /// Whose calendar serves the object now; `None` among the unassigned.
+    served_by: Option<String>,
+}
+
+/// Finds the object behind a resource name in the current snapshot, or behind
+/// the UID when the name is new. A key the snapshot does not hold is a 404, as
+/// it is for reads.
+async fn locate(
+    state: &AppState,
+    reader: &Reader,
+    key: &str,
+    name: &str,
+    uid: Option<&str>,
+) -> Result<Located, Box<Response>> {
     match state.feed.get().await {
         Outcome::Fresh(snapshot) | Outcome::Stale(snapshot) => {
-            Ok(snapshot.objects.get(name).map(|r| r.object_id.clone()))
+            let Some(view) = collection_view(&snapshot, key, reader) else {
+                debug!(key, "caldav task collection not found");
+                return Err(Box::new(status(StatusCode::NOT_FOUND)));
+            };
+            let name = match snapshot.objects.contains_key(name) {
+                true => Some(name),
+                false => uid.and_then(|uid| snapshot.names_by_uid.get(uid).map(String::as_str)),
+            };
+            Ok(Located {
+                object_id: name
+                    .and_then(|name| snapshot.objects.get(name))
+                    .map(|r| r.object_id.clone()),
+                here: name.is_some_and(|name| view.objects.contains_key(name)),
+                member_id: snapshot
+                    .collections
+                    .get(key)
+                    .and_then(|collection| collection.member_id.clone()),
+                served_by: name.and_then(|name| match reader {
+                    Reader::Person(me)
+                        if snapshot
+                            .shared
+                            .get(name)
+                            .is_some_and(|assignees| assignees.contains(me)) =>
+                    {
+                        Some(me.clone())
+                    }
+                    _ => snapshot
+                        .collections
+                        .values()
+                        .find(|collection| collection.objects.contains_key(name))
+                        .and_then(|collection| collection.member_id.clone()),
+                }),
+            })
         }
         Outcome::Unavailable { category } => Err(Box::new(unavailable(category))),
     }
@@ -358,7 +710,14 @@ fn precondition_failed(reason: &str) -> Response {
         .expect("static response")
 }
 
-async fn put(state: &AppState, name: &str, headers: &HeaderMap, body: &str) -> Response {
+async fn put(
+    state: &AppState,
+    reader: &Reader,
+    key: &str,
+    name: &str,
+    headers: &HeaderMap,
+    body: &str,
+) -> Response {
     // The whole body: what a client meant is only recoverable from it.
     debug!(resource = name, body, "caldav put body");
     let writer = state.writer.as_ref().expect("routed only with a writer");
@@ -390,14 +749,18 @@ async fn put(state: &AppState, name: &str, headers: &HeaderMap, body: &str) -> R
         "caldav put parsed"
     );
 
-    let existing = match locate(state, name).await {
-        Ok(existing) => existing,
+    let located = match locate(state, reader, key, name, incoming.uid.as_deref()).await {
+        Ok(located) => located,
         Err(response) => return *response,
     };
 
-    let Some(object_id) = existing else {
-        return create(state, name, if_match, &incoming).await;
+    let Some(object_id) = located.object_id else {
+        return create(state, name, if_match, &incoming, located.member_id).await;
     };
+    // Calino moves a task to another calendar with a PUT there and a DELETE of
+    // the old resource. The PUT hands the task over to this calendar's person;
+    // the DELETE then finds it gone.
+    let moving = !located.here;
 
     // A fresh read decides the precondition and the patch: the snapshot may be
     // older than an edit made in Anytype a moment ago.
@@ -409,13 +772,13 @@ async fn put(state: &AppState, name: &str, headers: &HeaderMap, body: &str) -> R
             return if if_match.is_some() {
                 precondition_failed("resource no longer exists")
             } else {
-                create(state, name, None, &incoming).await
+                create(state, name, None, &incoming, located.member_id).await
             };
         }
         Err(err) => return source_failure(&err),
     };
     let current_etag = state.feed.resource_for(&current).etag;
-    if if_none_match.as_deref() == Some("*") {
+    if !moving && if_none_match.as_deref() == Some("*") {
         warn!(resource = name, %object_id, "caldav put: If-None-Match * on an existing resource");
         return precondition_failed("resource exists");
     }
@@ -427,12 +790,20 @@ async fn put(state: &AppState, name: &str, headers: &HeaderMap, body: &str) -> R
     }
 
     let renderer = state.feed.renderer();
-    let patch = writeback::for_update(
+    let mut patch = writeback::for_update(
         &current,
         &renderer.wire(&current),
         &incoming,
         renderer.config(),
     );
+    if moving {
+        info!(resource = name, key, %object_id, from = ?located.served_by, to = ?located.member_id, "caldav put: moving the task to this calendar");
+        patch.assignees = Some(handed_over(
+            &current.assignees,
+            located.served_by.as_deref(),
+            located.member_id.as_deref(),
+        ));
+    }
     if patch.is_empty() {
         info!(resource = name, %object_id, "caldav put: nothing changed");
     } else {
@@ -442,7 +813,26 @@ async fn put(state: &AppState, name: &str, headers: &HeaderMap, body: &str) -> R
         }
         state.feed.invalidate();
     }
-    written(state, &object_id, StatusCode::NO_CONTENT).await
+    let code = if moving {
+        StatusCode::CREATED
+    } else {
+        StatusCode::NO_CONTENT
+    };
+    written(state, &object_id, code).await
+}
+
+/// The assignees once a task moves from one person's calendar to another's:
+/// the first leaves the task and the second comes first, which is whose
+/// calendar serves it. `None` is the unassigned, which adds nobody.
+fn handed_over(current: &[String], from: Option<&str>, to: Option<&str>) -> Vec<String> {
+    let mut assignees: Vec<String> = to.map(String::from).into_iter().collect();
+    assignees.extend(
+        current
+            .iter()
+            .filter(|id| Some(id.as_str()) != from && Some(id.as_str()) != to)
+            .cloned(),
+    );
+    assignees
 }
 
 async fn create(
@@ -450,6 +840,7 @@ async fn create(
     name: &str,
     if_match: Option<String>,
     incoming: &writeback::Incoming,
+    member_id: Option<String>,
 ) -> Response {
     let writer = state.writer.as_ref().expect("routed only with a writer");
     if if_match.is_some() {
@@ -475,7 +866,9 @@ async fn create(
             .body(Body::from("resource name must be derived from the UID"))
             .expect("static response");
     }
-    let patch = writeback::for_create(incoming, state.feed.renderer().config());
+    let mut patch = writeback::for_create(incoming, state.feed.renderer().config());
+    // A task created in a person's calendar is theirs.
+    patch.assignees = member_id.map(|id| vec![id]);
     info!(resource = name, %uid, ?patch, "caldav put: creating task");
     let object_id = match writer.create_task(&uid, &patch).await {
         Ok(id) => id,
@@ -505,16 +898,34 @@ async fn written(state: &AppState, object_id: &str, code: StatusCode) -> Respons
     builder.body(Body::empty()).expect("static response")
 }
 
-async fn delete(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
+/// In the flat calendar and among the unassigned a DELETE archives the task.
+/// In a person's calendar it takes that person off the task: what someone means
+/// by deleting from their own calendar is "not mine", and the task moves to the
+/// next assignee's calendar or to the unassigned.
+async fn delete(
+    state: &AppState,
+    reader: &Reader,
+    key: &str,
+    name: &str,
+    headers: &HeaderMap,
+) -> Response {
     let writer = state.writer.as_ref().expect("routed only with a writer");
     let if_match = header_text(headers, header::IF_MATCH).filter(|v| v != "*");
-    let object_id = match locate(state, name).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            info!(resource = name, "caldav delete: already gone");
+    let located = match locate(state, reader, key, name, None).await {
+        Ok(located) => located,
+        Err(response) => return *response,
+    };
+    let object_id = match located.object_id {
+        Some(id) if located.here => id,
+        // Moved to another calendar, as the second half of a move does.
+        Some(id) => {
+            info!(resource = name, key, object_id = %id, "caldav delete: the task is in another calendar now");
+            return status(StatusCode::NO_CONTENT);
+        }
+        None => {
+            info!(resource = name, key, "caldav delete: already gone");
             return status(StatusCode::NOT_FOUND);
         }
-        Err(response) => return *response,
     };
     let current = match writer.get_task(&object_id).await {
         Ok(Some(task)) => task,
@@ -531,9 +942,26 @@ async fn delete(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
         warn!(resource = name, %object_id, client_etag = %expected, server_etag = %current_etag, "caldav delete: stale etag");
         return precondition_failed("etag mismatch");
     }
-    info!(resource = name, %object_id, task = %current.name, "caldav delete: archiving task");
-    if let Err(err) = writer.archive_task(&object_id).await {
-        return source_failure(&err);
+    if let Some(member_id) = &located.member_id {
+        let remaining: Vec<String> = current
+            .assignees
+            .iter()
+            .filter(|id| *id != member_id)
+            .cloned()
+            .collect();
+        info!(resource = name, %object_id, task = %current.name, %member_id, left = remaining.len(), "caldav delete: removing the assignee");
+        let patch = writeback::Patch {
+            assignees: Some(remaining),
+            ..Default::default()
+        };
+        if let Err(err) = writer.update_task(&object_id, &patch).await {
+            return source_failure(&err);
+        }
+    } else {
+        info!(resource = name, %object_id, task = %current.name, "caldav delete: archiving task");
+        if let Err(err) = writer.archive_task(&object_id).await {
+            return source_failure(&err);
+        }
     }
     state.feed.invalidate();
     status(StatusCode::NO_CONTENT)
@@ -541,9 +969,9 @@ async fn delete(state: &AppState, name: &str, headers: &HeaderMap) -> Response {
 
 // ---------------------------------------------------------------- settings
 
-fn settings_collection_props(store: &StateStore) -> Vec<String> {
+fn settings_collection_props(store: &StateStore, storage: &str) -> Vec<String> {
     let ctag = store
-        .documents(SETTINGS)
+        .documents(storage)
         .map(|documents| {
             etag_for(
                 &documents
@@ -554,7 +982,7 @@ fn settings_collection_props(store: &StateStore) -> Vec<String> {
             )
         })
         .unwrap_or_else(|_| "\"unknown\"".to_string());
-    let mut props = collection_props("VEVENT", SETTINGS_DISPLAY_NAME, &ctag, true);
+    let mut props = collection_props(&["VEVENT"], SETTINGS_DISPLAY_NAME, &ctag, true);
     // The marker Calino looks for; without it the client makes a calendar of
     // its own, which this server does not allow.
     props.push(format!(
@@ -567,8 +995,11 @@ fn document_name(path: &str) -> Option<&str> {
     resource_name_in(path, SETTINGS)
 }
 
+/// `storage` is where this reader's documents are kept (`Reader::settings_storage`);
+/// the path a client sees is the same for everyone.
 fn settings_route(
     store: &StateStore,
+    storage: &str,
     method: &Method,
     path: &str,
     depth: &str,
@@ -576,10 +1007,13 @@ fn settings_route(
     body: &str,
 ) -> Response {
     let name = document_name(path).map(str::to_string);
-    let documents = |store: &StateStore| store.documents(SETTINGS).unwrap_or_default();
+    let documents = |store: &StateStore| store.documents(storage).unwrap_or_default();
     match (method.as_str(), path, name) {
         ("PROPFIND", SETTINGS, _) => {
-            let mut responses = vec![response(SETTINGS, &settings_collection_props(store))];
+            let mut responses = vec![response(
+                SETTINGS,
+                &settings_collection_props(store, storage),
+            )];
             if depth == "1" {
                 responses.extend(documents(store).into_iter().map(|(name, body)| {
                     response(
@@ -611,7 +1045,7 @@ fn settings_route(
         // is told the write went nowhere rather than that it failed.
         ("PROPPATCH", SETTINGS, _) => multistatus(vec![response(SETTINGS, &[])]),
         ("GET" | "HEAD" | "PROPFIND", _, Some(name)) => {
-            let Some(body) = store.document(SETTINGS, &name).ok().flatten() else {
+            let Some(body) = store.document(storage, &name).ok().flatten() else {
                 debug!(resource = %name, "caldav settings document not found");
                 return status(StatusCode::NOT_FOUND);
             };
@@ -639,7 +1073,7 @@ fn settings_route(
                 warn!(resource = %name, bytes = body.len(), "caldav settings document too large");
                 return status(StatusCode::PAYLOAD_TOO_LARGE);
             }
-            let current = store.document(SETTINGS, &name).ok().flatten();
+            let current = store.document(storage, &name).ok().flatten();
             let if_match = header_text(headers, header::IF_MATCH).filter(|v| v != "*");
             let if_none_match = header_text(headers, header::IF_NONE_MATCH);
             if if_none_match.as_deref() == Some("*") && current.is_some() {
@@ -652,7 +1086,7 @@ fn settings_route(
                     return precondition_failed("etag mismatch");
                 }
             }
-            if let Err(err) = store.put_document(SETTINGS, &name, body) {
+            if let Err(err) = store.put_document(storage, &name, body) {
                 error!(resource = %name, error = %err, "caldav settings put failed");
                 return status(StatusCode::INTERNAL_SERVER_ERROR);
             }
@@ -668,7 +1102,7 @@ fn settings_route(
                 .body(Body::empty())
                 .expect("valid response")
         }
-        ("DELETE", _, Some(name)) => match store.delete_document(SETTINGS, &name) {
+        ("DELETE", _, Some(name)) => match store.delete_document(storage, &name) {
             Ok(true) => {
                 info!(resource = %name, "caldav settings document deleted");
                 status(StatusCode::NO_CONTENT)
@@ -690,9 +1124,11 @@ fn settings_route(
 
 /// Every request under `events/`. Mirrors the task collection: the snapshot
 /// serves reads, a fresh read of the object decides write preconditions.
+#[allow(clippy::too_many_arguments)]
 async fn events_route(
     state: &AppState,
     service: &EventService,
+    names: &str,
     method: &Method,
     path: &str,
     depth: &str,
@@ -706,11 +1142,16 @@ async fn events_route(
             Ok(snapshot) => {
                 let mut responses = vec![response(
                     EVENTS,
-                    &collection_props("VEVENT", "События", &snapshot.ctag, writable),
+                    &collection_props(
+                        &["VEVENT"],
+                        &named(state, names, EVENTS, &state.calendar_names.events),
+                        &snapshot.ctag,
+                        writable,
+                    ),
                 )];
                 if depth == "1" {
                     responses.extend(snapshot.objects.iter().map(|(name, resource)| {
-                        response(&event_href(name), &[prop_text("d:getetag", &resource.etag)])
+                        response(&event_href(name), &member_props(&resource.etag))
                     }));
                 }
                 multistatus(responses)
@@ -764,7 +1205,7 @@ async fn events_route(
             if method.as_str() == "PROPFIND" {
                 return multistatus(vec![response(
                     &event_href(&name),
-                    &[prop_text("d:getetag", &resource.etag)],
+                    &member_props(&resource.etag),
                 )]);
             }
             let body = if method == Method::HEAD {
@@ -1174,12 +1615,31 @@ fn report_kind(body: &str) -> Report {
     }
 }
 
-fn collection_props(component: &str, name: &str, ctag: &str, writable: bool) -> Vec<String> {
+/// What the flat collection declares and its ctag: tasks alone, or tasks and
+/// the events merged into it, whose ctag then moves with either.
+fn flat_contents(
+    tasks_ctag: &str,
+    events: Option<&ev::EventSnapshot>,
+) -> (&'static [&'static str], String) {
+    match events {
+        Some(events) => (
+            &["VTODO", "VEVENT"],
+            etag_for(&format!("{tasks_ctag},{}", events.ctag)),
+        ),
+        None => (&["VTODO"], tasks_ctag.to_string()),
+    }
+}
+
+fn collection_props(components: &[&str], name: &str, ctag: &str, writable: bool) -> Vec<String> {
+    let components: String = components
+        .iter()
+        .map(|component| format!("<c:comp name=\"{component}\"/>"))
+        .collect();
     vec![
         "<d:resourcetype><d:collection/><c:calendar/></d:resourcetype>".to_string(),
         prop_text("d:displayname", name),
         format!(
-            "<c:supported-calendar-component-set><c:comp name=\"{component}\"/></c:supported-calendar-component-set>"
+            "<c:supported-calendar-component-set>{components}</c:supported-calendar-component-set>"
         ),
         // Changes whenever any member changes, so Calino can skip an unchanged
         // collection without listing it.
@@ -1192,11 +1652,102 @@ fn collection_props(component: &str, name: &str, ctag: &str, writable: bool) -> 
     ]
 }
 
-/// `/dav/calendars/tasks/<name>.ics` → `<name>`. A name is an object id or a
-/// name Calino derived from a UID, so only `[A-Za-z0-9._~-]` is accepted; `..`
-/// and anything path-like is refused rather than looked up.
-fn object_id(path: &str) -> Option<&str> {
-    resource_name_in(path, TASKS)
+/// The task collection a path addresses: the key that follows `tasks-`, or the
+/// empty string for the flat one. A key is a digest or the reserved
+/// `unassigned`, so anything else is not a task path at all.
+fn tasks_key(path: &str) -> Option<&str> {
+    if path.starts_with(TASKS) {
+        return Some("");
+    }
+    let (key, _) = path.strip_prefix(TASKS_PREFIX)?.split_once('/')?;
+    key.chars()
+        .all(|c| c.is_ascii_alphanumeric())
+        .then_some(key)
+}
+
+/// The name a reader gave a calendar, or the one the server gives it.
+fn named(state: &AppState, names: &str, path: &str, default: &str) -> String {
+    state
+        .documents
+        .as_ref()
+        .and_then(|store| store.document(names, path).ok().flatten())
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// A task or event collection, which a reader may rename.
+fn is_calendar(path: &str) -> bool {
+    path == EVENTS || tasks_key(path).is_some_and(|key| collection_path(key) == path)
+}
+
+/// Keeps the name a reader gave a calendar. Calino renames with a PROPPATCH
+/// of `displayname` alone and reads the name back on every sync, so a name the
+/// server does not keep is gone by the next one. An empty name, or a
+/// `displayname` under `remove`, returns the calendar to its own name.
+fn rename(store: &StateStore, names: &str, path: &str, body: &str) -> Response {
+    let Some(name) = display_name(body) else {
+        info!(path, "caldav proppatch without a displayname refused");
+        return status(StatusCode::FORBIDDEN);
+    };
+    let name = name.trim();
+    let stored = if name.is_empty() {
+        store.delete_document(names, path).map(|_| ())
+    } else {
+        store.put_document(names, path, name)
+    };
+    if let Err(err) = stored {
+        warn!(path, %err, "caldav rename not stored");
+        return status(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    info!(path, name, "caldav calendar renamed");
+    multistatus(vec![response(path, &["<d:displayname/>".to_string()])])
+}
+
+/// The text of the first `displayname` element in a request body, whatever
+/// its namespace prefix; empty for `<displayname/>`.
+fn display_name(body: &str) -> Option<String> {
+    let mut rest = body;
+    loop {
+        let at = rest.find("displayname")?;
+        let before = rest[..at].chars().next_back();
+        let after = &rest[at + "displayname".len()..];
+        rest = after;
+        if !matches!(before, Some('<' | ':')) || !after.starts_with(['>', ' ', '/']) {
+            continue;
+        }
+        let open_end = after.find('>')?;
+        if after[..open_end].ends_with('/') {
+            return Some(String::new());
+        }
+        let text = &after[open_end + 1..];
+        let text = &text[..text.find('<')?];
+        return Some(unescape(text));
+    }
+}
+
+fn unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn collection_path(key: &str) -> String {
+    if key.is_empty() {
+        TASKS.to_string()
+    } else {
+        format!("{TASKS_PREFIX}{key}/")
+    }
+}
+
+/// `/dav/calendars/tasks/<name>.ics` → `("", <name>)`. A name is an object id
+/// or a name Calino derived from a UID, so only `[A-Za-z0-9._~-]` is accepted;
+/// `..` and anything path-like is refused rather than looked up.
+fn object_id(path: &str) -> Option<(&str, &str)> {
+    let key = tasks_key(path)?;
+    let name = resource_name_in(path, &collection_path(key))?;
+    Some((key, name))
 }
 
 fn resource_name_in<'a>(path: &'a str, collection: &str) -> Option<&'a str> {
@@ -1207,8 +1758,8 @@ fn resource_name_in<'a>(path: &'a str, collection: &str) -> Option<&'a str> {
     (!name.is_empty() && plain && !name.contains("..")).then_some(name)
 }
 
-fn href_for(object_id: &str) -> String {
-    format!("{TASKS}{object_id}.ics")
+fn href_for(key: &str, object_id: &str) -> String {
+    format!("{}{object_id}.ics", collection_path(key))
 }
 
 /// Collections are addressed with a trailing slash; accept them without one.
@@ -1217,9 +1768,16 @@ fn normalize(path: &str) -> String {
         "/dav"
         | "/dav/principal"
         | "/dav/calendars"
-        | "/dav/calendars/tasks"
         | "/dav/calendars/events"
         | "/dav/calendars/calino-settings" => format!("{path}/"),
+        // There is one task collection per assignee, so they cannot be listed.
+        other
+            if other
+                .strip_prefix("/dav/calendars/tasks")
+                .is_some_and(|rest| !rest.contains('/')) =>
+        {
+            format!("{other}/")
+        }
         other => other.to_string(),
     }
 }
@@ -1230,6 +1788,15 @@ fn response(href: &str, props: &[String]) -> String {
         escape(href),
         props.concat()
     )
+}
+
+/// What a PROPFIND tells of a task or an event. Thunderbird fetches only the
+/// members listed as `text/calendar` (`CalDavRequestHandlers.sys.mjs`).
+fn member_props(etag: &str) -> [String; 2] {
+    [
+        prop_text("d:getetag", etag),
+        prop_text("d:getcontenttype", "text/calendar"),
+    ]
 }
 
 fn prop_text(name: &str, value: &str) -> String {
@@ -1326,15 +1893,37 @@ mod tests {
     fn only_plain_object_ids_are_resources() {
         assert_eq!(
             object_id("/dav/calendars/tasks/bafyreiabc123.ics"),
-            Some("bafyreiabc123")
+            Some(("", "bafyreiabc123"))
         );
         assert_eq!(object_id("/dav/calendars/tasks/../x.ics"), None);
         assert_eq!(
             object_id("/dav/calendars/tasks/0b9a4f2c-5d1e-4c3a-9f7e-2a6b8c1d0e3f.ics"),
-            Some("0b9a4f2c-5d1e-4c3a-9f7e-2a6b8c1d0e3f")
+            Some(("", "0b9a4f2c-5d1e-4c3a-9f7e-2a6b8c1d0e3f"))
         );
         assert_eq!(object_id("/dav/calendars/tasks/.ics"), None);
         assert_eq!(object_id("/dav/calendars/tasks/abc"), None);
+    }
+
+    #[test]
+    fn a_grouped_collection_carries_its_key() {
+        assert_eq!(tasks_key("/dav/calendars/tasks/"), Some(""));
+        assert_eq!(
+            tasks_key("/dav/calendars/tasks-a1b2c3d4e5f6/"),
+            Some("a1b2c3d4e5f6")
+        );
+        assert_eq!(
+            tasks_key("/dav/calendars/tasks-unassigned/"),
+            Some("unassigned")
+        );
+        assert_eq!(tasks_key("/dav/calendars/tasks-a1b2"), None);
+        assert_eq!(tasks_key("/dav/calendars/events/"), None);
+        // A key with a path behind it names no collection and no resource, so
+        // both the collection arms and the member arms miss it.
+        assert_eq!(object_id("/dav/calendars/tasks-a1b2/../x.ics"), None);
+        assert_eq!(
+            object_id("/dav/calendars/tasks-unassigned/bafyreiabc123.ics"),
+            Some(("unassigned", "bafyreiabc123"))
+        );
     }
 
     #[test]

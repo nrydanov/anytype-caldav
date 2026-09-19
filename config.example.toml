@@ -27,6 +27,11 @@ done      = "key:done"
 # Optional. A select/multi-select whose option names become CATEGORIES, one
 # line per tag. Calino colours tasks by category name.
 # tags = "id:<opaque-id>"
+# Optional. An `objects` property holding the people a task is assigned to.
+# Configuring it adds a calendar per person beside the flat one, named from the
+# space's own `profile` objects; without it every task is served from the flat
+# calendar only.
+# assignee = "key:assignee"
 
 [calendar]
 timezone = "Europe/Saratov"
@@ -90,6 +95,9 @@ all_day_time = "09:00"
 
 # CalDAV facade under /dav/, for a calendar app such as Calino. The password
 # comes from CALDAV_PASSWORD, next to the Anytype API key.
+# With ACCOUNTS_SECRET set beside it and `properties.assignee` configured, every
+# person of the space also has an account of their own, derived from that
+# secret; `exporter users` prints them.
 # [caldav]
 # enabled = true
 # username = "anytype"
@@ -98,6 +106,15 @@ all_day_time = "09:00"
 # writable = true
 # Serve objects of type `event` as a second collection, events/.
 # events = true
+# Serve events inside the task calendar instead of events/, so the space shows
+# as one calendar. Only the flat calendar is affected: with tasks split by
+# assignee, events stay in events/. Needs events = true.
+# events_in_tasks = true
+# What the task calendar and the events calendar are called. A name set in the
+# calendar app replaces these for that login only. Calendars per assignee take
+# the person's name from the space.
+# tasks_name = "Anytype"
+# events_name = "События"
 # Store the client's own settings documents, outside Anytype. Needs
 # push.state_file, which holds the database they are kept in.
 # settings = true

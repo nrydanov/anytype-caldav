@@ -13,6 +13,7 @@ chrono-tz = "0.10.4"
 clap = { version = "4.6.6", features = ["derive"] }
 futures = "0.3.34"
 hex = "0.4.3"
+hmac = "0.13"
 http = "1.5.0"
 httpdate = "1.0.3"
 humantime = "2.3.0"

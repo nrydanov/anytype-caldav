@@ -19,10 +19,32 @@ use crate::{
     writeback::Patch,
 };
 
+/// The bundled type of the objects a space keeps for the people in it.
+const PROFILE_TYPE_KEY: &str = "profile";
+
+/// Space memberships are addressed as `_participant_<space>_<identity>`.
+const PARTICIPANT_PREFIX: &str = "_participant_";
+
+/// The people a task can be assigned to, read once per refresh.
+#[derive(Default)]
+struct Directory {
+    /// Display name by the id a calendar is keyed on.
+    names: BTreeMap<String, String>,
+    /// Membership id to the id of that person's own object, so that one person
+    /// gets one calendar however a task addresses them.
+    profiles_by_participant: BTreeMap<String, String>,
+    /// The people who may sign in.
+    account_holders: std::collections::BTreeSet<String>,
+}
+
 pub struct AnytypeTaskSource {
     client: AnytypeClient,
     config: AnytypeConfig,
     properties: PropertiesConfig,
+    /// Membership id to the person's own object, as of the last listing. A
+    /// single task read before a write is normalized through it, so that the
+    /// write compares the same ids the calendars are keyed by.
+    profiles_by_participant: std::sync::RwLock<BTreeMap<String, String>>,
 }
 
 /// Builds the SDK client.
@@ -52,7 +74,21 @@ impl AnytypeTaskSource {
             client,
             config,
             properties,
+            profiles_by_participant: Default::default(),
         })
+    }
+
+    /// One person, one id, however a task addresses them.
+    fn normalize_assignees(&self, task: &mut Task) {
+        let table = self
+            .profiles_by_participant
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for assignee in &mut task.assignees {
+            if let Some(profile) = table.get(assignee) {
+                *assignee = profile.clone();
+            }
+        }
     }
 }
 
@@ -99,10 +135,24 @@ impl TaskSource for AnytypeTaskSource {
         for object in live {
             batch.tasks.push(self.to_task(object, &mut batch.warnings)?);
         }
+        if self.properties.assignee.is_some() {
+            let directory = self.read_directory().await?;
+            *self
+                .profiles_by_participant
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                directory.profiles_by_participant;
+            for task in &mut batch.tasks {
+                self.normalize_assignees(task);
+            }
+            batch.members = directory.names;
+            batch.account_holders = directory.account_holders;
+        }
         debug!(
             objects = objects.len(),
             archived,
             tasks = batch.tasks.len(),
+            members = batch.members.len(),
             warnings = batch.warnings.len(),
             done = batch.tasks.iter().filter(|t| t.done).count(),
             elapsed_ms = started.elapsed().as_millis(),
@@ -140,7 +190,8 @@ impl TaskWriter for AnytypeTaskSource {
             return Ok(None);
         }
         let mut warnings = Vec::new();
-        let task = self.to_task(&object, &mut warnings)?;
+        let mut task = self.to_task(&object, &mut warnings)?;
+        self.normalize_assignees(&mut task);
         for warning in warnings {
             warn!(%warning, "anytype get task reported a malformed value");
         }
@@ -164,6 +215,9 @@ impl TaskWriter for AnytypeTaskSource {
         }
         if let Some(tags) = self.tag_property(patch).await? {
             request = request.add_property(tags);
+        }
+        if let Some(assignees) = self.assignee_property(patch).await? {
+            request = request.add_property(assignees);
         }
         info!(object_id, ?patch, "anytype update task started");
         request.update().await.map_err(|err| {
@@ -190,6 +244,9 @@ impl TaskWriter for AnytypeTaskSource {
         }
         if let Some(tags) = self.tag_property(patch).await? {
             request = request.add_property(tags);
+        }
+        if let Some(assignees) = self.assignee_property(patch).await? {
+            request = request.add_property(assignees);
         }
         info!(uid, ?patch, "anytype create task started");
         let object = request.create().await.map_err(|err| {
@@ -241,8 +298,33 @@ impl AnytypeTaskSource {
         let (Some(names), Some(selector)) = (&patch.tags, &self.properties.tags) else {
             return Ok(None);
         };
-        let key = match selector {
-            PropertySelector::Key(key) => key.clone(),
+        let key = self.property_key(selector, "tags").await?;
+        let ids =
+            crate::events::option_ids(&self.client, &self.config.space_id, &key, names).await?;
+        Ok(Some(serde_json::json!({ "key": key, "multi_select": ids })))
+    }
+
+    /// The assignee property of a patch. Unlike a tag there is nothing to
+    /// create when an id is unknown: Anytype refuses the write.
+    async fn assignee_property(
+        &self,
+        patch: &Patch,
+    ) -> Result<Option<serde_json::Value>, SourceError> {
+        let (Some(ids), Some(selector)) = (&patch.assignees, &self.properties.assignee) else {
+            return Ok(None);
+        };
+        let key = self.property_key(selector, "assignee").await?;
+        Ok(Some(serde_json::json!({ "key": key, "objects": ids })))
+    }
+
+    /// The key a selector names, which is what the write API takes.
+    async fn property_key(
+        &self,
+        selector: &PropertySelector,
+        role: &str,
+    ) -> Result<String, SourceError> {
+        match selector {
+            PropertySelector::Key(key) => Ok(key.clone()),
             PropertySelector::Id(id) => self
                 .client
                 .properties(&self.config.space_id)
@@ -255,11 +337,8 @@ impl AnytypeTaskSource {
                 .into_iter()
                 .find(|property| &property.id == id)
                 .map(|property| property.key)
-                .ok_or_else(|| SourceError::Schema(format!("tags property {id} not found")))?,
-        };
-        let ids =
-            crate::events::option_ids(&self.client, &self.config.space_id, &key, names).await?;
-        Ok(Some(serde_json::json!({ "key": key, "multi_select": ids })))
+                .ok_or_else(|| SourceError::Schema(format!("{role} property {id} not found"))),
+        }
     }
 
     /// Fails loudly when a configured selector matches nothing.
@@ -353,6 +432,77 @@ impl AnytypeTaskSource {
         )))
     }
 
+    /// The space's directory of people, which is what the assignee calendars
+    /// are keyed by.
+    ///
+    /// Objects of type `profile` rather than the space's members: a member
+    /// carries nothing but a name and does not survive moving a space between
+    /// servers, so a space keeps objects of its own for the people in it, and
+    /// that is what an assignee relation points at. The members list is a
+    /// fallback for someone who has no object of their own.
+    async fn read_directory(&self) -> Result<Directory, SourceError> {
+        let paged = self
+            .client
+            .search_in(&self.config.space_id)
+            .types([PROFILE_TYPE_KEY])
+            .execute()
+            .await
+            .map_err(|err| SourceError::Transport(err.to_string()))?;
+        let mut stream = paged.into_stream();
+        let mut directory = Directory::default();
+        while let Some(item) = stream.next().await {
+            let object = item.map_err(|err| SourceError::Transport(err.to_string()))?;
+            if object.archived {
+                continue;
+            }
+            // A person's own page links their space membership, and that is the
+            // only bridge between the two id forms an assignee can hold.
+            if let Some(PropertyValue::Objects { objects }) =
+                object.get_property("links").map(|property| &property.value)
+            {
+                for participant in objects
+                    .iter()
+                    .filter(|link| link.starts_with(PARTICIPANT_PREFIX))
+                {
+                    directory
+                        .profiles_by_participant
+                        .insert(participant.clone(), object.id.clone());
+                }
+            }
+            let name = object
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&object.id)
+                .to_string();
+            directory.names.insert(object.id, name);
+        }
+
+        let members = self
+            .client
+            .members(&self.config.space_id)
+            .list()
+            .await
+            .map_err(|err| SourceError::Transport(err.to_string()))?
+            .collect_all()
+            .await
+            .map_err(|err| SourceError::Transport(err.to_string()))?;
+        for member in members.into_iter().filter(|member| member.is_active()) {
+            // Their tasks are normalized onto the object, so an entry here
+            // would only add a second, empty calendar for the same person.
+            // An active member behind an object is also what an account takes:
+            // leaving the space closes it at the next refresh.
+            if let Some(profile) = directory.profiles_by_participant.get(&member.id) {
+                directory.account_holders.insert(profile.clone());
+                continue;
+            }
+            let name = member.display_name().to_string();
+            directory.names.insert(member.id, name);
+        }
+        Ok(directory)
+    }
+
     fn to_task(&self, object: &Object, warnings: &mut Vec<String>) -> Result<Task, SourceError> {
         let name = object
             .name
@@ -369,6 +519,7 @@ impl AnytypeTaskSource {
         let done = self.read_done(object)?;
         let reminder_leads = self.read_reminder_leads(object, warnings)?;
         let tags = self.read_tags(object, warnings)?;
+        let assignees = self.read_assignees(object, warnings)?;
         let ical_uid = match object.get_property("ical_uid").map(|p| &p.value) {
             Some(PropertyValue::Text { text }) if !text.trim().is_empty() => {
                 Some(text.trim().to_string())
@@ -388,10 +539,42 @@ impl AnytypeTaskSource {
             done,
             reminder_leads,
             tags,
+            assignees,
             ical_uid,
             object_url: Some(object.get_link()),
             last_modified,
         })
+    }
+
+    /// Reads the ids of the assignee property, if one is configured. A wrong
+    /// format costs the assignees of that task, never the task.
+    fn read_assignees(
+        &self,
+        object: &Object,
+        warnings: &mut Vec<String>,
+    ) -> Result<Vec<String>, SourceError> {
+        let Some(selector) = self.properties.assignee.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let Some(property) = resolve_property(&object.properties, selector, "assignee")? else {
+            return Ok(Vec::new());
+        };
+        let ids: Vec<String> = match &property.value {
+            PropertyValue::Objects { objects } => objects.clone(),
+            other => {
+                warnings.push(format!(
+                    "object {} has assignee of format {:?}, expected objects; assignees omitted",
+                    object.id,
+                    other.format()
+                ));
+                return Ok(Vec::new());
+            }
+        };
+        Ok(ids
+            .into_iter()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect())
     }
 
     /// Reads the per-task lead times, if the property is configured.

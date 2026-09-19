@@ -49,6 +49,10 @@ pub struct Patch {
     pub deadline: Option<Option<String>>,
     /// Option names for the tag property; an empty list clears the tags.
     pub tags: Option<Vec<String>>,
+    /// Ids for the assignee property, replacing what it holds; an empty list
+    /// leaves the task with nobody. Set by the collection a request addresses,
+    /// never read from a calendar body.
+    pub assignees: Option<Vec<String>>,
 }
 
 impl Patch {
@@ -56,6 +60,7 @@ impl Patch {
         self.name.is_none()
             && self.done.is_none()
             && self.tags.is_none()
+            && self.assignees.is_none()
             && self.scheduled.is_none()
             && self.deadline.is_none()
     }
@@ -249,6 +254,7 @@ pub fn for_create(incoming: &Incoming, config: &CalendarConfig) -> Patch {
         scheduled: scheduled.map(|v| to_anytype(v, date_tz)),
         deadline: deadline.map(|v| to_anytype(v, date_tz)),
         tags: (!incoming.categories.is_empty()).then(|| incoming.categories.clone()),
+        assignees: None,
     }
 }
 
@@ -288,6 +294,7 @@ mod tests {
             done: false,
             reminder_leads: vec![],
             tags: vec![],
+            assignees: Vec::new(),
             ical_uid: None,
             object_url: None,
             last_modified: None,

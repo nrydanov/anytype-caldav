@@ -378,6 +378,7 @@ fn event_as_task(event: &Event) -> Task {
         done: false,
         reminder_leads: event.leads(),
         tags: event.tags.clone(),
+        assignees: Vec::new(),
         ical_uid: event.ical_uid.clone(),
         object_url: event.object_url.clone(),
         last_modified: event.last_modified,
@@ -560,6 +561,8 @@ mod tests {
                 SourceStep::Tasks(tasks) => Ok(TaskBatch {
                     tasks,
                     warnings: vec![],
+                    members: Default::default(),
+                    account_holders: Default::default(),
                 }),
                 SourceStep::Fail => Err(SourceError::Transport("scripted failure".into())),
             }
@@ -633,6 +636,7 @@ mod tests {
             done: false,
             reminder_leads: Vec::new(),
             tags: Vec::new(),
+            assignees: Vec::new(),
             ical_uid: None,
             object_url: None,
             last_modified: None,

@@ -100,7 +100,11 @@ struct RawCaldav {
     #[serde(default)]
     events: bool,
     #[serde(default)]
+    events_in_tasks: bool,
+    #[serde(default)]
     settings: bool,
+    tasks_name: Option<String>,
+    events_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,6 +179,7 @@ struct RawProperties {
     done: String,
     reminder: Option<String>,
     tags: Option<String>,
+    assignee: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,8 +304,14 @@ pub struct CaldavConfig {
     pub writable: bool,
     /// Serve objects of type `event` as a second collection, `events/`.
     pub events: bool,
+    /// Serve events inside the flat task collection instead of `events/`, so
+    /// that a space without grouping by assignee shows as one calendar.
+    pub events_in_tasks: bool,
     /// Store the calendar app's own settings documents, outside Anytype.
     pub settings: bool,
+    /// What the flat task collection and `events/` are called for a reader
+    /// who has not renamed them.
+    pub names: crate::caldav::CalendarNames,
 }
 
 /// The recurring-task generator. Off by default: turning it on is the
@@ -366,6 +377,9 @@ pub struct PropertiesConfig {
     pub reminder: Option<PropertySelector>,
     /// Optional tags, written as one `CATEGORIES` line per option name.
     pub tags: Option<PropertySelector>,
+    /// Optional assignee. Configuring it is what turns on the calendar per
+    /// member; without it every task is served from the flat collection only.
+    pub assignee: Option<PropertySelector>,
 }
 
 #[derive(Debug, Clone)]
@@ -472,6 +486,12 @@ impl Config {
             .as_deref()
             .map(|value| PropertySelector::parse("tags", value))
             .transpose()?;
+        let assignee = raw
+            .properties
+            .assignee
+            .as_deref()
+            .map(|value| PropertySelector::parse("assignee", value))
+            .transpose()?;
         // Two selectors pointing at one property would silently map one source
         // value onto two calendar fields.
         let mut selectors = vec![
@@ -484,6 +504,9 @@ impl Config {
         }
         if let Some(tags) = &tags {
             selectors.push(("tags", tags));
+        }
+        if let Some(assignee) = &assignee {
+            selectors.push(("assignee", assignee));
         }
         for (index, (an, a)) in selectors.iter().enumerate() {
             for (bn, b) in &selectors[index + 1..] {
@@ -629,6 +652,23 @@ impl Config {
                 "caldav.enabled is true but caldav.username is not set".into(),
             ));
         }
+        let name = |field: &str, value: &Option<String>, default: String| match value {
+            None => Ok(default),
+            Some(value) if value.trim().is_empty() => Err(ConfigError::Invalid(format!(
+                "caldav.{field} must not be empty"
+            ))),
+            Some(value) => Ok(value.trim().to_string()),
+        };
+        let defaults = crate::caldav::CalendarNames::default();
+        let calendar_names = crate::caldav::CalendarNames {
+            tasks: name("tasks_name", &raw.caldav.tasks_name, defaults.tasks)?,
+            events: name("events_name", &raw.caldav.events_name, defaults.events)?,
+        };
+        if raw.caldav.events_in_tasks && !raw.caldav.events {
+            return Err(ConfigError::Invalid(
+                "caldav.events_in_tasks needs caldav.events = true".into(),
+            ));
+        }
         if raw.series.poll_interval.is_zero() {
             return Err(ConfigError::Invalid(
                 "series.poll_interval must be greater than zero".into(),
@@ -648,6 +688,7 @@ impl Config {
                 done,
                 reminder,
                 tags,
+                assignee,
             },
             calendar: CalendarConfig {
                 timezone,
@@ -689,7 +730,9 @@ impl Config {
                 username: caldav_username,
                 writable: raw.caldav.enabled && raw.caldav.writable,
                 events: raw.caldav.enabled && raw.caldav.events,
+                events_in_tasks: raw.caldav.enabled && raw.caldav.events_in_tasks,
                 settings: raw.caldav.enabled && raw.caldav.settings,
+                names: calendar_names,
             },
         })
     }
@@ -821,6 +864,27 @@ allowed_origins = ["https://calino.io"]
     }
 
     #[test]
+    fn accepts_an_optional_assignee_selector() {
+        let text = base().replace(
+            "done = \"key:done\"",
+            "done = \"key:done\"\nassignee = \"key:assignee\"",
+        );
+        let config = load(&text).expect("valid config");
+        assert_eq!(
+            config.properties.assignee,
+            Some(PropertySelector::Key("assignee".into()))
+        );
+        assert!(
+            load(&base())
+                .expect("valid config")
+                .properties
+                .assignee
+                .is_none(),
+            "absent by default"
+        );
+    }
+
+    #[test]
     fn rejects_a_wildcard_origin() {
         let text = base().replace("[\"https://calino.io\"]", "[\"*\"]");
         let err = load(&text).unwrap_err().to_string();
@@ -949,6 +1013,36 @@ allowed_origins = ["https://calino.io"]
             .unwrap_err()
             .to_string();
         assert!(err.contains("caldav.username"), "{err}");
+    }
+
+    #[test]
+    fn calendar_names_default_to_the_old_ones_and_are_never_empty() {
+        let caldav = "[caldav]\nenabled = true\nusername = \"me\"";
+        let config = load(&format!("{}\n{caldav}", base())).expect("valid");
+        assert_eq!(config.caldav.names.tasks, "Anytype");
+        assert_eq!(config.caldav.names.events, "События");
+        let config = load(&format!(
+            "{}\n{caldav}\ntasks_name = \" Дом \"\nevents_name = \"Команда\"",
+            base()
+        ))
+        .expect("valid");
+        assert_eq!(config.caldav.names.tasks, "Дом");
+        assert_eq!(config.caldav.names.events, "Команда");
+        let err = load(&format!("{}\n{caldav}\ntasks_name = \" \"", base()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("caldav.tasks_name"), "{err}");
+    }
+
+    #[test]
+    fn events_in_tasks_needs_events() {
+        let caldav = "[caldav]\nenabled = true\nusername = \"me\"\nevents_in_tasks = true";
+        let err = load(&format!("{}\n{caldav}", base()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("caldav.events = true"), "{err}");
+        let config = load(&format!("{}\n{caldav}\nevents = true", base())).expect("valid");
+        assert!(config.caldav.events_in_tasks);
     }
 
     #[test]

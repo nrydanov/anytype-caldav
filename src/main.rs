@@ -3,6 +3,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anytype_task_exporter::{
+    accounts::{self, Accounts},
     anytype_source::{AnytypeTaskSource, build_client},
     config::Config,
     feed::FeedService,
@@ -23,6 +24,8 @@ use tracing_subscriber::EnvFilter;
 const API_KEY_ENV: &str = "ANYTYPE_API_KEY";
 /// Environment variable the CalDAV password is read from.
 const CALDAV_PASSWORD_ENV: &str = "CALDAV_PASSWORD";
+/// Environment variable the secret behind every person's password is read from.
+const ACCOUNTS_SECRET_ENV: &str = "ACCOUNTS_SECRET";
 /// Environment variable the SDK's `env` keystore reads the token from.
 const SDK_TOKEN_ENV: &str = "ANYTYPE_KEY_HTTP_TOKEN";
 
@@ -54,6 +57,9 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Print the account of every person in the space: name, username and
+    /// password. Writes nothing, neither to Anytype nor to disk.
+    Users,
 }
 
 fn main() -> std::process::ExitCode {
@@ -124,6 +130,7 @@ fn main() -> std::process::ExitCode {
         None => runtime.block_on(run(config)),
         Some(Command::Init { apply }) => runtime.block_on(init(config, apply)),
         Some(Command::Generate { apply }) => runtime.block_on(generate(config, apply)),
+        Some(Command::Users) => runtime.block_on(users(config)),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -138,6 +145,42 @@ async fn init(config: Config, apply: bool) -> Result<(), Box<dyn std::error::Err
     let client = build_client(&config.anytype)?;
     println!("space {}", config.anytype.space_id);
     install::run(&client, &config.anytype.space_id, apply).await?;
+    Ok(())
+}
+
+/// The passwords are handed out by hand, in private: a person's page is read
+/// by the whole space, so nothing is written there.
+async fn users(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    let secret = std::env::var(ACCOUNTS_SECRET_ENV)
+        .ok()
+        .map(|secret| secret.trim().to_string())
+        .filter(|secret| !secret.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{ACCOUNTS_SECRET_ENV} is not set: put the same value the service runs with \
+                 into the environment, e.g. from ~/.config/anytype-exporter.env"
+            )
+        })?;
+    let accounts = Accounts::new(&secret);
+    let client = build_client(&config.anytype)?;
+    let people = accounts::holders(&client, &config.anytype.space_id).await?;
+    if people.is_empty() {
+        println!("no profile in the space links an active member: nobody has an account");
+        return Ok(());
+    }
+    let width = people
+        .iter()
+        .map(|(_, name)| name.chars().count())
+        .max()
+        .unwrap_or(0);
+    for (id, name) in &people {
+        let pad = " ".repeat(width - name.chars().count());
+        println!(
+            "{name}{pad}  {}  {}",
+            accounts::username(id),
+            accounts.password_of(id)
+        );
+    }
     Ok(())
 }
 
@@ -255,6 +298,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         series_enabled = config.series.enabled,
         series_poll_interval = ?config.series.poll_interval,
         tags_selector = config.properties.tags.is_some(),
+        assignee_selector = config.properties.assignee.is_some(),
         reminder_selector = config.properties.reminder.is_some(),
         "starting anytype-task-exporter"
     );
@@ -366,10 +410,18 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             writable = config.caldav.writable,
             "caldav facade enabled"
         );
-        Some(Arc::new(anytype_task_exporter::caldav::Credentials::new(
-            &config.caldav.username,
-            &password,
-        )))
+        let credentials =
+            anytype_task_exporter::caldav::Credentials::new(&config.caldav.username, &password);
+        // With the secret set, every person of the space also has an account
+        // of their own (`exporter users` prints them).
+        let credentials = match std::env::var(ACCOUNTS_SECRET_ENV) {
+            Ok(secret) if !secret.trim().is_empty() => {
+                info!("caldav accounts per person enabled");
+                credentials.with_accounts(secret.trim())
+            }
+            _ => credentials,
+        };
+        Some(Arc::new(credentials))
     } else {
         None
     };
@@ -409,6 +461,8 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let state = http::AppState {
         documents,
         events,
+        events_in_tasks: config.caldav.events_in_tasks,
+        calendar_names: config.caldav.names.clone(),
         feed,
         allowed_origins: Arc::new(config.server.allowed_origins.clone()),
         caldav,

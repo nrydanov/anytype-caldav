@@ -32,6 +32,10 @@ pub struct AppState {
     pub writer: Option<Arc<dyn crate::source::TaskWriter>>,
     /// Set when events are served as a second collection.
     pub events: Option<Arc<crate::events::EventService>>,
+    /// Events are served inside the flat task collection, not in `events/`.
+    pub events_in_tasks: bool,
+    /// What the calendars are called unless a reader renamed them.
+    pub calendar_names: crate::caldav::CalendarNames,
     /// Set when the client's own documents are stored for it.
     pub documents: Option<Arc<crate::state::StateStore>>,
 }
@@ -310,6 +314,8 @@ async fn capture(State(state): State<AppState>, headers: HeaderMap, body: String
         scheduled: Some(due),
         deadline: None,
         tags: (!capture.tags.is_empty()).then(|| capture.tags.clone()),
+        // A captured thought belongs to nobody until someone sorts it.
+        assignees: None,
     };
     info!(%uid, ?patch, "capture: creating task");
     match writer.create_task(&uid, &patch).await {

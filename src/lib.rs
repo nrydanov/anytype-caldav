@@ -1,5 +1,6 @@
 //! Read-only bridge from one Anytype space to an iCalendar VTODO subscription.
 
+pub mod accounts;
 pub mod anytype_source;
 pub mod caldav;
 pub mod capture;

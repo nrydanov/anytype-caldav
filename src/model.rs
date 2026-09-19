@@ -66,6 +66,11 @@ pub struct Task {
     pub reminder_leads: Vec<chrono::Duration>,
     /// Option names of the tags property, in Anytype's order.
     pub tags: Vec<String>,
+    /// Who the task is assigned to, as ids of the space's directory of people,
+    /// in Anytype's order. A space addresses a person either by an object of
+    /// its own or by a space member, and the source normalizes the two to one
+    /// form. Empty when nobody is assigned or no selector is configured.
+    pub assignees: Vec<String>,
     /// The UID a calendar client gave a task it created. Such a task must stay
     /// reachable under the resource name the client computed from that UID.
     pub ical_uid: Option<String>,
@@ -91,6 +96,14 @@ pub struct TaskBatch {
     /// Values that could not be parsed, reported once per refresh rather than
     /// per object, so a systemic problem is one log line and not thousands.
     pub warnings: Vec<String>,
+    /// The space's directory of people: display name by the id `Task::assignees`
+    /// uses. Empty unless an assignee selector is configured; a calendar is then
+    /// served for everyone here, whether or not they have tasks, so that one
+    /// finished task cannot take a subscribed calendar away.
+    pub members: std::collections::BTreeMap<String, String>,
+    /// Who among `members` may sign in: a person with an object of their own
+    /// that an active member of the space stands behind.
+    pub account_holders: std::collections::BTreeSet<String>,
 }
 
 #[cfg(test)]
@@ -196,6 +209,7 @@ mod tests {
             done: false,
             reminder_leads: Vec::new(),
             tags: Vec::new(),
+            assignees: Vec::new(),
             ical_uid: None,
             object_url: None,
             last_modified: None,

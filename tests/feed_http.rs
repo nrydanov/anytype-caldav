@@ -84,6 +84,8 @@ impl TaskSource for ScriptedSource {
             Step::Ok(tasks) => Ok(TaskBatch {
                 tasks,
                 warnings: Vec::new(),
+                members: Default::default(),
+                account_holders: Default::default(),
             }),
             Step::Fail => Err(SourceError::Transport("scripted failure".into())),
         }
@@ -101,6 +103,7 @@ fn task(id: &str, name: &str) -> Task {
         done: false,
         reminder_leads: Vec::new(),
         tags: Vec::new(),
+        assignees: Vec::new(),
         ical_uid: None,
         object_url: Some(format!("anytype://object?objectId={id}")),
         last_modified: Some(Utc.with_ymd_and_hms(2026, 8, 29, 12, 0, 0).unwrap()),
@@ -149,6 +152,8 @@ fn build_at(
         caldav: None,
         writer: None,
         events: None,
+        events_in_tasks: false,
+        calendar_names: Default::default(),
         documents: None,
     };
     (http::router(state, feed_path), feed)

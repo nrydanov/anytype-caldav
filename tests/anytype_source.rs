@@ -14,6 +14,10 @@ use anytype_task_exporter::{
 use reqwest::StatusCode;
 
 const SPACE: &str = "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+/// A profile object id, the shape an `objects` assignee usually holds.
+const ALICE: &str = "bafyreibbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const ALICE_PARTICIPANT: &str = "_participant_space_alice";
+const CAROL_PARTICIPANT: &str = "_participant_space_carol";
 
 /// The SDK accepts a token only through its keystore, and the `env` store
 /// reads this variable once per client construction.
@@ -31,6 +35,14 @@ fn properties() -> PropertiesConfig {
         done: PropertySelector::Key("done".into()),
         reminder: None,
         tags: None,
+        assignee: None,
+    }
+}
+
+fn properties_with_assignee() -> PropertiesConfig {
+    PropertiesConfig {
+        assignee: Some(PropertySelector::Key("assignee".into())),
+        ..properties()
     }
 }
 
@@ -89,6 +101,66 @@ fn object_with_tags(id: &str, names: &[&str]) -> String {
                 .join(",")
         ),
     )
+}
+
+/// One object whose assignee relation points at the given ids.
+fn object_with_assignees(id: &str, assignees: &[&str]) -> String {
+    let ids = assignees
+        .iter()
+        .map(|id| format!("\"{id}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    object_with_reminders(id, &[]).replace(
+        r#""multi_select":[]}"#,
+        &format!(
+            r#""multi_select":[]}},
+            {{"name":"Assignee","key":"assignee","id":"p-asg","format":"objects",
+              "objects":[{ids}]}}"#
+        ),
+    )
+}
+
+/// The members endpoint's answer. Ids are the participant form the live API
+/// returns, which is not the form an `objects` assignee usually holds.
+fn members_page(members: &[(&str, &str)]) -> ScriptedHttpResponse {
+    let data = members
+        .iter()
+        .map(|(id, name)| {
+            format!(
+                r#"{{"object":"member","id":"{id}","name":"{name}","icon":null,
+                    "identity":"{id}","global_name":"","status":"active","role":"editor"}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    ScriptedHttpResponse::new(
+        StatusCode::OK,
+        ScriptedHttpContentType::Json,
+        format!(
+            r#"{{"data":[{data}],
+                "pagination":{{"has_more":false,"limit":100,"offset":0,"total":{}}}}}"#,
+            members.len()
+        ),
+    )
+}
+
+/// The space's people, as the `profile` search answers. A person's own page
+/// links their membership, which is what ties the two id forms together.
+fn profiles_page(profiles: &[(&str, &str, Option<&str>)]) -> ScriptedHttpResponse {
+    let data = profiles
+        .iter()
+        .map(|(id, name, participant)| {
+            let links = participant.map(|p| format!(r#""{p}""#)).unwrap_or_default();
+            format!(
+                r#"{{"archived":false,"id":"{id}","space_id":"{SPACE}","name":"{name}",
+                    "type":null,"properties":[
+                      {{"name":"Links","key":"links","id":"p-links","format":"objects",
+                        "objects":[{links}]}}]}}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    page(&data, false, profiles.len())
 }
 
 fn page(objects: &str, has_more: bool, total: usize) -> ScriptedHttpResponse {
@@ -166,6 +238,90 @@ async fn tag_options_become_category_names() {
 
     assert_eq!(batch.tasks[0].tags, vec!["Финансы", "Семья"]);
     assert!(batch.warnings.is_empty(), "{:?}", batch.warnings);
+}
+
+/// One person, one calendar, however a task addresses them: the membership id
+/// is rewritten onto the object the space keeps for that person.
+#[tokio::test]
+async fn an_assignee_is_normalized_onto_the_persons_own_object() {
+    let fixture = ScriptedHttpFixture::start(vec![
+        page(
+            &format!(
+                "{},{}",
+                object_with_assignees("a", &[ALICE_PARTICIPANT]),
+                object_with_assignees("b", &[ALICE])
+            ),
+            false,
+            2,
+        ),
+        profiles_page(&[(ALICE, "Alice", Some(ALICE_PARTICIPANT))]),
+        members_page(&[(ALICE_PARTICIPANT, "alice.any")]),
+    ])
+    .await
+    .expect("fixture starts");
+    let source = source_with(&fixture, 5000, properties_with_assignee()).await;
+
+    let batch = source.list_tasks().await.expect("lists tasks");
+
+    assert_eq!(batch.tasks[0].assignees, vec![ALICE]);
+    assert_eq!(batch.tasks[1].assignees, vec![ALICE]);
+    assert_eq!(batch.members[ALICE], "Alice");
+    assert!(
+        !batch.members.contains_key(ALICE_PARTICIPANT),
+        "the membership would only add a second, empty calendar: {:?}",
+        batch.members
+    );
+    assert!(
+        batch.account_holders.contains(ALICE),
+        "an active member stands behind her object, so she may sign in"
+    );
+    assert!(batch.warnings.is_empty(), "{:?}", batch.warnings);
+}
+
+/// Somebody the space has no object for still gets a name and a calendar, and
+/// keeps the membership id, because nothing else identifies them.
+#[tokio::test]
+async fn a_member_without_an_object_of_their_own_keeps_the_membership_id() {
+    let fixture = ScriptedHttpFixture::start(vec![
+        page(&object_with_assignees("a", &[CAROL_PARTICIPANT]), false, 1),
+        profiles_page(&[(ALICE, "Alice", Some(ALICE_PARTICIPANT))]),
+        members_page(&[(CAROL_PARTICIPANT, "Carol")]),
+    ])
+    .await
+    .expect("fixture starts");
+    let source = source_with(&fixture, 5000, properties_with_assignee()).await;
+
+    let batch = source.list_tasks().await.expect("lists tasks");
+
+    assert_eq!(batch.tasks[0].assignees, vec![CAROL_PARTICIPANT]);
+    assert_eq!(batch.members[CAROL_PARTICIPANT], "Carol");
+    assert_eq!(
+        batch.members[ALICE], "Alice",
+        "a person with no tasks still gets a calendar"
+    );
+    // Alice's membership is not in the space any more, and Carol has no object
+    // of her own to keep an account under.
+    assert!(
+        batch.account_holders.is_empty(),
+        "{:?}",
+        batch.account_holders
+    );
+}
+
+/// Without the selector the relation is not read at all, and no member lookup
+/// is made — the fixture would run out of scripted responses if one were.
+#[tokio::test]
+async fn assignees_are_ignored_when_the_property_is_not_configured() {
+    let fixture =
+        ScriptedHttpFixture::start(vec![page(&object_with_assignees("a", &[ALICE]), false, 1)])
+            .await
+            .expect("fixture starts");
+    let source = source_for(&fixture, 5000).await;
+
+    let batch = source.list_tasks().await.expect("lists tasks");
+
+    assert!(batch.tasks[0].assignees.is_empty());
+    assert!(batch.members.is_empty());
 }
 
 #[tokio::test]
