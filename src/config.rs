@@ -107,15 +107,21 @@ struct RawCaldav {
 struct RawSeries {
     #[serde(default)]
     enabled: bool,
+    #[serde(default)]
+    events: bool,
     #[serde(default = "default_series_poll_interval", with = "humantime_serde")]
     poll_interval: Duration,
+    #[serde(default, with = "humantime_serde")]
+    horizon: Duration,
 }
 
 impl Default for RawSeries {
     fn default() -> Self {
         Self {
             enabled: false,
+            events: false,
             poll_interval: default_series_poll_interval(),
+            horizon: Duration::ZERO,
         }
     }
 }
@@ -302,6 +308,10 @@ pub struct CaldavConfig {
 #[derive(Debug, Clone)]
 pub struct SeriesConfig {
     pub enabled: bool,
+    /// Generate events from `recurring_event` series, apart from tasks.
+    pub events: bool,
+    /// How far ahead occurrences are made; zero makes the next one alone.
+    pub horizon: chrono::Duration,
     pub poll_interval: Duration,
 }
 
@@ -598,6 +608,15 @@ impl Config {
                 "series.enabled is true but push.state_file is not set".into(),
             ));
         }
+        let series_horizon = chrono::Duration::from_std(raw.series.horizon)
+            .ok()
+            .filter(|horizon| *horizon <= chrono::Duration::days(366))
+            .ok_or_else(|| ConfigError::Invalid("series.horizon must be at most a year".into()))?;
+        if raw.series.events && push_state_file.is_none() {
+            return Err(ConfigError::Invalid(
+                "series.events is true but push.state_file is not set".into(),
+            ));
+        }
         let caldav_username = raw
             .caldav
             .username
@@ -661,7 +680,9 @@ impl Config {
             },
             series: SeriesConfig {
                 enabled: raw.series.enabled,
+                events: raw.series.events,
                 poll_interval: raw.series.poll_interval,
+                horizon: series_horizon,
             },
             caldav: CaldavConfig {
                 enabled: raw.caldav.enabled,
@@ -910,7 +931,15 @@ allowed_origins = ["https://calino.io"]
     fn the_generator_is_off_unless_asked_for() {
         let config = load(&base()).expect("valid config");
         assert!(!config.series.enabled);
+        assert!(!config.series.events);
+        assert_eq!(config.series.horizon, chrono::Duration::zero());
+        let config = load(&format!("{}\n[series]\nhorizon = \"31d\"", base())).expect("valid");
+        assert_eq!(config.series.horizon, chrono::Duration::days(31));
         assert_eq!(config.series.poll_interval, Duration::from_secs(300));
+        let err = load(&format!("{}\n[series]\nevents = true", base()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("series.events"), "{err}");
     }
 
     #[test]

@@ -142,9 +142,22 @@ async fn init(config: Config, apply: bool) -> Result<(), Box<dyn std::error::Err
 }
 
 async fn generate(config: Config, apply: bool) -> Result<(), Box<dyn std::error::Error>> {
+    generate_kind(&config, series::Kind::Task, apply).await?;
+    if config.series.events {
+        generate_kind(&config, series::Kind::Event, apply).await?;
+    }
+    Ok(())
+}
+
+async fn generate_kind(
+    config: &Config,
+    kind: series::Kind,
+    apply: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let space = AnytypeSeries::new(
         build_client(&config.anytype)?,
         config.anytype.space_id.clone(),
+        kind,
     );
     let tz = config.calendar.timezone;
     let now = Utc::now();
@@ -163,12 +176,14 @@ async fn generate(config: Config, apply: bool) -> Result<(), Box<dyn std::error:
     let all = space.series().await?;
     let instances = space.instances().await?;
     println!(
-        "space {}: {} series, {} instances, today {today}",
+        "space {} ({}): {} series, {} instances, today {today}",
         config.anytype.space_id,
+        kind.series_type(),
         all.len(),
         instances.len()
     );
-    let (planned, warnings) = series::plan(&all, &instances, tz, today);
+    let until = today + config.series.horizon;
+    let (planned, warnings) = series::plan_until(&all, &instances, tz, today, until);
     for warning in &warnings {
         println!("  warn    {warning}");
     }
@@ -199,7 +214,13 @@ async fn generate(config: Config, apply: bool) -> Result<(), Box<dyn std::error:
     match state {
         // The same pass the service runs, claims included.
         Some(state) => {
-            let generator = SeriesGenerator::new(space, state, tz, config.series.poll_interval);
+            let generator = SeriesGenerator::new(
+                space,
+                state,
+                tz,
+                config.series.poll_interval,
+                config.series.horizon,
+            );
             let created = generator.check_at(now).await?;
             println!("  created {created}");
         }
@@ -309,23 +330,28 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let durable_state_for_documents = durable_state.clone();
 
-    // Validation guarantees a state file whenever the generator is enabled.
-    let generator_handle = match (config.series.enabled, durable_state) {
-        (true, Some(durable_state)) => {
+    // Validation guarantees a state file whenever a generator is enabled.
+    let mut generator_handles = Vec::new();
+    for (kind, enabled) in [
+        (series::Kind::Task, config.series.enabled),
+        (series::Kind::Event, config.series.events),
+    ] {
+        if let (true, Some(durable_state)) = (enabled, durable_state.clone()) {
             let generator = Arc::new(SeriesGenerator::new(
                 AnytypeSeries::new(
                     build_client(&config.anytype)?,
                     config.anytype.space_id.clone(),
+                    kind,
                 ),
                 durable_state,
                 config.calendar.timezone,
                 config.series.poll_interval,
+                config.series.horizon,
             ));
-            info!(poll_interval = ?config.series.poll_interval, "recurring task generator enabled");
-            Some(tokio::spawn(generator.run()))
+            info!(?kind, poll_interval = ?config.series.poll_interval, horizon_days = config.series.horizon.num_days(), "series generator enabled");
+            generator_handles.push(tokio::spawn(generator.run()));
         }
-        _ => None,
-    };
+    }
 
     let caldav = if config.caldav.enabled {
         let password = std::env::var(CALDAV_PASSWORD_ENV).unwrap_or_default();
@@ -434,7 +460,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         })
         .await;
 
-    for handle in [scheduler_handle, generator_handle].into_iter().flatten() {
+    for handle in scheduler_handle.into_iter().chain(generator_handles) {
         handle.abort();
         let _ = handle.await;
     }

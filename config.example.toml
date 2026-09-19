@@ -75,6 +75,19 @@ all_day_time = "09:00"
 # service worker. See deploy/calino/ for subscribing from inside Calino.
 # app_url = "https://calendar.example/"
 
+# Generator of recurring tasks and events. A `recurring_task` or
+# `recurring_event` object holds the rule and the start; the task or event for
+# the next occurrence is created on the day of the previous one. An event is
+# created from the event template named as its series, or from the event
+# type's only template.
+# Needs push.state_file, which remembers what was created.
+# [series]
+# enabled = true
+# events = true
+# poll_interval = "5m"
+# How far ahead occurrences are made. Unset, only the next one is.
+# horizon = "31d"
+
 # CalDAV facade under /dav/, for a calendar app such as Calino. The password
 # comes from CALDAV_PASSWORD, next to the Anytype API key.
 # [caldav]
