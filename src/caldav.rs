@@ -779,6 +779,12 @@ async fn events_route(
                 .body(body)
                 .expect("valid response")
         }
+        ("PUT", _, Some(name)) if writable && name.ends_with(ev::DEADLINE_SUFFIX) => {
+            put_deadline(service, &name, headers, body).await
+        }
+        ("DELETE", _, Some(name)) if writable && name.ends_with(ev::DEADLINE_SUFFIX) => {
+            delete_deadline(service, &name, headers).await
+        }
         ("PUT", _, Some(name)) if writable => put_event(service, &name, headers, body).await,
         ("DELETE", _, Some(name)) if writable => delete_event(service, &name, headers).await,
         ("PUT" | "DELETE" | "PROPPATCH" | "MKCOL" | "MKCALENDAR" | "MOVE" | "COPY", _, _) => {
@@ -977,6 +983,104 @@ async fn event_written(service: &EventService, object_id: &str, code: StatusCode
         }
     }
     builder.body(Body::empty()).expect("static response")
+}
+
+/// The event behind a deadline's entry, read afresh, once the client's
+/// `If-Match` agrees with that entry as it is now.
+async fn deadline_owner(
+    service: &EventService,
+    name: &str,
+    headers: &HeaderMap,
+) -> Result<ev::Event, Box<Response>> {
+    let if_match = header_text(headers, header::IF_MATCH).filter(|v| v != "*");
+    let Some(object_id) = locate_event(service, name).await? else {
+        // A deadline is made on its event, never on its own.
+        info!(resource = name, "caldav deadline: no such entry");
+        return Err(Box::new(status(StatusCode::NOT_FOUND)));
+    };
+    let current = match service.source.get(&object_id).await {
+        Ok(Some(event)) => event,
+        Ok(None) => {
+            service.invalidate();
+            return Err(Box::new(status(StatusCode::NOT_FOUND)));
+        }
+        Err(err) => return Err(Box::new(source_failure(&err))),
+    };
+    let current_etag = ev::deadline_entry(&current)
+        .and_then(|entry| service.resource(&entry, &[]))
+        .map(|resource| resource.etag);
+    if let Some(expected) = &if_match
+        && Some(expected) != current_etag.as_ref()
+    {
+        warn!(resource = name, %object_id, client_etag = %expected, server_etag = ?current_etag, "caldav deadline: stale etag");
+        return Err(Box::new(precondition_failed("etag mismatch")));
+    }
+    Ok(current)
+}
+
+/// Moving `<name> (дедлайн)` moves the event's deadline to the entry's start.
+/// Nothing else of the entry is written: its name and the rest belong to the
+/// event.
+async fn put_deadline(
+    service: &EventService,
+    name: &str,
+    headers: &HeaderMap,
+    body: &str,
+) -> Response {
+    let current = match deadline_owner(service, name, headers).await {
+        Ok(event) => event,
+        Err(response) => return *response,
+    };
+    let deadline = match ev::parse_event(body) {
+        Ok(incoming) => ev::deadline_from(&incoming, &service.config),
+        Err(err) => {
+            warn!(resource = name, error = %err, "caldav deadline put: unreadable body");
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(err.to_string()))
+                .expect("static response");
+        }
+    };
+    let Some(deadline) = deadline else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("a deadline needs DTSTART"))
+            .expect("static response");
+    };
+    info!(resource = name, object_id = %current.object_id, event = %current.name, %deadline, "caldav deadline put: moving the deadline");
+    let patch = ev::EventPatch {
+        deadline: Some(Some(deadline)),
+        ..Default::default()
+    };
+    if let Err(err) = service.source.update(&current.object_id, &patch).await {
+        return source_failure(&err);
+    }
+    service.invalidate();
+    let mut builder = Response::builder().status(StatusCode::NO_CONTENT);
+    if let Ok(Some(event)) = service.source.get(&current.object_id).await
+        && let Some(resource) = ev::deadline_entry(&event).and_then(|e| service.resource(&e, &[]))
+    {
+        builder = builder.header(header::ETAG, resource.etag);
+    }
+    builder.body(Body::empty()).expect("static response")
+}
+
+/// Deleting `<name> (дедлайн)` clears the event's deadline; the event stays.
+async fn delete_deadline(service: &EventService, name: &str, headers: &HeaderMap) -> Response {
+    let current = match deadline_owner(service, name, headers).await {
+        Ok(event) => event,
+        Err(response) => return *response,
+    };
+    info!(resource = name, object_id = %current.object_id, event = %current.name, "caldav deadline delete: clearing the deadline");
+    let patch = ev::EventPatch {
+        deadline: Some(None),
+        ..Default::default()
+    };
+    if let Err(err) = service.source.update(&current.object_id, &patch).await {
+        return source_failure(&err);
+    }
+    service.invalidate();
+    status(StatusCode::NO_CONTENT)
 }
 
 async fn delete_event(service: &EventService, name: &str, headers: &HeaderMap) -> Response {

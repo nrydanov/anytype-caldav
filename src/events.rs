@@ -59,6 +59,43 @@ pub struct Event {
     pub series: Option<String>,
     /// The occurrence it replaces (its RECURRENCE-ID).
     pub occurrence: Option<AnytypeDate>,
+    /// `deadline`, served as an entry of its own (`deadline_entry`).
+    pub deadline: Option<AnytypeDate>,
+}
+
+/// What the name of a deadline's resource and its UID end with.
+pub const DEADLINE_SUFFIX: &str = "-deadline";
+
+/// The deadline of an event as a calendar entry of its own: `<name> (дедлайн)`
+/// on the deadline, all day when it has no time, reminded with the event's own
+/// leads, counted from the deadline. A series has one deadline for every
+/// occurrence and none of them in particular, so it gets no entry.
+pub fn deadline_entry(event: &Event) -> Option<Event> {
+    if event.rrule.is_some() {
+        return None;
+    }
+    Some(Event {
+        object_id: event.object_id.clone(),
+        name: format!("{} (дедлайн)", event.name),
+        start: Some(event.deadline.clone()?),
+        end: None,
+        location: None,
+        tags: event.tags.clone(),
+        reminder_names: event.reminder_names.clone(),
+        ical_uid: Some(format!("{}{DEADLINE_SUFFIX}", event.uid())),
+        object_url: event.object_url.clone(),
+        last_modified: event.last_modified,
+        rrule: None,
+        exdates: Vec::new(),
+        series: None,
+        occurrence: None,
+        deadline: None,
+    })
+}
+
+/// The deadline a client moved an entry from `deadline_entry` to: its start.
+pub fn deadline_from(incoming: &IncomingEvent, config: &CalendarConfig) -> Option<String> {
+    anytype_date(incoming.start.as_ref()?, config)
 }
 
 impl Event {
@@ -383,6 +420,8 @@ pub struct EventPatch {
     pub series: Option<String>,
     /// Only on create, beside `series`.
     pub occurrence: Option<String>,
+    /// `deadline`; `Some(None)` clears it.
+    pub deadline: Option<Option<String>>,
 }
 
 impl EventPatch {
@@ -397,6 +436,7 @@ impl EventPatch {
             && self.exdates.is_none()
             && self.series.is_none()
             && self.occurrence.is_none()
+            && self.deadline.is_none()
     }
 }
 
@@ -626,6 +666,7 @@ pub fn event_patch_for_create(incoming: &IncomingEvent, config: &CalendarConfig)
         exdates: None,
         series: None,
         occurrence: None,
+        deadline: None,
         name: Some(
             incoming
                 .summary
@@ -846,6 +887,7 @@ fn to_event(object: &Object) -> Event {
             .get_property_array("series")
             .and_then(|links| links.into_iter().next()),
         occurrence: date(object, "occurrence"),
+        deadline: date(object, "deadline"),
     }
 }
 
@@ -862,7 +904,11 @@ impl AnytypeEvents {
         patch: &EventPatch,
     ) -> Result<Vec<serde_json::Value>, SourceError> {
         let mut out = Vec::new();
-        for (key, value) in [("start_date", &patch.start), ("end_date", &patch.end)] {
+        for (key, value) in [
+            ("start_date", &patch.start),
+            ("end_date", &patch.end),
+            ("deadline", &patch.deadline),
+        ] {
             if let Some(value) = value {
                 out.push(serde_json::json!({ "key": key, "date": value }));
             }
@@ -1046,6 +1092,11 @@ impl EventService {
                     objects.insert(event.resource_name(), resource);
                 }
                 None => undated += 1,
+            }
+            if let Some(entry) = deadline_entry(event)
+                && let Some(resource) = self.resource(&entry, &[])
+            {
+                objects.insert(entry.resource_name(), resource);
             }
         }
         if undated > 0 {
@@ -1250,6 +1301,8 @@ mod tests {
             exdates: Vec::new(),
             series: None,
             occurrence: None,
+
+            deadline: None,
         }
     }
 

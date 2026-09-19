@@ -129,9 +129,26 @@ impl PushScheduler {
             }
         };
         debug!(events = events.len(), "scheduler read events");
-        events
+        // A deadline is reminded like a start, under the event's own name.
+        let deadlines: Vec<Event> = events
             .iter()
             .filter_map(|event| {
+                crate::events::deadline_entry(event).map(|entry| Event {
+                    name: event.name.clone(),
+                    ..entry
+                })
+            })
+            .collect();
+        let entries = events
+            .iter()
+            .map(|event| (event, ReminderAnchor::Start))
+            .chain(
+                deadlines
+                    .iter()
+                    .map(|entry| (entry, ReminderAnchor::Deadline)),
+            );
+        entries
+            .filter_map(|(event, anchor)| {
                 let task = event_as_task(event);
                 let longest = task.reminder_leads.iter().max().copied()?;
                 // A start at or after its trigger: occurrences from the start
@@ -163,10 +180,7 @@ impl PushScheduler {
                         let occurrence = Task { scheduled: Some(start), ..task.clone() };
                         reminders_for(&occurrence, &self.calendar, &self.reminders)
                     })
-                    .map(|moment| ReminderMoment {
-                        anchor: ReminderAnchor::Start,
-                        ..moment
-                    })
+                    .map(|moment| ReminderMoment { anchor, ..moment })
                     .collect();
                 Some((task, moments))
             })
@@ -725,6 +739,8 @@ mod tests {
             exdates: Vec::new(),
             series: None,
             occurrence: None,
+
+            deadline: None,
         }
     }
 
@@ -819,6 +835,24 @@ mod tests {
         let scheduler = scheduler.with_events(Arc::new(OneEvent(event("ev", &[]))));
         scheduler.check_at(now).await.unwrap();
         assert!(sink.notifications().is_empty());
+    }
+
+    /// An event's deadline is reminded with the event's leads, counted from
+    /// the deadline, and says it is the deadline.
+    #[tokio::test]
+    async fn an_event_deadline_is_reminded_with_the_events_leads() {
+        let mut ev = event("ev", &["15m"]);
+        // 29.08 18:00 Saratov.
+        ev.deadline = AnytypeDate::parse("2026-08-29T14:00:00Z");
+        let now = Utc.with_ymd_and_hms(2026, 8, 29, 13, 45, 10).unwrap();
+        let (scheduler, sink, _, _directory) = build_scheduler(vec![SourceStep::Tasks(Vec::new())]);
+        let scheduler = scheduler.with_events(Arc::new(OneEvent(ev)));
+        scheduler.check_at(now).await.unwrap();
+        let sent = sink.notifications();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].title, "Семинар");
+        assert!(sent[0].body.starts_with("Дедлайн "), "{}", sent[0].body);
+        assert!(sent[0].body.contains("18:00"), "{}", sent[0].body);
     }
 
     /// A claim is permanent, so spending one while no browser is subscribed

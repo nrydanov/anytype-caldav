@@ -1010,6 +1010,9 @@ mod writes {
             if let Some(end) = &patch.end {
                 event.end = end.as_deref().and_then(AnytypeDate::parse);
             }
+            if let Some(deadline) = &patch.deadline {
+                event.deadline = deadline.as_deref().and_then(AnytypeDate::parse);
+            }
             if let Some(location) = &patch.location {
                 event.location = location.clone();
             }
@@ -1109,6 +1112,8 @@ mod writes {
                 exdates: Vec::new(),
                 series: None,
                 occurrence: None,
+
+                deadline: None,
             }
         }
 
@@ -1252,6 +1257,63 @@ mod writes {
             assert_eq!(stored.start.unwrap().raw, "2026-09-21T10:00:00Z");
             assert_eq!(stored.end.unwrap().raw, "2026-09-21T11:30:00Z");
             assert_eq!(stored.reminder_names, vec!["1h".to_string()]);
+        }
+
+        /// An event with a deadline shows as two entries: the event, and
+        /// `<name> (дедлайн)` on the deadline. Moving the second moves the
+        /// deadline; deleting it clears the deadline and keeps the event.
+        #[tokio::test]
+        async fn a_deadline_is_an_entry_of_its_own() {
+            let (router, events) = with_events();
+            // 19.09, date only: Saratov midnight is 20:00Z the day before.
+            events.events.lock().unwrap()[0].deadline = AnytypeDate::parse("2026-09-18T20:00:00Z");
+            let name = "bafyreieee~40anytype-task-exporter-deadline";
+
+            let (_, _, listing) = send(
+                &router,
+                "PROPFIND",
+                "/dav/calendars/events/",
+                Some("1"),
+                PROBE,
+            )
+            .await;
+            assert!(
+                listing.contains(&format!(
+                    "<d:href>/dav/calendars/events/{name}.ics</d:href>"
+                )),
+                "{listing}"
+            );
+            let (_, event) = get_event(&router, "bafyreieee").await;
+            assert!(event.contains("SUMMARY:Лекция\r\n"), "{event}");
+
+            let (etag, ics) = get_event(&router, name).await;
+            assert!(ics.contains("SUMMARY:Лекция (дедлайн)"), "{ics}");
+            assert!(
+                ics.contains("UID:bafyreieee@anytype-task-exporter-deadline"),
+                "{ics}"
+            );
+            assert!(ics.contains("DTSTART;VALUE=DATE:20260919"), "{ics}");
+            // The event's own reminder, before the deadline.
+            assert!(ics.contains("TRIGGER:-PT15M"), "{ics}");
+
+            let moved = ics
+                .replace("DTSTART;VALUE=DATE:20260919", "DTSTART;VALUE=DATE:20260922")
+                .replace("DTEND;VALUE=DATE:20260920", "DTEND;VALUE=DATE:20260923");
+            let path = format!("/dav/calendars/events/{name}.ics");
+            let (status, _) = put(&router, &path, Some(("If-Match", &etag)), &moved).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            let stored = events.events.lock().unwrap()[0].clone();
+            assert_eq!(stored.deadline.unwrap().raw, "2026-09-21T20:00:00Z");
+            assert_eq!(stored.start.unwrap().raw, "2026-09-20T09:50:00Z");
+
+            let (status, _, _) = send(&router, "DELETE", &path, None, "").await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            let stored = events.events.lock().unwrap()[0].clone();
+            assert!(stored.deadline.is_none());
+            assert_eq!(stored.name, "Лекция");
+            let (status, _, _) = send(&router, "GET", &path, None, "").await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            get_event(&router, "bafyreieee").await;
         }
 
         #[tokio::test]
