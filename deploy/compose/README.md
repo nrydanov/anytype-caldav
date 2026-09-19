@@ -14,6 +14,9 @@ obtains the TLS certificate. Nothing but Docker is needed on the host.
    other setting of `config.example.toml` can be added as
    `ANYTYPE_CALDAV__<SECTION>__<KEY>`.
 
+   If the space lives on a self-hosted any-sync network, put the network's
+   `client.yml` into [`network/`](network/) before the first start.
+
 3. Start:
 
    ```sh
@@ -22,10 +25,11 @@ obtains the TLS certificate. Nothing but Docker is needed on the host.
    ```
 
    On the first start the `anytype` service creates a bot account and prints
-   its account key: keep it. The bot then asks to join the space; if the invite
-   needs approval, the owner approves it in Anytype. Until then the server
-   stops with "the account is a member of no space" and is restarted, so it
-   comes up by itself once the bot is in.
+   its account key: keep it. The bot then asks to join the space by the invite
+   link, trying again every minute until the request goes through, and hands
+   the space's id to the server. If the invite needs approval, the owner
+   approves the bot in Anytype; until then `init` fails and the server is
+   restarted, so it comes up by itself once the bot is in.
 
 4. Connect a CalDAV client to `https://DOMAIN/dav/` with the username
    `anytype` and `CALDAV_PASSWORD`. With `ACCOUNTS_SECRET` set, everyone's own
@@ -34,7 +38,8 @@ obtains the TLS certificate. Nothing but Docker is needed on the host.
 
 Every step can run again without harm: after changing `.env`, run
 `docker compose up -d` again. The bot is created only once and kept in a
-volume, joining again changes nothing, a fresh API key is issued on every
+volume, a link joined once is not joined again (a new link is), a fresh API
+key is issued on every
 start, `init --apply` creates only what is missing, and the VAPID key is made
 only when there is none.
 

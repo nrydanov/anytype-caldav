@@ -11,10 +11,15 @@ services:
     restart: unless-stopped
     entrypoint: ["/bin/sh", "/setup/anytype.sh"]
     environment:
+      # The API answers only requests addressed to localhost unless the name
+      # it is reached by is allowed; the server reaches it as anytype:31012.
+      # Nothing outside the kit's network can reach the port.
+      ANYTYPE_API_ALLOWED_HOSTS: anytype:31012
       ANYTYPE_INVITE_LINK: ${ANYTYPE_INVITE_LINK:-}
       ANYTYPE_ACCOUNT_KEY: ${ANYTYPE_ACCOUNT_KEY:-}
     volumes:
       - ./anytype.sh:/setup/anytype.sh:ro
+      - ./network:/setup/network:ro
       - anytype-data:/root/.anytype
       - anytype-config:/root/.config/anytype
       - keys:/shared
@@ -23,11 +28,16 @@ services:
     build: ../..
     restart: unless-stopped
     depends_on: [anytype]
-    # Waits for the API key, brings the space's schema up to date (init
-    # creates only what is missing) and starts.
+    # Waits for the API key and the id of the joined space (unless .env names
+    # the space), brings the space's schema up to date (init creates only what
+    # is missing) and starts.
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - until [ -s /shared/api-key ]; do sleep 1; done;
+      - until [ -s /shared/api-key ]; do sleep 2; done;
+        if [ -z "$${ANYTYPE_CALDAV__ANYTYPE__SPACE_ID:-}" ]; then
+          until [ -s /shared/space-id ]; do sleep 2; done;
+          export ANYTYPE_CALDAV__ANYTYPE__SPACE_ID="$$(cat /shared/space-id)";
+        fi;
         anytype-caldav init --apply && exec anytype-caldav
     env_file: .env
     environment:
