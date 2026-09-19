@@ -1,2 +1,7 @@
 /target
 /config.toml
+__pycache__/
+/deploy/compose/.env
+/deploy/compose/config.toml
+/deploy/compose/*.pem
+/deploy/compose/calino/
