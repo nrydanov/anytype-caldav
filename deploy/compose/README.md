@@ -3,7 +3,10 @@
 anytype-caldav with a headless Anytype of its own and Caddy in front, which
 obtains the TLS certificate. Nothing but Docker is needed on the host.
 
-1. In Anytype, the owner of the space makes an invite link.
+1. In Anytype, the owner of the space makes an invite link with editor
+   rights (the bot creates types and writes tasks) and without approval, so
+   the bot joins at once. Anyone holding such a link can join: revoke it once
+   the bot is in.
 2. Fill in the settings:
 
    ```sh
@@ -28,12 +31,15 @@ obtains the TLS certificate. Nothing but Docker is needed on the host.
    ```
 
    On the first start the `anytype` service creates a bot account and prints
-   its account key: keep it. The bot then asks to join the space by the invite
+   its account key. Put it into `.env` as `ANYTYPE_ACCOUNT_KEY`: with it, lost
+   volumes or a new host bring the same bot back.
+   `docker compose exec anytype account-key` shows it again. The bot then asks to join the space by the invite
    link, trying again every minute until the request goes through, and hands
    the space's id to the server, together with the API key and the session
    token `init` uses to set type headers over gRPC. If the invite needs
-   approval, the owner approves the bot in Anytype; until then `init` fails and the server is
-   restarted, so it comes up by itself once the bot is in.
+   approval, the owner approves the bot in Anytype; until then the server
+   tries `init` again every 30 seconds and comes up by itself once the bot is
+   in.
 
 4. Connect a CalDAV client to `https://<ANYTYPE_CALDAV_DOMAIN>/dav/` with the
    username `anytype` and `CALDAV_PASSWORD`. Without one in `.env`, the server

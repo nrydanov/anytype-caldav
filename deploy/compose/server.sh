@@ -39,7 +39,13 @@ if [ -n "${ACCOUNTS_SECRET:-}" ]; then
     export ANYTYPE_CALDAV__PROPERTIES__ASSIGNEE="${ANYTYPE_CALDAV__PROPERTIES__ASSIGNEE:-key:assignee}"
 fi
 
+# Until the owner lets the bot in, the space cannot be read; init is tried
+# again rather than the container restarted.
 if [ "$#" -eq 0 ]; then
-    anytype-caldav init --apply
+    until anytype-caldav init --apply; do
+        echo "init failed (see above). If the invite needs approval, the owner" \
+            "lets the bot into the space in Anytype. Trying again in 30 s."
+        sleep 30
+    done
 fi
 exec anytype-caldav "$@"

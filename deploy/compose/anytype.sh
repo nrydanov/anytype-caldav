@@ -18,6 +18,18 @@
 #   which the API cannot, over gRPC.
 set -u
 
+# The bot's account key, which the CLI keeps in its config. The image runs
+# this as `account-key`.
+account_key() {
+    sed -n 's/.*"accountKey": *"\([^"]*\)".*/\1/p' /root/.anytype/config.json 2>/dev/null
+}
+if [ "${1:-}" = account-key ]; then
+    key=$(account_key)
+    [ -n "$key" ] || { echo "no bot account yet" >&2; exit 1; }
+    echo "$key"
+    exit 0
+fi
+
 # Stale until the account is up again.
 rm -f /shared/session-token
 
@@ -52,10 +64,22 @@ if ! grep -q '"accountKey": *"[^"]' /root/.anytype/config.json 2>/dev/null; then
         # shellcheck disable=SC2086
         cli auth login --account-key "$ANYTYPE_ACCOUNT_KEY" $network || exit 1
     else
-        echo "No account in the volume yet: creating the bot. Keep the account key" \
-            "printed below; it is the only way back into this account."
         # shellcheck disable=SC2086
-        cli auth create "${ANYTYPE_BOT_NAME:-anytype-caldav}" $network || exit 1
+        if ! out=$(cli auth create "${ANYTYPE_BOT_NAME:-anytype-caldav}" $network 2>&1); then
+            printf '%s\n' "$out" >&2
+            exit 1
+        fi
+        cat <<MSG
+
+Bot account created. Its account key is the only way back into it:
+
+    $(account_key)
+
+Put it into .env as ANYTYPE_ACCOUNT_KEY=<key>: then losing the volumes or
+moving to another host brings the same bot back. Shown again by
+    docker compose exec anytype account-key
+
+MSG
     fi
 fi
 

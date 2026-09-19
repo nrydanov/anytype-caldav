@@ -7,12 +7,14 @@
 # run `docker compose up -d` again.
 services:
   anytype:
-    # The CLI's image with socat, which relays Anytype's gRPC port (see
-    # anytype.sh).
+    # The CLI's image with socat, which relays Anytype's gRPC port, and the
+    # command account-key, which prints the bot's key (see anytype.sh).
     build:
       dockerfile_inline: |
         FROM ghcr.io/anyproto/anytype-cli:${ANYTYPE_CLI_VERSION:-v0.3.7}
-        RUN apk add --no-cache socat
+        RUN apk add --no-cache socat \
+         && printf '#!/bin/sh\nexec sh /setup/anytype.sh account-key\n' > /usr/local/bin/account-key \
+         && chmod +x /usr/local/bin/account-key
     restart: unless-stopped
     entrypoint: ["/bin/sh", "/setup/anytype.sh"]
     environment:
