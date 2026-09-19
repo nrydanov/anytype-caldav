@@ -1,17 +1,53 @@
-// Turns on server reminders inside the Calino Home Screen app.
+// Turns on server reminders inside Calino.
 //
 // nginx adds this script to Calino's index.html, so Calino itself is not
-// modified. It uses Declarative Web Push (Safari, iOS 18.4+): the page
+// modified. On iOS it uses Declarative Web Push (Safari, 18.4+): the page
 // subscribes through window.pushManager and Safari shows the exporter's
-// notifications without a service worker. The subscription belongs to the
-// installed app, so the button appears only when running as that app.
+// notifications without a service worker; that subscription belongs to the
+// installed app, so there the button appears only when running as that app.
+// Everywhere else (Chrome and Firefox, on Android and on a desktop) it
+// subscribes through the service worker push-sw.js, which shows them.
 (() => {
   const USERNAME = 'anytype';
   const DONE_KEY = 'anytype-push-registered';
+  const DISMISSED_KEY = 'anytype-push-dismissed';
 
   const standalone =
     navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
-  if (!standalone || !('pushManager' in window) || !('Notification' in window)) return;
+  const declarative = 'pushManager' in window;
+  const throughWorker = 'serviceWorker' in navigator && 'PushManager' in window;
+  if (!('Notification' in window)) return;
+  // `navigator.standalone` exists only on iOS, where a push reaches nothing
+  // but the installed app.
+  if (declarative || 'standalone' in navigator) {
+    if (!declarative || !standalone) return;
+  } else if (!throughWorker) {
+    return;
+  }
+
+  // The offer is for a phone and for the installed app. In a tab on a desktop
+  // it would hang over the calendar of everyone who only came to look; there
+  // it appears when asked for, by opening the page with #reminders.
+  const asked = location.hash === '#reminders';
+  const handheld = matchMedia('(pointer: coarse)').matches;
+  if (!asked && !standalone && !handheld) return;
+
+  const dismissed = () => {
+    try {
+      return localStorage.getItem(DISMISSED_KEY) === '1';
+    } catch {
+      return false;
+    }
+  };
+
+  // Where subscriptions are made: the window on iOS, a worker elsewhere.
+  const pushManager = async () => {
+    if (declarative) return window.pushManager;
+    const registration = await navigator.serviceWorker.register('/push-sw.js', {
+      scope: '/push-sw/',
+    });
+    return registration.pushManager;
+  };
 
   const keyBytes = (base64url) => {
     const padded = base64url.replace(/-/g, '+').replace(/_/g, '/') +
@@ -19,8 +55,8 @@
     return Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
   };
 
-  const basic = (password) => {
-    const bytes = new TextEncoder().encode(`${USERNAME}:${password}`);
+  const basic = (username, password) => {
+    const bytes = new TextEncoder().encode(`${username}:${password}`);
     return 'Basic ' + btoa(String.fromCharCode(...bytes));
   };
 
@@ -40,15 +76,20 @@
       if ((await Notification.requestPermission()) !== 'granted') {
         throw new Error('уведомления запрещены в настройках');
       }
+      const manager = await pushManager();
       const subscription =
-        (await window.pushManager.getSubscription()) ||
-        (await window.pushManager.subscribe({
+        (await manager.getSubscription()) ||
+        (await manager.subscribe({
           userVisibleOnly: true,
           applicationServerKey: keyBytes(publicKey),
         }));
+      // The same login Calino was given: a person's own one makes the
+      // subscription theirs, and it then receives only their reminders.
+      const username = prompt('Логин CalDAV', USERNAME);
+      if (!username) throw new Error('логин не введён');
       const password = prompt('Пароль CalDAV, чтобы включить напоминания');
       if (!password) throw new Error('пароль не введён');
-      const authorization = basic(password);
+      const authorization = basic(username.trim(), password);
       const saved = await fetch('/push/subscribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: authorization },
@@ -69,8 +110,18 @@
   }
 
   async function offer() {
-    const subscription = await window.pushManager.getSubscription();
+    // Looking for an existing subscription must not register a worker in a
+    // browser whose owner never asked for reminders.
+    let subscription = null;
+    if (declarative) {
+      subscription = await window.pushManager.getSubscription();
+    } else {
+      const registration = await navigator.serviceWorker.getRegistration('/push-sw/');
+      subscription = registration ? await registration.pushManager.getSubscription() : null;
+    }
     if (subscription && Notification.permission === 'granted' && registered()) return;
+    // "Not now" is remembered; #reminders brings the offer back.
+    if (dismissed() && !asked) return;
     const keyResponse = await fetch('/push/key');
     if (!keyResponse.ok) return;
     const { publicKey } = await keyResponse.json();
@@ -92,6 +143,27 @@
       boxShadow: '0 4px 14px rgba(0,0,0,.25)',
     });
     button.addEventListener('click', () => enable(button, publicKey));
+
+    const close = document.createElement('span');
+    close.textContent = '×';
+    close.setAttribute('role', 'button');
+    close.setAttribute('aria-label', 'Не сейчас');
+    Object.assign(close.style, {
+      marginLeft: '10px',
+      padding: '0 2px',
+      fontSize: '18px',
+      lineHeight: '1',
+      opacity: '0.8',
+      cursor: 'pointer',
+    });
+    close.addEventListener('click', (event) => {
+      event.stopPropagation();
+      try {
+        localStorage.setItem(DISMISSED_KEY, '1');
+      } catch {}
+      button.remove();
+    });
+    button.appendChild(close);
     document.body.appendChild(button);
   }
 
