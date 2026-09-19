@@ -113,6 +113,7 @@ all_day_time = "09:00"
 # secret; `exporter users` prints them.
 # [caldav]
 # enabled = true
+# The shared login; "anytype" when left out.
 # username = "anytype"
 # Accept edits from the client and write them to Anytype. Off by default, so a
 # deploy never makes the calendar editable by itself.

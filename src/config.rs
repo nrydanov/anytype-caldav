@@ -799,16 +799,18 @@ impl Config {
                 "series.events is true but push.state_file is not set".into(),
             ));
         }
+        // Left out, the shared login is `anytype`; written out empty, it is a
+        // mistake worth stopping for.
         let caldav_username = raw
             .caldav
             .username
             .as_deref()
-            .unwrap_or("")
+            .unwrap_or("anytype")
             .trim()
             .to_string();
         if raw.caldav.enabled && caldav_username.is_empty() {
             return Err(ConfigError::Invalid(
-                "caldav.enabled is true but caldav.username is not set".into(),
+                "caldav.username must not be empty".into(),
             ));
         }
         let name = |field: &str, value: &Option<String>, default: String| match value {
@@ -1295,11 +1297,16 @@ allowed_origins = ["https://calino.io"]
     }
 
     #[test]
-    fn caldav_is_off_unless_asked_for_and_needs_a_username() {
+    fn caldav_is_off_unless_asked_for_and_its_username_defaults_to_anytype() {
         assert!(!load(&base()).expect("valid config").caldav.enabled);
-        let err = load(&format!("{}\n[caldav]\nenabled = true", base()))
-            .unwrap_err()
-            .to_string();
+        let config = load(&format!("{}\n[caldav]\nenabled = true", base())).expect("valid");
+        assert_eq!(config.caldav.username, "anytype");
+        let err = load(&format!(
+            "{}\n[caldav]\nenabled = true\nusername = \" \"",
+            base()
+        ))
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("caldav.username"), "{err}");
     }
 
