@@ -10,9 +10,8 @@ obtains the TLS certificate. Nothing but Docker is needed on the host:
   [Behind a proxy of your own](#behind-a-proxy-of-your-own) otherwise;
 - outbound access to Anytype's network, or to the self-hosted one.
 
-The server's image is pulled, so the host does not build Rust; building it
-from source (`docker compose up --build`) takes far more memory than running
-it.
+The images are pulled, so the host builds nothing; building the server from
+source (`docker compose up --build`) takes far more memory than running it.
 
 1. In Anytype, the owner of the space makes an invite link with editor
    rights (the bot creates types and writes tasks) and without approval, so

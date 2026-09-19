@@ -18,8 +18,8 @@
 #   which the API cannot, over gRPC.
 set -u
 
-# The bot's account key, which the CLI keeps in its config. The image runs
-# this as `account-key`.
+# The bot's account key, which the CLI keeps in its config; the image's
+# account-key command runs this.
 account_key() {
     sed -n 's/.*"accountKey": *"\([^"]*\)".*/\1/p' /root/.anytype/config.json 2>/dev/null
 }

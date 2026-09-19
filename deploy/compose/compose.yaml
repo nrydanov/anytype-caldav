@@ -7,16 +7,14 @@
 # run `docker compose up -d` again.
 services:
   anytype:
-    # The CLI's image with socat, which relays Anytype's gRPC port, and the
-    # command account-key, which prints the bot's key (see anytype.sh).
+    # Anytype's CLI with a relay of its gRPC port and anytype.sh, which
+    # prepares the bot (anytype-bot.Dockerfile); built from this checkout
+    # only when the image cannot be pulled.
+    image: ghcr.io/nrydanov/anytype-bot:${ANYTYPE_CALDAV_VERSION:-0.1.3}
     build:
-      dockerfile_inline: |
-        FROM ghcr.io/anyproto/anytype-cli:${ANYTYPE_CLI_VERSION:-v0.3.7}
-        RUN apk add --no-cache socat \
-         && printf '#!/bin/sh\nexec sh /setup/anytype.sh account-key\n' > /usr/local/bin/account-key \
-         && chmod +x /usr/local/bin/account-key
+      context: .
+      dockerfile: anytype-bot.Dockerfile
     restart: unless-stopped
-    entrypoint: ["/bin/sh", "/setup/anytype.sh"]
     environment:
       # The API answers only requests addressed to localhost unless the name
       # it is reached by is allowed; the server reaches it as anytype:31012.
@@ -26,7 +24,6 @@ services:
       ANYTYPE_ACCOUNT_KEY: ${ANYTYPE_ACCOUNT_KEY:-}
     volumes:
       # z: readable in the container on hosts with SELinux.
-      - ./anytype.sh:/setup/anytype.sh:ro,z
       - ./network:/setup/network:ro,z
       - anytype-data:/root/.anytype
       - anytype-config:/root/.config/anytype
@@ -35,7 +32,7 @@ services:
   server:
     # The published image; `docker compose up --build` builds it from this
     # checkout instead.
-    image: ghcr.io/nrydanov/anytype-caldav:${ANYTYPE_CALDAV_VERSION:-0.1.2}
+    image: ghcr.io/nrydanov/anytype-caldav:${ANYTYPE_CALDAV_VERSION:-0.1.3}
     build: ../..
     restart: unless-stopped
     depends_on: [anytype]

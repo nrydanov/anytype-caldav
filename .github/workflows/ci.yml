@@ -19,21 +19,29 @@ jobs:
       - run: cargo clippy --all-targets --locked
       - run: cargo test --locked
 
-  # Each platform is built on a runner of its own architecture: under QEMU
-  # emulation the arm64 build took two hours. Each pushes its image by
-  # digest, and `merge` joins them under the version's tags.
+  # Two images, the server and the kit's anytype-bot. Each platform is built
+  # on a runner of its own architecture: under QEMU emulation the arm64 build
+  # took two hours. Each leg pushes its image by digest, and `merge` joins an
+  # image's digests under the version's tags.
   image:
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: linux/amd64
+        image:
+          - name: anytype-caldav
+            context: .
+            file: Dockerfile
+          - name: anytype-bot
+            context: deploy/compose
+            file: deploy/compose/anytype-bot.Dockerfile
+        platform:
+          - arch: linux/amd64
             runner: ubuntu-latest
-          - platform: linux/arm64
+          - arch: linux/arm64
             runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.platform.runner }}
     permissions:
       contents: read
       packages: write
@@ -48,9 +56,10 @@ jobs:
       - uses: docker/build-push-action@v6
         id: build
         with:
-          context: .
-          platforms: ${{ matrix.platform }}
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.file }}
+          platforms: ${{ matrix.platform.arch }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.image.name }},push-by-digest=true,name-canonical=true,push=true
       - name: Export digest
         run: |
           mkdir -p "${{ runner.temp }}/digests"
@@ -58,13 +67,16 @@ jobs:
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
       - uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ matrix.runner }}
+          name: digests-${{ matrix.image.name }}-${{ matrix.platform.runner }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
     needs: image
+    strategy:
+      matrix:
+        image: [anytype-caldav, anytype-bot]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -73,7 +85,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digests-*
+          pattern: digests-${{ matrix.image }}-*
           merge-multiple: true
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -84,7 +96,7 @@ jobs:
       - uses: docker/metadata-action@v5
         id: meta
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=semver,pattern={{version}}
             type=raw,value=latest
@@ -95,4 +107,4 @@ jobs:
           # shellcheck disable=SC2046
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+            $(printf 'ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@sha256:%s ' *)
