@@ -44,7 +44,11 @@ if [ -s /setup/network/client.yml ]; then
     echo "using the self-hosted network of network/client.yml"
 fi
 
-anytype --no-update-check serve --listen-address 0.0.0.0:31012 &
+# The API's address. Creating the account or logging in starts the API again,
+# on the CLI's default of localhost unless told otherwise.
+api=0.0.0.0:31012
+
+anytype --no-update-check serve --listen-address "$api" &
 serve=$!
 trap 'kill "$serve" 2>/dev/null; wait "$serve"; exit 0' TERM INT
 
@@ -62,10 +66,10 @@ done
 if ! grep -q '"accountKey": *"[^"]' /root/.anytype/config.json 2>/dev/null; then
     if [ -n "${ANYTYPE_ACCOUNT_KEY:-}" ]; then
         # shellcheck disable=SC2086
-        cli auth login --account-key "$ANYTYPE_ACCOUNT_KEY" $network || exit 1
+        cli auth login --account-key "$ANYTYPE_ACCOUNT_KEY" --listen-address "$api" $network || exit 1
     else
         # shellcheck disable=SC2086
-        if ! out=$(cli auth create "${ANYTYPE_BOT_NAME:-anytype-caldav}" $network 2>&1); then
+        if ! out=$(cli auth create "${ANYTYPE_BOT_NAME:-anytype-caldav}" --listen-address "$api" $network 2>&1); then
             printf '%s\n' "$out" >&2
             exit 1
         fi
@@ -100,13 +104,17 @@ if [ "$ready" -ne 1 ]; then
 fi
 
 socat TCP-LISTEN:31020,fork,reuseaddr TCP:127.0.0.1:31010 &
-token=$(sed -n 's/.*"sessionToken": *"\([^"]*\)".*/\1/p' /root/.anytype/config.json)
-if [ -n "$token" ]; then
+# The server's copy follows the CLI's: right after the account is created,
+# serve logs in once more on its own and the token it had is no longer valid.
+hand_over_token() {
+    token=$(sed -n 's/.*"sessionToken": *"\([^"]*\)".*/\1/p' /root/.anytype/config.json)
+    [ -n "$token" ] || return 0
+    [ "$token" = "$(cat /shared/session-token 2>/dev/null)" ] && return 0
     printf '%s\n' "$token" > /shared/session-token.new &&
         mv /shared/session-token.new /shared/session-token
-else
-    echo "no session token in the CLI config; init leaves type headers alone" >&2
-fi
+}
+hand_over_token
+(while sleep 5; do hand_over_token; done) &
 
 join_space() {
     out=$(cli space join "$ANYTYPE_INVITE_LINK" 2>&1)
