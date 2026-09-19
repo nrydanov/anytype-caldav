@@ -45,11 +45,12 @@ space.
 ## Deploy with Docker Compose
 
 [`deploy/compose/`](deploy/compose/) runs everything: a headless Anytype of its
-own, the server and Caddy for TLS. The host needs Docker and a domain name.
+own, the server and Caddy for TLS. The host needs Docker and a domain name;
+the server's image is pulled from `ghcr.io/nrydanov/anytype-caldav`.
 
 ```sh
 cd deploy/compose
-cp env.example .env && chmod 600 .env   # DOMAIN, ANYTYPE_INVITE_LINK, CALDAV_PASSWORD
+cp env.example .env && chmod 600 .env   # DOMAIN, ANYTYPE_INVITE_LINK, CALDAV_PASSWORD, timezone
 docker compose up -d
 ```
 
@@ -58,6 +59,21 @@ the invite link, issues an API key, prepares the space's schema and starts the
 server. Every step can run again without harm, so after changing `.env`, run
 `docker compose up -d` again. The kit's [README](deploy/compose/README.md) has
 the details.
+
+## Clients
+
+The client this server is used and tested with is
+[Calino](https://github.com/Ivan-Malinovski/calino), a calendar that runs in
+the browser and shows tasks and events together. Two things to know:
+
+- The CalDAV routes send no CORS headers, so Calino has to be served from the
+  same origin as the server, or reach it through a CORS proxy as Calino's
+  README describes.
+- In the browser, upstream Calino reminds only while its page is open. The
+  branch `dsc/server-push` of the fork
+  [nrydanov/calino](https://github.com/nrydanov/calino) subscribes to this
+  server's Web Push instead, so reminders arrive with the page closed; on iOS
+  only for Calino added to the Home Screen.
 
 ## Run from source
 
