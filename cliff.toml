@@ -1,0 +1,25 @@
+[git]
+# parse the commits based on https://www.conventionalcommits.org
+conventional_commits = true
+# error if unconventional commit found
+require_conventional = true
+# regex for parsing and grouping commits
+commit_parsers = [
+    { message = "^feat", group = "<!-- 00 -->Features" },
+    { message = "^fix", group = "<!-- 01 -->Bug fixes" },
+    { message = "^perf", group = "<!-- 02 -->Performance" },
+    { message = "^doc", group = "<!-- 03 -->Documentation" },
+    { message = "^refactor", group = "<!-- 04 -->Refactoring" },
+    { message = "^style", group = "<!-- 05 -->Code style" },
+    { message = "^tests?", group = "<!-- 06 -->Tests" },
+    { message = "^build", group = "<!-- 07 -->Build" },
+    { message = "^chore\\(deps.*\\)", skip = true },
+    { message = "^chore\\(release\\):", skip = true },
+    { message = "^chore|^ci", group = "<!-- 08 -->Other" },
+]
+# error if any commit is not matched by any of `commit_parsers`
+fail_on_unmatched_commit = true
+# sort the commits inside sections by oldest/newest order
+sort_commits = "newest"
+# sort the tags topologically
+topo_order = true
