@@ -166,6 +166,18 @@ pub const TYPES: &[TypeSpec] = &[
     },
 ];
 
+/// A property Anytype puts into every space. A list without it is not of a
+/// space the account has loaded: `init` would take every property as missing
+/// and create duplicates of what arrives with the space.
+const BUNDLED_WITH_EVERY_SPACE: &str = "created_date";
+
+/// Whether `existing` is the property list of a space the account has loaded.
+pub fn space_is_loaded(existing: &[Property]) -> bool {
+    existing
+        .iter()
+        .any(|property| property.key == BUNDLED_WITH_EVERY_SPACE)
+}
+
 /// The keys of `wanted` a type does not list yet, in `wanted`'s order.
 pub fn missing_keys<'a>(listed: &[&str], wanted: &[&'a str]) -> Vec<&'a str> {
     wanted
@@ -227,6 +239,10 @@ pub enum InstallError {
     Schema(Vec<Problem>),
     #[error("anytype: {0}")]
     Anytype(#[from] AnytypeError),
+    #[error(
+        "space {0} is not readable yet: the account is not a member, or has not loaded it; nothing was changed"
+    )]
+    NotLoaded(String),
     #[error("{0}")]
     Type(String),
     #[error("setting the header of {key}: {message}")]
@@ -296,6 +312,11 @@ pub async fn run(
     apply: bool,
     grpc_available: bool,
 ) -> Result<(), InstallError> {
+    // A space the account cannot read answers 404; one joined a moment ago
+    // may be readable and still empty, which the property list shows.
+    if client.space(space_id).get().await.is_err() {
+        return Err(InstallError::NotLoaded(space_id.to_string()));
+    }
     let mut changes = create_properties(client, space_id, apply).await?;
     changes |= prepare_types(client, space_id, apply).await?;
     if grpc_available {
@@ -324,6 +345,9 @@ async fn create_properties(
         .await?
         .collect_all()
         .await?;
+    if !space_is_loaded(&existing) {
+        return Err(InstallError::NotLoaded(space_id.to_string()));
+    }
     let steps = plan(SCHEMA, &existing).map_err(InstallError::Schema)?;
 
     let mut missing = Vec::new();
@@ -697,6 +721,16 @@ mod tests {
         keys.sort_unstable();
         keys.dedup();
         assert_eq!(keys.len(), SCHEMA.len());
+    }
+
+    #[test]
+    fn an_empty_or_partial_list_is_not_a_loaded_space() {
+        assert!(!space_is_loaded(&[]));
+        assert!(!space_is_loaded(&[property("a", "priority", "select")]));
+        assert!(space_is_loaded(&[
+            property("a", "priority", "select"),
+            property("b", "created_date", "date"),
+        ]));
     }
 
     #[test]
