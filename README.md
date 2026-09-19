@@ -1,121 +1,155 @@
-# anytype-task-exporter
+# anytype-caldav
 
-A local, read-only bridge from one Anytype space to an iCalendar `VTODO`
-subscription, with optional server-side Web Push reminders. Anytype stays the
-source of truth; the exporter never writes task state back.
+A small server that puts one [Anytype](https://anytype.io) space on a calendar.
+Tasks and events live in Anytype; a CalDAV client such as
+[Calino](https://calino.io) shows and edits them, and reminders arrive as Web
+Push on the phone, including iOS.
 
-Design and rationale: [`docs/superpowers/specs/2026-08-29-anytype-vtodo-exporter-design.md`](docs/superpowers/specs/2026-08-29-anytype-vtodo-exporter-design.md).
+```
+ Anytype (headless or desktop)
+        │  REST API, one space
+        ▼
+ anytype-caldav ──── /dav/        CalDAV: tasks (VTODO), events (VEVENT), read and write
+        │        ├── /push/       Web Push subscriptions and reminders
+        │        ├── /f/…/todos.ics  read-only iCalendar feed
+        │        └── /capture     one line of text becomes a task
+        ▼
+ Calino in the browser / on the Home Screen
+```
 
-**Picking this up?** Start with [`docs/HANDOFF.md`](docs/HANDOFF.md): current
-state, the ordered next steps, and the constraints that are expensive to
-rediscover (Apple cannot show
-`VTODO` by any route).
+Anytype stays the source of truth. The server keeps no copy of the space; its
+only state is a SQLite file with push subscriptions, sent reminders and the
+calendar app's own settings.
 
-## Running
+## What it does
+
+- **Tasks** of one type become `VTODO`s: scheduled date, deadline, done, tags as
+  `CATEGORIES`, reminders as `VALARM`. Edits made in the client (done, dates,
+  name, tags, new tasks, deletion as archive) are written back to Anytype.
+- **Events** of type `event` become a second calendar, with recurring series,
+  edited and deleted occurrences, and deadlines as entries of their own.
+- **A calendar per person** when tasks have an assignee property. Every person
+  of the space can get an account of their own; the password is derived from
+  one server secret, so nothing is stored.
+- **Server-side reminders** through Web Push, sent at most once, surviving
+  restarts. A person's subscription receives only the reminders of their tasks.
+- **Recurring tasks and events**: a `recurring_task` or `recurring_event`
+  object holds the rule; the server creates the next occurrence in Anytype.
+- **`init`** checks a space against the schema the server needs and creates
+  what is missing.
+
+What it does not do: Apple Calendar and Reminders cannot show `VTODO` by any
+route (see [`docs/dev/2026-08-31-tasks-and-events-decision-log.md`](docs/dev/2026-08-31-tasks-and-events-decision-log.md)).
+One process serves one space; run a second process for a second space.
+
+## Quick start
+
+You need a running Anytype with an API key and the id of the space.
 
 ```sh
-cp config.example.toml config.toml     # then edit space_id and the properties
-export ANYTYPE_API_KEY=...             # never goes in the TOML file
-cargo run -- --config config.toml
+cp config.example.toml config.toml        # set anytype.url and space_id
+export ANYTYPE_API_KEY=...                # never goes in the TOML file
+cargo run -- --config config.toml init    # check the space, --apply to fix it
+cargo run -- --config config.toml         # serve
 ```
 
-Subscribe a `VTODO`-capable client to `http://127.0.0.1:8080/todos.ics`.
-The target client is [Calino](https://calino.io/); Google Calendar and Apple
-Calendar ignore `VTODO` in subscribed feeds and will show an empty calendar.
+Or with Docker:
 
-`GET /healthz` reports on this process only and never contacts Anytype.
-
-## Server-side Web Push
-
-Web Push is optional. When enabled, subscriptions and handled reminder IDs are
-stored in SQLite so they survive restarts:
-
-```toml
-[push]
-enabled = true
-private_key_file = "~/.config/vapid_private.pem"
-state_file = "~/.local/share/anytype-task-exporter/state.sqlite3"
-poll_interval = "30s"
-late_window = "1h"
+```sh
+docker run --rm -v "$PWD/config.toml:/config.toml:ro" \
+  -e ANYTYPE_API_KEY -p 8080:8080 ghcr.io/<owner>/anytype-caldav --config /config.toml
 ```
 
-Keep the VAPID key stable: replacing it invalidates existing browser
-subscriptions. Treat both the key and SQLite file as private and back them up
-together. The database is created with mode `0600` on Unix.
+A full setup with headless Anytype, the server and Calino behind Caddy is in
+[`deploy/compose/`](deploy/compose/).
 
-The scheduler reads Anytype independently of feed requests, once per
-`poll_interval`, continuously — `server.min_refresh_interval` does not bound
-this. Raise `poll_interval` on a small host; the only cost is that reminders
-land up to that much later.
+## Configuration
 
-It sends reminders missed by at most `late_window`; older ones are recorded as
-expired. Reminder claims are persisted before contacting the push service, so
-delivery is **at-most-once**: restarts do not duplicate notifications, but a
-crash or transport failure after the claim is not retried. A reminder that
-falls due while nothing is subscribed is not claimed at all, so it still
-arrives if a browser subscribes within the late window.
+Everything is in one TOML file; [`config.example.toml`](config.example.toml)
+describes every option. Secrets come from the environment:
 
-On iOS, Web Push works only after the site is added to the Home Screen and the
-subscription is created from that installed app.
+| Variable | Needed for |
+|---|---|
+| `ANYTYPE_API_KEY` | always |
+| `CALDAV_PASSWORD` | `[caldav]`, the shared login |
+| `ACCOUNTS_SECRET` | accounts per person (`properties.assignee` must be set) |
 
-## Per-task reminders
-
-Set `properties.reminder` to a select or multi-select property whose option
-**names** are durations — `15m`, `30m`, `1h`, `2h`, `1d`, `1w`. Every chosen
-option produces one reminder, so a task can warn you a day ahead *and* half an
-hour ahead. Anytype snake_cases option keys (`1d` is stored as `1_d`), which is
-why the name is what gets parsed; an option that is not a duration is logged
-and skipped rather than failing the task.
-
-A task that leaves the property empty falls back to `reminders.lead_time`.
-
-The notification titles itself with the task name and says why it arrived —
-«Дедлайн через 2 часа — сегодня в 18:00», «Дедлайн завтра в 18:00», «Дедлайн
-сегодня» — computed when the push is sent, so one delayed by the late window
-reads «Дедлайн был сегодня в 18:00» instead of promising a passed future.
-
-The lead counts back from the deadline, or from the scheduled date when there
-is no deadline. For an all-day date there is no *default* lead — such a task
-announces itself at `reminders.all_day_time` — but an explicitly chosen lead
-does count back from that hour, so `1d` on an all-day task due Monday fires at
-09:00 on Sunday.
-
-## Finding your property selectors
-
-Each property is configured as `key:<stable-key>` or `id:<opaque-id>`. If a
-selector matches nothing, the refresh fails and every property the type
-actually offers is logged with its key, id, name and format:
+Properties are selected as `key:<stable-key>` or `id:<opaque-id>`, never by
+display name, so renaming a property in Anytype breaks nothing. If a selector
+matches nothing, the refresh fails and every property the type offers is logged:
 
 ```
 WARN property available on type task property=key:due_date id:bafy... name:"Deadline" format:Date
 ```
 
-Set the selectors from that list. A selector is never matched by display name,
-so renaming a property in Anytype does not break the feed.
+## Commands
+
+| Command | What it does |
+|---|---|
+| `anytype-caldav --config c.toml` | runs the server |
+| `… init [--apply]` | checks the space's schema; `--apply` creates missing properties |
+| `… generate [--apply]` | shows the occurrences of series due today; `--apply` creates them |
+| `… users` | prints every person's name, login and password (needs `ACCOUNTS_SECRET`) |
+
+`GET /healthz` reports on the process only and never contacts Anytype.
+
+## Reminders
+
+Web Push is optional. Subscriptions and handled reminders are stored in SQLite,
+so they survive restarts. Keep the VAPID key stable, since replacing it
+invalidates every subscription, and back it up together with the state file.
+
+- Delivery is **at most once**: a reminder is claimed before it is sent, so a
+  restart never repeats one, and a crash right after the claim loses it.
+- Reminders missed by less than `push.late_window` are sent late; older ones
+  are skipped. A reminder due while nothing is subscribed is not claimed.
+- `properties.reminder` is a select whose option names are durations (`15m`,
+  `1h`, `1d`, `1w`); each chosen option is one reminder. Without it,
+  `reminders.lead_time` applies.
+- An all-day task reminds at `reminders.all_day_time`.
+- On iOS, Web Push works only after the site is added to the Home Screen and
+  subscribed from there.
+
+[`deploy/calino/`](deploy/calino/) has the script that subscribes from inside
+Calino.
 
 ## Notes on behaviour
 
-- **Timed values are emitted as UTC instants**, not `TZID=...`. A `TZID`
-  reference obliges the document to carry a matching `VTIMEZONE` component
-  (RFC 5545 §3.6.5); a UTC instant is unambiguous without one.
-- **A value at midnight becomes an all-day task.** Which midnight is decided by
-  `calendar.date_only_timezone`. If your all-day tasks appear at 04:00, set it
-  to `"UTC"`.
-- **A failed refresh serves the last good feed** with `X-Exporter-Stale: true`.
-  Before any successful refresh it returns `503` rather than an empty calendar,
-  because a subscribed client reads an empty calendar as "delete everything".
-- **Zero tasks is logged as a warning**, since a misconfigured space or a
-  renamed type looks identical to a genuinely empty one.
-- **CORS is off unless you list origins.** A wildcard is refused: the feed is
-  unauthenticated, so `*` would let any page you visit read your whole task
-  list, which the loopback bind alone would otherwise prevent.
+- **Timed values are emitted as UTC instants.** A `TZID` would oblige the
+  document to carry a `VTIMEZONE` (RFC 5545 §3.6.5).
+- **A value at local midnight is an all-day date.** Which midnight is set by
+  `calendar.date_only_timezone`; if all-day tasks appear at 04:00, set it to
+  `"UTC"`.
+- **A failed refresh serves the last good data** with `X-Exporter-Stale: true`.
+  Before the first success it answers `503`, since a client reads an empty
+  calendar as "delete everything".
+- **The feed is unauthenticated**, protected by an unguessable path. CORS is off
+  unless origins are listed, and `*` is refused for it.
 
-## Tests
+## Repository layout
+
+| Path | What |
+|---|---|
+| `src/`, `tests/` | the server; `cargo test` runs everything without a live Anytype |
+| `deploy/compose/` | Docker Compose kit: Anytype, the server, Caddy |
+| `deploy/systemd/` | unit file for a host without Docker |
+| `deploy/calino/` | reminders inside Calino, and the patch for hidden calendars |
+| `scripts/` | optional tools for preparing a space; `scripts/history/` is one-off migrations |
+| `docs/dev/` | design, decision log, plans and the handoff notes |
+
+## Development
 
 ```sh
 cargo test
 ```
 
-Generated feeds are parsed back by a different crate than the one that produced
-them. The Anytype boundary is covered by fixtures; a live test against a real
-installation is environment-gated and not part of the normal run.
+Generated calendars are parsed back by a different crate than the one that
+wrote them. The Anytype boundary is covered by fixtures; a live test against a
+real installation is gated by the environment (`tests/live_feed.rs`).
+
+Start with [`docs/dev/HANDOFF.md`](docs/dev/HANDOFF.md) for the current state
+and the constraints that were expensive to learn.
+
+## License
+
+[GLWT (Good Luck With That) Public License](LICENSE).
