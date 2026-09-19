@@ -33,7 +33,7 @@ done      = "key:done"
 # leave it empty use reminders.lead_time below.
 # reminder = "id:<opaque-id>"
 # Optional. A select/multi-select whose option names become CATEGORIES, one
-# line per tag. Calino colours tasks by category name.
+# line per tag. Clients colour tasks by category name.
 # tags = "id:<opaque-id>"
 # Optional. An `objects` property holding the people a task is assigned to.
 # Configuring it adds a calendar per person beside the flat one, named from the
@@ -62,9 +62,10 @@ listen = "127.0.0.1:8080"
 request_timeout = "10s"
 # Requests inside this window are served from cache without contacting Anytype.
 min_refresh_interval = "30s"
-# Origins allowed to read the feed from a browser. Required for Calino.
+# Origins allowed to read the feed from a browser, for a web client served
+# from another address.
 # An empty list emits no CORS headers; "*" is refused.
-allowed_origins = ["https://calino.io"]
+allowed_origins = ["https://calendar.example"]
 
 [reminders]
 # A VALARM on each open task. Only data: a client must be running to fire it.
@@ -89,7 +90,7 @@ all_day_time = "09:00"
 # late_window = "1h"
 # The calendar app a tapped notification opens. When set, pushes also carry a
 # Declarative Web Push envelope, which Safari on iOS 18.4+ shows without a
-# service worker. The fork of Calino subscribes to them from its settings.
+# service worker.
 # app_url = "https://calendar.example/"
 
 # Generator of recurring tasks and events. A `recurring_task` or
@@ -105,7 +106,7 @@ all_day_time = "09:00"
 # How far ahead occurrences are made. Unset, only the next one is.
 # horizon = "31d"
 
-# CalDAV facade under /dav/, for a calendar app such as Calino. The password
+# CalDAV facade under /dav/, for a CalDAV client. The password
 # comes from CALDAV_PASSWORD, next to the Anytype API key.
 # With ACCOUNTS_SECRET set beside it and `properties.assignee` configured, every
 # person of the space also has an account of their own, derived from that
