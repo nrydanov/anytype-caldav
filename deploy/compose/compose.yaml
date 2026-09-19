@@ -30,18 +30,27 @@ services:
       - keys:/shared
 
   server:
+    # The published image; `docker compose up --build` builds it from this
+    # checkout instead.
+    image: ghcr.io/nrydanov/anytype-caldav:${ANYTYPE_CALDAV_VERSION:-0.1.0}
     build: ../..
     restart: unless-stopped
     depends_on: [anytype]
     # Waits for the API key, the session token and the id of the joined space
-    # (unless .env names the space), brings the space's schema up to date (init creates only what
-    # is missing) and starts.
+    # (unless .env names the space), brings the space's schema up to date (init
+    # adds only what is missing) and starts. The iCalendar feed gets a random
+    # path, made once and kept in the state volume; Caddy does not route it.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - until [ -s /shared/api-key ] && [ -s /shared/session-token ]; do sleep 2; done;
         if [ -z "$${ANYTYPE_CALDAV__ANYTYPE__SPACE_ID:-}" ]; then
           until [ -s /shared/space-id ]; do sleep 2; done;
           export ANYTYPE_CALDAV__ANYTYPE__SPACE_ID="$$(cat /shared/space-id)";
+        fi;
+        if [ -z "$${ANYTYPE_CALDAV__SERVER__FEED_PATH:-}" ]; then
+          [ -s /data/feed-path ] ||
+            echo "/f/$$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')/todos.ics" > /data/feed-path;
+          export ANYTYPE_CALDAV__SERVER__FEED_PATH="$$(cat /data/feed-path)";
         fi;
         anytype-caldav init --apply && exec anytype-caldav
     env_file: .env
@@ -51,8 +60,16 @@ services:
       ANYTYPE_CALDAV__ANYTYPE__URL: http://anytype:31012
       ANYTYPE_CALDAV__ANYTYPE__GRPC_URL: http://anytype:31020
       ANYTYPE_CALDAV__SERVER__LISTEN: 0.0.0.0:8080
+      ANYTYPE_CALDAV__CALENDAR__TIMEZONE: ${ANYTYPE_CALDAV__CALENDAR__TIMEZONE:?set ANYTYPE_CALDAV__CALENDAR__TIMEZONE in .env}
+      # Everything init prepares is used: the reminder and tag properties,
+      # events and recurring series. .env can turn any of it off.
+      ANYTYPE_CALDAV__PROPERTIES__REMINDER: ${ANYTYPE_CALDAV__PROPERTIES__REMINDER:-key:reminder_lead}
+      ANYTYPE_CALDAV__PROPERTIES__TAGS: ${ANYTYPE_CALDAV__PROPERTIES__TAGS:-key:tag}
       ANYTYPE_CALDAV__CALDAV__ENABLED: "true"
       ANYTYPE_CALDAV__CALDAV__WRITABLE: "true"
+      ANYTYPE_CALDAV__CALDAV__EVENTS: ${ANYTYPE_CALDAV__CALDAV__EVENTS:-true}
+      ANYTYPE_CALDAV__SERIES__ENABLED: ${ANYTYPE_CALDAV__SERIES__ENABLED:-true}
+      ANYTYPE_CALDAV__SERIES__EVENTS: ${ANYTYPE_CALDAV__SERIES__EVENTS:-true}
       ANYTYPE_CALDAV__PUSH__ENABLED: "true"
       ANYTYPE_CALDAV__PUSH__PRIVATE_KEY_FILE: /data/vapid.pem
       ANYTYPE_CALDAV__PUSH__STATE_FILE: /data/state.sqlite3
