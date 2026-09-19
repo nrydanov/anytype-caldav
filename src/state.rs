@@ -129,6 +129,25 @@ impl StateStore {
                 source,
             })?;
 
+        // Whose subscription it is, when a person of the space made it. Added
+        // as a column without bumping user_version: an older binary names the
+        // columns it reads, so a rollback still opens this file.
+        let has_person = connection
+            .prepare("SELECT 1 FROM pragma_table_info('subscriptions') WHERE name = 'person'")
+            .and_then(|mut statement| statement.exists([]))
+            .map_err(|source| StateError::Open {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if !has_person {
+            connection
+                .execute_batch("ALTER TABLE subscriptions ADD COLUMN person TEXT")
+                .map_err(|source| StateError::Open {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+        }
+
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -138,21 +157,64 @@ impl StateStore {
         &self,
         subscription: &BrowserSubscription,
     ) -> Result<(), StateError> {
+        self.upsert_subscription_of(subscription, None)
+    }
+
+    /// `person` is who subscribed, when they signed in with an account of
+    /// their own; such a subscription receives only that person's reminders.
+    pub fn upsert_subscription_of(
+        &self,
+        subscription: &BrowserSubscription,
+        person: Option<&str>,
+    ) -> Result<(), StateError> {
         self.connection()?.execute(
-            "INSERT INTO subscriptions (endpoint, p256dh, auth, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO subscriptions (endpoint, p256dh, auth, updated_at_ms, person)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(endpoint) DO UPDATE SET
                 p256dh = excluded.p256dh,
                 auth = excluded.auth,
-                updated_at_ms = excluded.updated_at_ms",
+                updated_at_ms = excluded.updated_at_ms,
+                person = excluded.person",
             params![
                 subscription.endpoint,
                 subscription.keys.p256dh,
                 subscription.keys.auth,
                 Utc::now().timestamp_millis(),
+                person,
             ],
         )?;
         Ok(())
+    }
+
+    /// The subscriptions a reminder of a task with these assignees goes to:
+    /// everyone who subscribed as nobody in particular, and the assignees'.
+    pub fn subscriptions_reaching(
+        &self,
+        assignees: &[String],
+    ) -> Result<Vec<BrowserSubscription>, StateError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT endpoint, p256dh, auth, person FROM subscriptions ORDER BY endpoint",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let person: Option<String> = row.get(3)?;
+            Ok((
+                BrowserSubscription {
+                    endpoint: row.get(0)?,
+                    keys: SubscriptionKeys {
+                        p256dh: row.get(1)?,
+                        auth: row.get(2)?,
+                    },
+                },
+                person,
+            ))
+        })?;
+        Ok(rows
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|(_, person)| person.as_ref().is_none_or(|p| assignees.contains(p)))
+            .map(|(subscription, _)| subscription)
+            .collect())
     }
 
     pub fn subscriptions(&self) -> Result<Vec<BrowserSubscription>, StateError> {
@@ -338,6 +400,64 @@ mod tests {
         assert!(store.claim_instance("rent", day).unwrap());
         store.release_instance("guitar", day).unwrap();
         assert!(store.claim_instance("guitar", day).unwrap());
+    }
+
+    #[test]
+    fn a_persons_subscription_is_reached_only_by_their_own_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.sqlite3")).unwrap();
+        let at = |endpoint: &str| BrowserSubscription {
+            endpoint: endpoint.into(),
+            ..subscription("key", "auth")
+        };
+        store
+            .upsert_subscription(&at("https://push/everything"))
+            .unwrap();
+        store
+            .upsert_subscription_of(&at("https://push/alice"), Some("alice"))
+            .unwrap();
+        store
+            .upsert_subscription_of(&at("https://push/bob"), Some("bob"))
+            .unwrap();
+
+        let reached = |assignees: &[&str]| -> Vec<String> {
+            let assignees: Vec<String> = assignees.iter().map(|id| id.to_string()).collect();
+            store
+                .subscriptions_reaching(&assignees)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.endpoint)
+                .collect()
+        };
+        assert_eq!(
+            reached(&["alice"]),
+            ["https://push/alice", "https://push/everything"]
+        );
+        assert_eq!(reached(&[]), ["https://push/everything"]);
+        assert_eq!(store.subscriptions().unwrap().len(), 3);
+    }
+
+    /// A file written before subscriptions knew who made them.
+    #[test]
+    fn an_older_file_gains_the_person_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE subscriptions (
+                    endpoint TEXT PRIMARY KEY NOT NULL,
+                    p256dh TEXT NOT NULL,
+                    auth TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                INSERT INTO subscriptions VALUES ('https://push/old', 'k', 'a', 0);",
+            )
+            .unwrap();
+        for _ in 0..2 {
+            let store = StateStore::open(&path).unwrap();
+            assert_eq!(store.subscriptions_reaching(&[]).unwrap().len(), 1);
+        }
     }
 
     #[test]

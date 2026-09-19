@@ -46,7 +46,15 @@ pub struct CheckReport {
 
 #[async_trait]
 pub trait NotificationSink: Send + Sync + 'static {
-    async fn notify_all(&self, notification: &Notification) -> (usize, usize);
+    /// `assignees` are the people the task belongs to: a subscription made by
+    /// a person receives it only when they are among them. `None` reaches
+    /// every subscription: an event belongs to nobody in particular, and its
+    /// calendar is the same for everyone in the space.
+    async fn notify_all(
+        &self,
+        notification: &Notification,
+        assignees: Option<&[String]>,
+    ) -> (usize, usize);
 
     /// How many recipients a send would reach right now.
     fn audience(&self) -> usize;
@@ -54,8 +62,12 @@ pub trait NotificationSink: Send + Sync + 'static {
 
 #[async_trait]
 impl NotificationSink for PushService {
-    async fn notify_all(&self, notification: &Notification) -> (usize, usize) {
-        PushService::notify_all(self, notification).await
+    async fn notify_all(
+        &self,
+        notification: &Notification,
+        assignees: Option<&[String]>,
+    ) -> (usize, usize) {
+        PushService::notify(self, notification, assignees).await
     }
 
     fn audience(&self) -> usize {
@@ -223,18 +235,26 @@ impl PushScheduler {
             tasks = batch.tasks.len(),
             audience, "scheduler evaluating reminders"
         );
-        let mut entries: Vec<(Task, Vec<ReminderMoment>)> = batch
+        // The last field is whether the entry is an event, which reaches
+        // every subscription rather than the assignees.
+        let mut entries: Vec<(Task, Vec<ReminderMoment>, bool)> = batch
             .tasks
             .iter()
             .map(|task| {
                 (
                     task.clone(),
                     reminders_for(task, &self.calendar, &self.reminders),
+                    false,
                 )
             })
             .collect();
-        entries.extend(self.event_entries(now).await);
-        for (task, moments) in &entries {
+        entries.extend(
+            self.event_entries(now)
+                .await
+                .into_iter()
+                .map(|(task, moments)| (task, moments, true)),
+        );
+        for (task, moments, is_event) in &entries {
             // A task can carry several lead times, each claimed on its own.
             for &moment in moments {
                 if moment.trigger_at > now {
@@ -311,7 +331,9 @@ impl PushScheduler {
                     body = %notification.body,
                     "reminder notification built"
                 );
-                let (delivered, subscriptions) = self.sink.notify_all(&notification).await;
+                let assignees = (!is_event).then_some(task.assignees.as_slice());
+                let (delivered, subscriptions) =
+                    self.sink.notify_all(&notification, assignees).await;
                 report.delivered += delivered;
                 report.subscriptions += subscriptions;
                 let log_delivery = |level_ok: bool| {
@@ -571,6 +593,8 @@ mod tests {
 
     struct RecordingSink {
         notifications: Mutex<Vec<Notification>>,
+        /// Whom each notification was addressed to, in the same order.
+        recipients: Mutex<Vec<Option<Vec<String>>>>,
         audience: AtomicUsize,
     }
 
@@ -580,6 +604,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 notifications: Mutex::new(Vec::new()),
+                recipients: Mutex::new(Vec::new()),
                 audience: AtomicUsize::new(1),
             }
         }
@@ -597,11 +622,19 @@ mod tests {
 
     #[async_trait]
     impl NotificationSink for RecordingSink {
-        async fn notify_all(&self, notification: &Notification) -> (usize, usize) {
+        async fn notify_all(
+            &self,
+            notification: &Notification,
+            assignees: Option<&[String]>,
+        ) -> (usize, usize) {
             self.notifications
                 .lock()
                 .unwrap()
                 .push(notification.clone());
+            self.recipients
+                .lock()
+                .unwrap()
+                .push(assignees.map(<[String]>::to_vec));
             let reached = self.audience.load(Ordering::SeqCst);
             (reached, reached)
         }
@@ -684,6 +717,8 @@ mod tests {
 
         let sent = sink.notifications();
         assert_eq!(sent.len(), 1);
+        // A task reaches its assignees, here nobody named.
+        assert_eq!(*sink.recipients.lock().unwrap(), vec![Some(Vec::new())]);
         assert_eq!(sent[0].title, "Купить хлеб");
         assert_eq!(sent[0].body, "Дедлайн сегодня");
         assert_eq!(
@@ -834,6 +869,8 @@ mod tests {
         assert_eq!(sent[0].title, "Семинар");
         assert!(sent[0].body.starts_with("Начало "), "{}", sent[0].body);
         assert!(sent[0].body.contains("10:00"), "{}", sent[0].body);
+        // Everyone subscribed, not the assignees an event does not have.
+        assert_eq!(*sink.recipients.lock().unwrap(), vec![None]);
 
         let (scheduler, sink, _, _directory) = build_scheduler(vec![SourceStep::Tasks(Vec::new())]);
         let scheduler = scheduler.with_events(Arc::new(OneEvent(event("ev", &[]))));

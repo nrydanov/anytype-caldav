@@ -141,7 +141,17 @@ impl PushService {
     /// Replaces any existing entry for the same endpoint: browsers re-issue a
     /// subscription on their own schedule, and a stale one only produces 410s.
     pub fn store(&self, subscription: BrowserSubscription) -> Result<(), StateError> {
-        self.state.upsert_subscription(&subscription)?;
+        self.store_of(subscription, None)
+    }
+
+    /// Stores a subscription made by a person of the space, who then receives
+    /// only the reminders of their own tasks.
+    pub fn store_of(
+        &self,
+        subscription: BrowserSubscription,
+        person: Option<&str>,
+    ) -> Result<(), StateError> {
+        self.state.upsert_subscription_of(&subscription, person)?;
         // Best-effort count: the subscription is already durable, so a failure
         // to read it back is a log-quality problem, not a rejected request.
         info!(
@@ -163,7 +173,21 @@ impl PushService {
 
     /// Sends to every stored subscription, returning how many were delivered.
     pub async fn notify_all(&self, notification: &Notification) -> (usize, usize) {
-        let targets = match self.state.subscriptions() {
+        self.notify(notification, None).await
+    }
+
+    /// Sends a reminder of a task with these assignees; `None` reaches
+    /// everyone, whoever they subscribed as.
+    pub async fn notify(
+        &self,
+        notification: &Notification,
+        assignees: Option<&[String]>,
+    ) -> (usize, usize) {
+        let targets = match assignees {
+            Some(assignees) => self.state.subscriptions_reaching(assignees),
+            None => self.state.subscriptions(),
+        };
+        let targets = match targets {
             Ok(targets) => targets,
             Err(err) => {
                 warn!(error = %err, "cannot read push subscriptions");

@@ -186,6 +186,21 @@ fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
     accepted
 }
 
+/// Like `authorized`, and also accepts a person's own account.
+async fn reader(state: &AppState, headers: &HeaderMap) -> Option<crate::caldav::Reader> {
+    let reader = match &state.caldav {
+        Some(credentials) => credentials.reader(&state.feed, headers).await,
+        None => None,
+    };
+    if reader.is_none() {
+        warn!(
+            presented = headers.contains_key(header::AUTHORIZATION),
+            "push request without valid credentials"
+        );
+    }
+    reader
+}
+
 async fn authorized_subscribe(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -193,9 +208,9 @@ async fn authorized_subscribe(
 ) -> Response {
     // The body is read as text so the credentials are checked before it is
     // parsed: an anonymous caller learns nothing from a 422.
-    if !authorized(&state, &headers) {
+    let Some(reader) = reader(&state, &headers).await else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
+    };
     let subscription: BrowserSubscription = match serde_json::from_str(&body) {
         Ok(subscription) => subscription,
         Err(err) => {
@@ -207,18 +222,43 @@ async fn authorized_subscribe(
         endpoint_host = subscription.endpoint.split('/').nth(2).unwrap_or("?"),
         "push subscription from the calendar app"
     );
-    push_subscribe(State(state), Json(subscription)).await
+    // A person's subscription receives the reminders of their own tasks only.
+    let person = match &reader {
+        crate::caldav::Reader::Person(id) => Some(id.as_str()),
+        crate::caldav::Reader::Shared => None,
+    };
+    let Some(push) = &state.push else {
+        return (StatusCode::NOT_FOUND, "push is disabled").into_response();
+    };
+    match push.store_of(subscription, person) {
+        Ok(()) => (StatusCode::NO_CONTENT, "").into_response(),
+        Err(err) => {
+            error!(error = %err, "cannot store push subscription");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cannot store subscription",
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn authorized_test(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if !authorized(&state, &headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    match reader(&state, &headers).await {
+        None => StatusCode::UNAUTHORIZED.into_response(),
+        Some(crate::caldav::Reader::Shared) => push_test(State(state)).await,
+        // A person's test goes where their reminders go, not to everyone in
+        // the space.
+        Some(crate::caldav::Reader::Person(id)) => send_test(&state, Some(&[id])).await,
     }
-    push_test(State(state)).await
 }
 
 /// Proves the whole chain end to end without waiting for a real deadline.
 async fn push_test(State(state): State<AppState>) -> Response {
+    send_test(&state, None).await
+}
+
+async fn send_test(state: &AppState, assignees: Option<&[String]>) -> Response {
     let Some(push) = &state.push else {
         return (StatusCode::NOT_FOUND, "push is disabled").into_response();
     };
@@ -229,7 +269,7 @@ async fn push_test(State(state): State<AppState>) -> Response {
         tag: Some("test".to_string()),
         day: None,
     };
-    let (delivered, attempted) = push.notify_all(&notification).await;
+    let (delivered, attempted) = push.notify(&notification, assignees).await;
     Json(serde_json::json!({ "delivered": delivered, "subscriptions": attempted })).into_response()
 }
 
