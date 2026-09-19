@@ -71,6 +71,31 @@ impl fmt::Display for PropertySelector {
     }
 }
 
+/// A secret from the environment: the variable `name` itself, or else the file
+/// named by `<name>_FILE`, which is how Docker secrets and the compose kit hand
+/// one over. Whitespace around it, such as the newline a file ends with, is
+/// dropped, and an empty value counts as unset. A `_FILE` that cannot be read
+/// is an error rather than "unset", so a wrong path cannot quietly turn a
+/// feature off. `lookup` reads a variable; the service passes `std::env::var`.
+pub fn read_secret(
+    name: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<String>, ConfigError> {
+    if let Some(value) = lookup(name).filter(|value| !value.trim().is_empty()) {
+        return Ok(Some(value.trim().to_string()));
+    }
+    let file_variable = format!("{name}_FILE");
+    let Some(path) = lookup(&file_variable).filter(|path| !path.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(path.trim()).map_err(|source| ConfigError::Read {
+        path: format!("{} (from {file_variable})", path.trim()),
+        source,
+    })?;
+    let value = text.trim();
+    Ok((!value.is_empty()).then(|| value.to_string()))
+}
+
 /// Sets the value `ANYTYPE_CALDAV__A__B` names at `a.b`, making the tables on
 /// the way. A section given as a scalar, or an empty part, is an error rather
 /// than a value silently dropped.
@@ -929,6 +954,49 @@ allowed_origins = ["https://calino.io"]
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn a_secret_comes_from_its_variable_or_else_from_its_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("api-key");
+        std::fs::write(&file, "from-file\n").unwrap();
+        let file = file.display().to_string();
+
+        let both = |name: &str| match name {
+            "KEY" => Some(" from-variable ".to_string()),
+            "KEY_FILE" => Some(file.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            read_secret("KEY", both).unwrap().as_deref(),
+            Some("from-variable")
+        );
+
+        let file_only = |name: &str| (name == "KEY_FILE").then(|| file.clone());
+        assert_eq!(
+            read_secret("KEY", file_only).unwrap().as_deref(),
+            Some("from-file")
+        );
+
+        let empty_variable = |name: &str| match name {
+            "KEY" => Some("  ".to_string()),
+            "KEY_FILE" => Some(file.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            read_secret("KEY", empty_variable).unwrap().as_deref(),
+            Some("from-file")
+        );
+
+        assert_eq!(read_secret("KEY", |_| None).unwrap(), None);
+
+        let missing = |name: &str| (name == "KEY_FILE").then(|| "/nonexistent/key".to_string());
+        let err = read_secret("KEY", missing).unwrap_err().to_string();
+        assert!(
+            err.contains("/nonexistent/key") && err.contains("KEY_FILE"),
+            "{err}"
+        );
     }
 
     #[test]

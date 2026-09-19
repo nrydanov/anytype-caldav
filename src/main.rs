@@ -64,6 +64,11 @@ enum Command {
     Users,
 }
 
+/// A secret from its variable, or from the file its `_FILE` variable names.
+fn secret(name: &str) -> Result<Option<String>, anytype_caldav::config::ConfigError> {
+    anytype_caldav::config::read_secret(name, |name| std::env::var(name).ok())
+}
+
 fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -94,10 +99,14 @@ fn main() -> std::process::ExitCode {
 
     let args = Args::parse();
 
-    let api_key = match std::env::var(API_KEY_ENV) {
-        Ok(key) if !key.trim().is_empty() => key,
-        _ => {
-            eprintln!("{API_KEY_ENV} must be set to the Anytype API key");
+    let api_key = match secret(API_KEY_ENV) {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            eprintln!("{API_KEY_ENV} or {API_KEY_ENV}_FILE must be set to the Anytype API key");
+            return std::process::ExitCode::FAILURE;
+        }
+        Err(err) => {
+            eprintln!("{err}");
             return std::process::ExitCode::FAILURE;
         }
     };
@@ -160,16 +169,12 @@ async fn init(config: Config, apply: bool) -> Result<(), Box<dyn std::error::Err
 /// The passwords are handed out by hand, in private: a person's page is read
 /// by the whole space, so nothing is written there.
 async fn users(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    let secret = std::env::var(ACCOUNTS_SECRET_ENV)
-        .ok()
-        .map(|secret| secret.trim().to_string())
-        .filter(|secret| !secret.is_empty())
-        .ok_or_else(|| {
-            format!(
-                "{ACCOUNTS_SECRET_ENV} is not set: put the same value the service runs with \
-                 into the environment, e.g. from ~/.config/anytype-exporter.env"
-            )
-        })?;
+    let secret = secret(ACCOUNTS_SECRET_ENV)?.ok_or_else(|| {
+        format!(
+            "neither {ACCOUNTS_SECRET_ENV} nor {ACCOUNTS_SECRET_ENV}_FILE is set: give it \
+             the same value the service runs with"
+        )
+    })?;
     let accounts = Accounts::new(&secret);
     let client = build_client(&config.anytype)?;
     let people = accounts::holders(&client, &config.anytype.space_id).await?;
@@ -407,12 +412,12 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let caldav = if config.caldav.enabled {
-        let password = std::env::var(CALDAV_PASSWORD_ENV).unwrap_or_default();
-        if password.trim().is_empty() {
-            return Err(
-                format!("caldav.enabled is true but {CALDAV_PASSWORD_ENV} is not set").into(),
-            );
-        }
+        let password = secret(CALDAV_PASSWORD_ENV)?.ok_or_else(|| {
+            format!(
+                "caldav.enabled is true but neither {CALDAV_PASSWORD_ENV} nor \
+                 {CALDAV_PASSWORD_ENV}_FILE is set"
+            )
+        })?;
         info!(
             username = %config.caldav.username,
             base = anytype_caldav::caldav::BASE,
@@ -423,12 +428,12 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             anytype_caldav::caldav::Credentials::new(&config.caldav.username, &password);
         // With the secret set, every person of the space also has an account
         // of their own (`exporter users` prints them).
-        let credentials = match std::env::var(ACCOUNTS_SECRET_ENV) {
-            Ok(secret) if !secret.trim().is_empty() => {
+        let credentials = match secret(ACCOUNTS_SECRET_ENV)? {
+            Some(secret) => {
                 info!("caldav accounts per person enabled");
-                credentials.with_accounts(secret.trim())
+                credentials.with_accounts(&secret)
             }
-            _ => credentials,
+            None => credentials,
         };
         Some(Arc::new(credentials))
     } else {

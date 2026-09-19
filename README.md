@@ -75,6 +75,9 @@ describes every option. Secrets come from the environment:
 | `CALDAV_PASSWORD` | `[caldav]`, the shared login |
 | `ACCOUNTS_SECRET` | accounts per person (`properties.assignee` must be set) |
 
+Each can also be read from a file named by the same variable with `_FILE`
+appended, such as `ANYTYPE_API_KEY_FILE`, as Docker secrets are passed.
+
 Notifications, the default calendar names and the deadline line in a task's
 description are in English or Russian, set by `calendar.language` (`"en"` by
 default, or `"ru"`).
