@@ -60,6 +60,15 @@ pub struct StateStore {
     connection: Mutex<Connection>,
 }
 
+/// A claimed occurrence of a series.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Claim {
+    /// What the meeting made for it held when the generator last wrote it;
+    /// none for a claim recorded before fingerprints were kept, or by hand.
+    pub fingerprint: Option<String>,
+    pub claimed_at: DateTime<Utc>,
+}
+
 impl StateStore {
     pub fn open(path: &Path) -> Result<Self, StateError> {
         if let Some(parent) = path
@@ -322,26 +331,27 @@ impl StateStore {
         Ok(())
     }
 
-    /// Every claimed occurrence, by series and day, with the fingerprint of
-    /// the meeting made for it when one was recorded.
-    pub fn claimed_instances(
-        &self,
-    ) -> Result<HashMap<(String, NaiveDate), Option<String>>, StateError> {
+    /// Every claimed occurrence, by series and day.
+    pub fn claimed_instances(&self) -> Result<HashMap<(String, NaiveDate), Claim>, StateError> {
         let connection = self.connection()?;
-        let mut statement = connection
-            .prepare("SELECT series_id, occurrence_day, fingerprint FROM generated_instances")?;
+        let mut statement = connection.prepare(
+            "SELECT series_id, occurrence_day, fingerprint, created_at_ms FROM generated_instances",
+        )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
+                Claim {
+                    fingerprint: row.get(2)?,
+                    claimed_at: DateTime::from_timestamp_millis(row.get(3)?).unwrap_or_default(),
+                },
             ))
         })?;
         let mut claims = HashMap::new();
         for row in rows {
-            let (series_id, day, fingerprint) = row?;
+            let (series_id, day, claim) = row?;
             if let Ok(day) = day.parse::<NaiveDate>() {
-                claims.insert((series_id, day), fingerprint);
+                claims.insert((series_id, day), claim);
             }
         }
         Ok(claims)
@@ -472,12 +482,11 @@ mod tests {
         let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
         store.claim_instance("daily", day).unwrap();
         let key = ("daily".to_string(), day);
-        assert_eq!(store.claimed_instances().unwrap().get(&key), Some(&None));
+        let fingerprint =
+            |store: &StateStore| store.claimed_instances().unwrap()[&key].fingerprint.clone();
+        assert_eq!(fingerprint(&store), None);
         store.record_instance("daily", day, "shape").unwrap();
-        assert_eq!(
-            store.claimed_instances().unwrap().get(&key),
-            Some(&Some("shape".to_string()))
-        );
+        assert_eq!(fingerprint(&store).as_deref(), Some("shape"));
     }
 
     #[test]
@@ -500,7 +509,7 @@ mod tests {
         let store = StateStore::open(&path).unwrap();
         let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
         let key = ("daily".to_string(), day);
-        assert_eq!(store.claimed_instances().unwrap().get(&key), Some(&None));
+        assert_eq!(store.claimed_instances().unwrap()[&key].fingerprint, None);
         store.record_instance("daily", day, "shape").unwrap();
         assert!(store.instance_claimed("daily", day).unwrap());
     }

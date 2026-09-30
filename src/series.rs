@@ -22,6 +22,10 @@
 //! archived. A meeting somebody changed by hand is left as it is; the state
 //! file keeps what the generator last wrote to each meeting to tell. Tasks
 //! are not maintained this way.
+//!
+//! An event series' `exdate` leaves days out: no meeting is made for them. A
+//! meeting deleted by hand joins the `exdate` of its series, so that a
+//! calendar expanding the rule does not show that day again.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -47,7 +51,7 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::{
     model::{AnytypeDate, CalendarValue},
-    state::{StateError, StateStore},
+    state::{Claim, StateError, StateStore},
 };
 
 pub const SERIES_TYPE: &str = "recurring_task";
@@ -99,6 +103,18 @@ pub struct Series {
     pub icon: Option<Icon>,
     /// Every property the object has, for `carried`.
     pub extra: Vec<(String, PropertyValue)>,
+    /// Occurrences left out of the series (`exdate`, one per line): no
+    /// meeting is made for their day.
+    pub exdates: Vec<AnytypeDate>,
+}
+
+impl Series {
+    /// Whether the occurrence on `day` is left out of the series.
+    pub fn excludes(&self, tz: Tz, day: NaiveDate) -> bool {
+        self.exdates
+            .iter()
+            .any(|excluded| excluded.parsed.with_timezone(&tz).date_naive() == day)
+    }
 }
 
 /// Keys the generator sets from its own fields, and those Anytype keeps for
@@ -427,7 +443,10 @@ pub fn plan_until<'a>(
             }
         };
         let own: Vec<&Instance> = instances.iter().filter(|i| i.series_id == one.id).collect();
-        for next in wanted {
+        for next in wanted
+            .into_iter()
+            .filter(|(_, day)| !one.excludes(tz, *day))
+        {
             let matching = own.iter().find(|instance| {
                 instance
                     .occurrence
@@ -494,7 +513,18 @@ pub enum Upkeep<'a> {
         day: NaiveDate,
         fingerprint: String,
     },
+    /// Occurrences whose meeting was made or skipped once and is gone now,
+    /// deleted by hand: they join the series' `exdate`, so a calendar that
+    /// expands the rule leaves them out as well.
+    Exclude {
+        series: &'a Series,
+        occurrences: Vec<String>,
+    },
 }
+
+/// How old a claim without a meeting has to be to count as a meeting deleted:
+/// a meeting just made may not be found by search yet.
+const SETTLED: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
 
 /// The occurrence of `series` on `day`. `Err` when the series has no rule or
 /// start, or its rule does not parse: then nothing can be said about the day.
@@ -502,6 +532,9 @@ fn occurrence_on(series: &Series, tz: Tz, day: NaiveDate) -> Result<Option<DateT
     let (Some(rule), Some(anchor)) = (&series.rrule, &series.anchor) else {
         return Err(());
     };
+    if series.excludes(tz, day) {
+        return Ok(None);
+    }
     Ok(upcoming(rule, anchor, tz, day, day)
         .map_err(|_| ())?
         .into_iter()
@@ -516,7 +549,7 @@ fn occurrence_on(series: &Series, tz: Tz, day: NaiveDate) -> Result<Option<DateT
 pub fn plan_upkeep<'a>(
     series: &'a [Series],
     instances: &[Instance],
-    claims: &HashMap<(String, NaiveDate), Option<String>>,
+    claims: &HashMap<(String, NaiveDate), Claim>,
     tz: Tz,
     now: DateTime<Utc>,
 ) -> Vec<Upkeep<'a>> {
@@ -535,7 +568,11 @@ pub fn plan_upkeep<'a>(
             continue;
         }
         // Without a claim the meeting was made by hand.
-        let Some(recorded) = claims.get(&(instance.series_id.clone(), day)) else {
+        let Some(Claim {
+            fingerprint: recorded,
+            ..
+        }) = claims.get(&(instance.series_id.clone(), day))
+        else {
             continue;
         };
         let current = instance.shape.fingerprint();
@@ -593,6 +630,42 @@ pub fn plan_upkeep<'a>(
             decision,
             "upkeep decision"
         );
+    }
+
+    let mut excluded: Vec<(&Series, Vec<String>)> = Vec::new();
+    for ((series_id, day), claim) in claims {
+        if *day < today || claim.claimed_at > now - SETTLED {
+            continue;
+        }
+        let Some(one) = series.iter().find(|one| &one.id == series_id) else {
+            continue;
+        };
+        let has_meeting = instances.iter().any(|instance| {
+            &instance.series_id == series_id
+                && instance
+                    .occurrence
+                    .as_ref()
+                    .is_some_and(|o| o.parsed.with_timezone(&tz).date_naive() == *day)
+        });
+        let Ok(Some(at)) = occurrence_on(one, tz, *day) else {
+            continue;
+        };
+        if has_meeting {
+            continue;
+        }
+        debug!(series_id, %day, decision = "exclude: its meeting was deleted", "upkeep decision");
+        let occurrence = at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        match excluded.iter_mut().find(|(found, _)| found.id == one.id) {
+            Some((_, occurrences)) => occurrences.push(occurrence),
+            None => excluded.push((one, vec![occurrence])),
+        }
+    }
+    for (one, mut occurrences) in excluded {
+        occurrences.sort();
+        upkeep.push(Upkeep::Exclude {
+            series: one,
+            occurrences,
+        });
     }
     upkeep
 }
@@ -675,6 +748,9 @@ impl AnytypeSeries {
                     .iter()
                     .map(|property| (property.key.clone(), property.value.clone()))
                     .collect(),
+                exdates: text(&object, "exdate")
+                    .map(|values| values.lines().filter_map(AnytypeDate::parse).collect())
+                    .unwrap_or_default(),
             })
             .collect())
     }
@@ -846,6 +922,30 @@ impl AnytypeSeries {
         request.update().await.inspect_err(|err| {
             error!(object_id, series_id = %series.id, day = %planned.day, error = %err, "anytype update event failed");
         })?;
+        Ok(())
+    }
+
+    /// Adds occurrences to a series' `exdate`, keeping those it has.
+    pub async fn exclude(
+        &self,
+        series: &Series,
+        occurrences: &[String],
+    ) -> Result<(), SeriesError> {
+        let text = series
+            .exdates
+            .iter()
+            .map(|excluded| excluded.raw.clone())
+            .chain(occurrences.iter().cloned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.client
+            .update_object(&self.space_id, &series.id)
+            .set_text("exdate", text)
+            .update()
+            .await
+            .inspect_err(|err| {
+                error!(series_id = %series.id, error = %err, "anytype update series exdate failed");
+            })?;
         Ok(())
     }
 
@@ -1082,7 +1182,8 @@ impl SeriesGenerator {
         now: DateTime<Utc>,
     ) -> Result<(), SeriesError> {
         let claims = self.state.claimed_instances()?;
-        let (mut updated, mut archived, mut adopted, mut failed) = (0usize, 0usize, 0usize, 0usize);
+        let (mut updated, mut archived, mut adopted, mut excluded, mut failed) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
         for one in plan_upkeep(series, instances, &claims, self.tz, now) {
             match one {
                 Upkeep::Update { object_id, planned } => {
@@ -1118,12 +1219,22 @@ impl SeriesGenerator {
                     self.state.record_instance(&series_id, day, &fingerprint)?;
                     adopted += 1;
                 }
+                Upkeep::Exclude {
+                    series,
+                    occurrences,
+                } => match self.source.exclude(series, &occurrences).await {
+                    Ok(()) => {
+                        info!(series_id = %series.id, series = %series.name, ?occurrences, "left deleted meetings out of their series");
+                        excluded += occurrences.len();
+                    }
+                    Err(_) => failed += 1,
+                },
             }
         }
-        if updated + archived + adopted + failed > 0 {
+        if updated + archived + adopted + excluded + failed > 0 {
             info!(
                 updated,
-                archived, adopted, failed, "upkeep of meetings finished"
+                archived, adopted, excluded, failed, "upkeep of meetings finished"
             );
         }
         Ok(())
@@ -1189,6 +1300,7 @@ mod tests {
             address: None,
             icon: None,
             extra: Vec::new(),
+            exdates: Vec::new(),
         }
     }
 
@@ -1375,9 +1487,7 @@ mod tests {
         }
     }
 
-    fn claims(
-        entries: &[(&Instance, Option<String>)],
-    ) -> HashMap<(String, NaiveDate), Option<String>> {
+    fn claims(entries: &[(&Instance, Option<String>)]) -> HashMap<(String, NaiveDate), Claim> {
         entries
             .iter()
             .map(|(instance, recorded)| {
@@ -1388,7 +1498,11 @@ mod tests {
                     .parsed
                     .with_timezone(&Saratov)
                     .date_naive();
-                ((instance.series_id.clone(), day), recorded.clone())
+                let claim = Claim {
+                    fingerprint: recorded.clone(),
+                    claimed_at: DateTime::UNIX_EPOCH,
+                };
+                ((instance.series_id.clone(), day), claim)
             })
             .collect()
     }
@@ -1510,6 +1624,81 @@ mod tests {
         let mut changed = made;
         changed.shape.name = "Дейлик с Мишей".into();
         assert!(plan_upkeep(&daily, &[changed], &recorded, Saratov, now()).is_empty());
+    }
+
+    #[test]
+    fn an_excluded_day_gets_no_meeting_and_loses_the_one_it_had() {
+        let mut daily = series("daily", "FREQ=DAILY", DAILY);
+        let made = meeting(&daily, "2026-10-01T11:00:00Z");
+        daily.exdates = vec![at("2026-10-01T11:00:00Z")];
+        let daily = [daily];
+        let (planned, _) = plan_until(&daily, &[], Saratov, day(2026, 9, 30), day(2026, 10, 2));
+        let days: Vec<NaiveDate> = planned.iter().map(|p| p.day).collect();
+        assert_eq!(days, vec![day(2026, 9, 30), day(2026, 10, 2)]);
+
+        let recorded = claims(&[(&made, Some(made.shape.fingerprint()))]);
+        assert!(matches!(
+            plan_upkeep(&daily, &[made], &recorded, Saratov, now()).as_slice(),
+            [Upkeep::Archive { .. }]
+        ));
+    }
+
+    #[test]
+    fn a_deleted_meeting_joins_the_series_exdate() {
+        let daily = [series("daily", "FREQ=DAILY", DAILY)];
+        let gone_first = meeting(&daily[0], "2026-10-01T11:00:00Z");
+        let gone_second = meeting(&daily[0], "2026-10-03T11:00:00Z");
+        let kept = meeting(&daily[0], "2026-10-02T11:00:00Z");
+        let mut recorded = claims(&[
+            (&gone_second, None),
+            (&gone_first, Some(gone_first.shape.fingerprint())),
+            (&kept, Some(kept.shape.fingerprint())),
+        ]);
+        let upkeep = plan_upkeep(
+            &daily,
+            std::slice::from_ref(&kept),
+            &recorded,
+            Saratov,
+            now(),
+        );
+        let [
+            Upkeep::Exclude {
+                series,
+                occurrences,
+            },
+        ] = upkeep.as_slice()
+        else {
+            panic!("{upkeep:?}");
+        };
+        assert_eq!(series.id, "daily");
+        assert_eq!(
+            occurrences,
+            &["2026-10-01T11:00:00Z", "2026-10-03T11:00:00Z"]
+        );
+
+        // A claim just made may stand for a meeting search does not show yet.
+        for claim in recorded.values_mut() {
+            claim.claimed_at = now() - chrono::TimeDelta::minutes(1);
+        }
+        assert!(
+            plan_upkeep(
+                &daily,
+                std::slice::from_ref(&kept),
+                &recorded,
+                Saratov,
+                now()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_excluded_day_is_not_excluded_again() {
+        let mut daily = series("daily", "FREQ=DAILY", DAILY);
+        let gone = meeting(&daily, "2026-10-01T11:00:00Z");
+        daily.exdates = vec![at("2026-10-01T11:00:00Z")];
+        let recorded = claims(&[(&gone, None)]);
+        assert!(plan_upkeep(&[daily], &[], &recorded, Saratov, now()).is_empty());
     }
 
     // Saturday 2026-09-19 at 12:00 Saratov is 08:00Z.
