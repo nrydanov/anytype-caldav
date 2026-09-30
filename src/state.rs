@@ -1,6 +1,7 @@
 //! Durable Web Push subscriptions and reminder delivery state.
 
 use std::{
+    collections::HashMap,
     path::Path,
     sync::{Mutex, MutexGuard},
 };
@@ -142,6 +143,27 @@ impl StateStore {
         if !has_person {
             connection
                 .execute_batch("ALTER TABLE subscriptions ADD COLUMN person TEXT")
+                .map_err(|source| StateError::Open {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+        }
+
+        // What a generated meeting held when the generator last wrote it; a
+        // meeting that still holds it was changed by nobody. Added like
+        // `person`.
+        let has_fingerprint = connection
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('generated_instances') WHERE name = 'fingerprint'",
+            )
+            .and_then(|mut statement| statement.exists([]))
+            .map_err(|source| StateError::Open {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if !has_fingerprint {
+            connection
+                .execute_batch("ALTER TABLE generated_instances ADD COLUMN fingerprint TEXT")
                 .map_err(|source| StateError::Open {
                     path: path.display().to_string(),
                     source,
@@ -300,6 +322,47 @@ impl StateStore {
         Ok(())
     }
 
+    /// Every claimed occurrence, by series and day, with the fingerprint of
+    /// the meeting made for it when one was recorded.
+    pub fn claimed_instances(
+        &self,
+    ) -> Result<HashMap<(String, NaiveDate), Option<String>>, StateError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT series_id, occurrence_day, fingerprint FROM generated_instances")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut claims = HashMap::new();
+        for row in rows {
+            let (series_id, day, fingerprint) = row?;
+            if let Ok(day) = day.parse::<NaiveDate>() {
+                claims.insert((series_id, day), fingerprint);
+            }
+        }
+        Ok(claims)
+    }
+
+    /// Records what the meeting of a claimed occurrence holds as written by
+    /// the generator.
+    pub fn record_instance(
+        &self,
+        series_id: &str,
+        day: NaiveDate,
+        fingerprint: &str,
+    ) -> Result<(), StateError> {
+        self.connection()?.execute(
+            "UPDATE generated_instances SET fingerprint = ?3
+             WHERE series_id = ?1 AND occurrence_day = ?2",
+            params![series_id, day.to_string(), fingerprint],
+        )?;
+        Ok(())
+    }
+
     /// Every document of a collection, oldest name first.
     pub fn documents(&self, collection: &str) -> Result<Vec<(String, String)>, StateError> {
         let connection = self.connection()?;
@@ -400,6 +463,46 @@ mod tests {
         assert!(store.claim_instance("rent", day).unwrap());
         store.release_instance("guitar", day).unwrap();
         assert!(store.claim_instance("guitar", day).unwrap());
+    }
+
+    #[test]
+    fn a_claim_keeps_the_fingerprint_of_its_meeting() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.sqlite3")).unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
+        store.claim_instance("daily", day).unwrap();
+        let key = ("daily".to_string(), day);
+        assert_eq!(store.claimed_instances().unwrap().get(&key), Some(&None));
+        store.record_instance("daily", day, "shape").unwrap();
+        assert_eq!(
+            store.claimed_instances().unwrap().get(&key),
+            Some(&Some("shape".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_file_without_fingerprints_gains_the_column_and_keeps_its_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite3");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE generated_instances (
+                    series_id TEXT NOT NULL,
+                    occurrence_day TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (series_id, occurrence_day)
+                );
+                INSERT INTO generated_instances VALUES ('daily', '2026-10-19', 0);
+                PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        let store = StateStore::open(&path).unwrap();
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 19).unwrap();
+        let key = ("daily".to_string(), day);
+        assert_eq!(store.claimed_instances().unwrap().get(&key), Some(&None));
+        store.record_instance("daily", day, "shape").unwrap();
+        assert!(store.instance_claimed("daily", day).unwrap());
     }
 
     #[test]

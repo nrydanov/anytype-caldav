@@ -31,6 +31,8 @@ calendar client's own settings.
   restarts. A person's subscription receives only the reminders of their tasks.
 - **Recurring tasks and events**: a `recurring_task` or `recurring_event`
   object holds the rule; the server creates the next occurrence in Anytype.
+  Meetings ahead follow a change to their series or its archiving, unless
+  somebody changed them by hand.
 - **`init`** checks a space against the schema the server needs and adds
   what is missing: properties, the types `event`, `recurring_task` and
   `recurring_event`, the properties each type lists, and the ones shown in a

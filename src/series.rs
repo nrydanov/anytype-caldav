@@ -15,9 +15,16 @@
 //! An instance is matched to an occurrence by the *day* of its `occurrence`
 //! property, not the instant, so a date-only anchor and a timed one compare the
 //! same way and a hand-made instance at a slightly different hour still counts.
+//!
+//! Meetings ahead follow their series: when its time, length, name, place,
+//! tags or reminders change, the meetings the generator made are rewritten,
+//! and when the series is archived or its rule drops a day, those meetings are
+//! archived. A meeting somebody changed by hand is left as it is; the state
+//! file keeps what the generator last wrote to each meeting to tell. Tasks
+//! are not maintained this way.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     str::FromStr,
     sync::{
         Arc, Mutex,
@@ -211,6 +218,70 @@ pub struct Instance {
     pub object_id: String,
     pub series_id: String,
     pub occurrence: Option<AnytypeDate>,
+    /// What it holds of the fields the generator sets on a meeting.
+    pub shape: Shape,
+}
+
+/// The fields the generator sets on a meeting. What a meeting holds is
+/// compared with what the generator wrote to tell whether anybody changed it
+/// since. Instants are Unix seconds, so the form in which Anytype gives a date
+/// back does not count as a change, and tags are sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Shape {
+    pub name: String,
+    pub start: Option<i64>,
+    pub end: Option<i64>,
+    pub address: Option<String>,
+    pub tags: Vec<String>,
+    pub reminder_leads: Vec<String>,
+}
+
+impl Shape {
+    /// The meeting a series makes for one occurrence.
+    pub fn of_meeting(series: &Series, occurrence: DateTime<Utc>, day: NaiveDate) -> Self {
+        Self {
+            name: event_name(series, day),
+            start: Some(occurrence.timestamp()),
+            end: event_end(series, occurrence)
+                .and_then(|end| AnytypeDate::parse(&end))
+                .map(|end| end.parsed.timestamp()),
+            address: series
+                .address
+                .clone()
+                .filter(|address| !address.trim().is_empty()),
+            tags: sorted(series.tags.clone()),
+            reminder_leads: sorted(series.reminder_leads.clone()),
+        }
+    }
+
+    pub fn of_object(object: &Object) -> Self {
+        Self {
+            name: object.name.clone().unwrap_or_default().trim().to_string(),
+            start: date(object, "start_date").map(|d| d.parsed.timestamp()),
+            end: date(object, "end_date").map(|d| d.parsed.timestamp()),
+            address: text(object, "address"),
+            tags: sorted(tag_ids(object, "tag")),
+            reminder_leads: sorted(tag_ids(object, "reminder_lead")),
+        }
+    }
+
+    /// The form kept in the state file.
+    pub fn fingerprint(&self) -> String {
+        serde_json::json!([
+            self.name,
+            self.start,
+            self.end,
+            self.address,
+            self.tags,
+            self.reminder_leads
+        ])
+        .to_string()
+    }
+}
+
+fn sorted(mut ids: Vec<String>) -> Vec<String> {
+    ids.sort();
+    ids
 }
 
 /// A task the generator wants to exist.
@@ -400,6 +471,132 @@ pub fn plan<'a>(
     plan_until(series, instances, tz, today, today)
 }
 
+/// What becomes of a future meeting the generator made, once its series
+/// changed. A meeting somebody changed by hand is never touched.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Upkeep<'a> {
+    /// The series now makes this meeting differently: another time, length,
+    /// name, place, tags or reminders.
+    Update {
+        object_id: String,
+        planned: Planned<'a>,
+    },
+    /// The series is gone, or its rule no longer has this day.
+    Archive {
+        object_id: String,
+        series_id: String,
+        day: NaiveDate,
+    },
+    /// A meeting made before fingerprints were kept, exactly as its series
+    /// makes it now: from here on it counts as unchanged.
+    Adopt {
+        series_id: String,
+        day: NaiveDate,
+        fingerprint: String,
+    },
+}
+
+/// The occurrence of `series` on `day`. `Err` when the series has no rule or
+/// start, or its rule does not parse: then nothing can be said about the day.
+fn occurrence_on(series: &Series, tz: Tz, day: NaiveDate) -> Result<Option<DateTime<Utc>>, ()> {
+    let (Some(rule), Some(anchor)) = (&series.rrule, &series.anchor) else {
+        return Err(());
+    };
+    Ok(upcoming(rule, anchor, tz, day, day)
+        .map_err(|_| ())?
+        .into_iter()
+        .find(|(_, found)| *found == day)
+        .map(|(at, _)| at))
+}
+
+/// Decides what to do with the meetings still ahead that the generator made:
+/// those with a claim on their series and day. A meeting counts as unchanged
+/// when it holds what the generator last wrote to it, as recorded in the
+/// claim. Pure, like `plan_until`.
+pub fn plan_upkeep<'a>(
+    series: &'a [Series],
+    instances: &[Instance],
+    claims: &HashMap<(String, NaiveDate), Option<String>>,
+    tz: Tz,
+    now: DateTime<Utc>,
+) -> Vec<Upkeep<'a>> {
+    let today = now.with_timezone(&tz).date_naive();
+    let mut upkeep = Vec::new();
+    for instance in instances {
+        let Some(occurrence) = &instance.occurrence else {
+            continue;
+        };
+        let day = occurrence.parsed.with_timezone(&tz).date_naive();
+        let start = instance
+            .shape
+            .start
+            .unwrap_or_else(|| occurrence.parsed.timestamp());
+        if day < today || start <= now.timestamp() {
+            continue;
+        }
+        // Without a claim the meeting was made by hand.
+        let Some(recorded) = claims.get(&(instance.series_id.clone(), day)) else {
+            continue;
+        };
+        let current = instance.shape.fingerprint();
+        let unchanged = recorded.as_deref() == Some(current.as_str());
+        let owner = series.iter().find(|one| one.id == instance.series_id);
+        let wanted = match owner.map(|one| (one, occurrence_on(one, tz, day))) {
+            None => None,
+            Some((one, Ok(Some(at)))) => Some((one, at)),
+            Some((_, Ok(None))) => None,
+            // A rule being edited says nothing about the meetings.
+            Some((_, Err(()))) => continue,
+        };
+        let decision = match wanted {
+            None if unchanged => {
+                upkeep.push(Upkeep::Archive {
+                    object_id: instance.object_id.clone(),
+                    series_id: instance.series_id.clone(),
+                    day,
+                });
+                "archive: the series no longer has this day"
+            }
+            None => "keep: no longer in the series, but changed by hand",
+            Some((one, at)) => {
+                let expected = Shape::of_meeting(one, at, day).fingerprint();
+                if current == expected {
+                    if recorded.is_none() {
+                        upkeep.push(Upkeep::Adopt {
+                            series_id: one.id.clone(),
+                            day,
+                            fingerprint: expected,
+                        });
+                        "adopt: as the series makes it"
+                    } else {
+                        "keep: as the series makes it"
+                    }
+                } else if unchanged {
+                    upkeep.push(Upkeep::Update {
+                        object_id: instance.object_id.clone(),
+                        planned: Planned {
+                            series: one,
+                            occurrence: at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            day,
+                        },
+                    });
+                    "update: the series changed"
+                } else {
+                    "keep: changed by hand"
+                }
+            }
+        };
+        debug!(
+            series_id = %instance.series_id,
+            object_id = %instance.object_id,
+            %day,
+            decision,
+            "upkeep decision"
+        );
+    }
+    upkeep
+}
+
 /// Reads series and their instances from one space, and creates instances.
 pub struct AnytypeSeries {
     client: AnytypeClient,
@@ -496,6 +693,7 @@ impl AnytypeSeries {
                     object_id: object.id.clone(),
                     series_id,
                     occurrence: date(&object, "occurrence"),
+                    shape: Shape::of_object(&object),
                 });
             }
         }
@@ -620,6 +818,47 @@ impl AnytypeSeries {
             "anytype create event finished"
         );
         Ok(object.id)
+    }
+
+    /// Rewrites a meeting the way its series makes it now. What the series
+    /// carries beyond its own fields is left as it was.
+    pub async fn update_event(
+        &self,
+        object_id: &str,
+        planned: &Planned<'_>,
+    ) -> Result<(), SeriesError> {
+        let series = planned.series;
+        let at = DateTime::parse_from_rfc3339(&planned.occurrence)
+            .map(|at| at.with_timezone(&Utc))
+            .expect("the planner writes RFC 3339");
+        let mut request = self
+            .client
+            .update_object(&self.space_id, object_id)
+            .name(event_name(series, planned.day))
+            .set_date("occurrence", planned.occurrence.clone())
+            .set_date("start_date", planned.occurrence.clone())
+            .set_text("address", series.address.clone().unwrap_or_default())
+            .set_multi_select("tag", series.tags.clone())
+            .set_multi_select("reminder_lead", series.reminder_leads.clone());
+        if let Some(end) = event_end(series, at) {
+            request = request.set_date("end_date", end);
+        }
+        request.update().await.inspect_err(|err| {
+            error!(object_id, series_id = %series.id, day = %planned.day, error = %err, "anytype update event failed");
+        })?;
+        Ok(())
+    }
+
+    /// Archives a meeting, as deleting it in Anytype does.
+    pub async fn archive(&self, object_id: &str) -> Result<(), SeriesError> {
+        self.client
+            .object(&self.space_id, object_id)
+            .delete()
+            .await
+            .inspect_err(|err| {
+                error!(object_id, error = %err, "anytype archive event failed");
+            })?;
+        Ok(())
     }
 
     /// Creates the task for one occurrence, copying what the series carries.
@@ -757,6 +996,9 @@ impl SeriesGenerator {
             debug!(series_id = %one.series.id, day = %one.day, "occurrence claimed");
             match self.source.create(&one).await {
                 Ok(id) => {
+                    if self.source.kind() == Kind::Event {
+                        self.record(&one);
+                    }
                     info!(
                         series_id = %one.series.id,
                         series = %one.series.name,
@@ -787,6 +1029,10 @@ impl SeriesGenerator {
             }
         }
 
+        if self.source.kind() == Kind::Event {
+            self.upkeep(&series, &instances, now).await?;
+        }
+
         let summary_is_news = created + failed + already > 0;
         macro_rules! summary {
             ($level:ident) => {
@@ -810,6 +1056,77 @@ impl SeriesGenerator {
             summary!(debug);
         }
         Ok(created)
+    }
+
+    /// Keeps a claim's fingerprint of the meeting just written for it. A
+    /// failure only leaves that meeting out of the upkeep, so it is logged.
+    fn record(&self, planned: &Planned<'_>) {
+        let Ok(at) = DateTime::parse_from_rfc3339(&planned.occurrence) else {
+            return;
+        };
+        let shape = Shape::of_meeting(planned.series, at.with_timezone(&Utc), planned.day);
+        if let Err(err) =
+            self.state
+                .record_instance(&planned.series.id, planned.day, &shape.fingerprint())
+        {
+            warn!(series_id = %planned.series.id, day = %planned.day, error = %err, "cannot record the meeting's fingerprint");
+        }
+    }
+
+    /// Brings the meetings ahead that nobody changed in line with their
+    /// series. One failure is logged and does not stop the rest.
+    async fn upkeep(
+        &self,
+        series: &[Series],
+        instances: &[Instance],
+        now: DateTime<Utc>,
+    ) -> Result<(), SeriesError> {
+        let claims = self.state.claimed_instances()?;
+        let (mut updated, mut archived, mut adopted, mut failed) = (0usize, 0usize, 0usize, 0usize);
+        for one in plan_upkeep(series, instances, &claims, self.tz, now) {
+            match one {
+                Upkeep::Update { object_id, planned } => {
+                    match self.source.update_event(&object_id, &planned).await {
+                        Ok(()) => {
+                            info!(object_id, series = %planned.series.name, day = %planned.day, occurrence = %planned.occurrence, "updated a meeting after its series changed");
+                            self.record(&planned);
+                            updated += 1;
+                        }
+                        Err(_) => failed += 1,
+                    }
+                }
+                Upkeep::Archive {
+                    object_id,
+                    series_id,
+                    day,
+                } => {
+                    match self.source.archive(&object_id).await {
+                        Ok(()) => {
+                            info!(object_id, series_id, %day, "archived a meeting its series no longer has");
+                            // Should the series have the day again, the meeting is made anew.
+                            self.state.release_instance(&series_id, day)?;
+                            archived += 1;
+                        }
+                        Err(_) => failed += 1,
+                    }
+                }
+                Upkeep::Adopt {
+                    series_id,
+                    day,
+                    fingerprint,
+                } => {
+                    self.state.record_instance(&series_id, day, &fingerprint)?;
+                    adopted += 1;
+                }
+            }
+        }
+        if updated + archived + adopted + failed > 0 {
+            info!(
+                updated,
+                archived, adopted, failed, "upkeep of meetings finished"
+            );
+        }
+        Ok(())
     }
 
     pub async fn run(self: Arc<Self>) {
@@ -1042,7 +1359,157 @@ mod tests {
             object_id: format!("task-of-{series_id}"),
             series_id: series_id.into(),
             occurrence: Some(at(occurrence)),
+            shape: Shape::default(),
         }
+    }
+
+    /// A meeting as `series` makes it for `occurrence`.
+    fn meeting(series: &Series, occurrence: &str) -> Instance {
+        let at = at(occurrence).parsed.with_timezone(&Utc);
+        let day = at.with_timezone(&Saratov).date_naive();
+        Instance {
+            object_id: format!("meeting-{day}"),
+            series_id: series.id.clone(),
+            occurrence: Some(AnytypeDate::parse(occurrence).unwrap()),
+            shape: Shape::of_meeting(series, at, day),
+        }
+    }
+
+    fn claims(
+        entries: &[(&Instance, Option<String>)],
+    ) -> HashMap<(String, NaiveDate), Option<String>> {
+        entries
+            .iter()
+            .map(|(instance, recorded)| {
+                let day = instance
+                    .occurrence
+                    .as_ref()
+                    .unwrap()
+                    .parsed
+                    .with_timezone(&Saratov)
+                    .date_naive();
+                ((instance.series_id.clone(), day), recorded.clone())
+            })
+            .collect()
+    }
+
+    // Wednesday 2026-09-30, 12:00 Saratov; the daily meeting is at 15:00.
+    const NOON: &str = "2026-09-30T08:00:00Z";
+    const DAILY: &str = "2026-09-28T11:00:00Z";
+
+    fn now() -> DateTime<Utc> {
+        at(NOON).parsed.with_timezone(&Utc)
+    }
+
+    #[test]
+    fn an_unchanged_meeting_follows_its_series_to_another_hour() {
+        let before = series("daily", "FREQ=DAILY", DAILY);
+        let made = meeting(&before, "2026-10-01T11:00:00Z");
+        let recorded = claims(&[(&made, Some(made.shape.fingerprint()))]);
+        // The series moves from 15:00 to 16:00 Saratov.
+        let after = [series("daily", "FREQ=DAILY", "2026-09-28T12:00:00Z")];
+        let upkeep = plan_upkeep(&after, &[made], &recorded, Saratov, now());
+        let [Upkeep::Update { object_id, planned }] = upkeep.as_slice() else {
+            panic!("{upkeep:?}");
+        };
+        assert_eq!(object_id, "meeting-2026-10-01");
+        assert_eq!(planned.occurrence, "2026-10-01T12:00:00Z");
+        assert_eq!(planned.day, day(2026, 10, 1));
+    }
+
+    #[test]
+    fn a_meeting_changed_by_hand_is_left_alone() {
+        let before = series("daily", "FREQ=DAILY", DAILY);
+        let mut made = meeting(&before, "2026-10-01T11:00:00Z");
+        let recorded = claims(&[(&made, Some(made.shape.fingerprint()))]);
+        made.shape.address = Some("Room 4".into());
+        let after = [series("daily", "FREQ=DAILY", "2026-09-28T12:00:00Z")];
+        assert!(
+            plan_upkeep(
+                &after,
+                std::slice::from_ref(&made),
+                &recorded,
+                Saratov,
+                now()
+            )
+            .is_empty()
+        );
+        // Neither is it archived when the series is gone.
+        assert!(plan_upkeep(&[], &[made], &recorded, Saratov, now()).is_empty());
+    }
+
+    #[test]
+    fn a_day_the_series_no_longer_has_loses_its_meeting() {
+        let before = series("daily", "FREQ=DAILY", DAILY);
+        // Thursday 2026-10-01.
+        let made = meeting(&before, "2026-10-01T11:00:00Z");
+        let recorded = claims(&[(&made, Some(made.shape.fingerprint()))]);
+        let weekdays = [series("daily", "FREQ=WEEKLY;BYDAY=MO,TU,WE", DAILY)];
+        assert_eq!(
+            plan_upkeep(
+                &weekdays,
+                std::slice::from_ref(&made),
+                &recorded,
+                Saratov,
+                now()
+            ),
+            vec![Upkeep::Archive {
+                object_id: "meeting-2026-10-01".into(),
+                series_id: "daily".into(),
+                day: day(2026, 10, 1),
+            }]
+        );
+        // An archived series is not listed at all.
+        assert_eq!(
+            plan_upkeep(&[], &[made], &recorded, Saratov, now()).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_rule_that_does_not_parse_touches_nothing() {
+        let before = series("daily", "FREQ=DAILY", DAILY);
+        let made = meeting(&before, "2026-10-01T11:00:00Z");
+        let recorded = claims(&[(&made, Some(made.shape.fingerprint()))]);
+        let broken = [series("daily", "FREQ=DAILLY", DAILY)];
+        assert!(plan_upkeep(&broken, &[made], &recorded, Saratov, now()).is_empty());
+    }
+
+    #[test]
+    fn meetings_made_by_hand_or_already_begun_are_not_the_generators() {
+        let daily = series("daily", "FREQ=DAILY", DAILY);
+        let moved = [series("daily", "FREQ=DAILY", "2026-09-28T12:00:00Z")];
+        // No claim: made by hand.
+        let by_hand = meeting(&daily, "2026-10-01T11:00:00Z");
+        assert!(plan_upkeep(&moved, &[by_hand], &HashMap::new(), Saratov, now()).is_empty());
+        // Today's at 07:00 Saratov has begun by noon.
+        let begun = meeting(&daily, "2026-09-30T03:00:00Z");
+        let recorded = claims(&[(&begun, Some(begun.shape.fingerprint()))]);
+        assert!(plan_upkeep(&moved, &[begun], &recorded, Saratov, now()).is_empty());
+    }
+
+    #[test]
+    fn a_meeting_without_a_fingerprint_is_adopted_only_as_the_series_makes_it() {
+        let daily = [series("daily", "FREQ=DAILY", DAILY)];
+        let made = meeting(&daily[0], "2026-10-01T11:00:00Z");
+        let recorded = claims(&[(&made, None)]);
+        assert_eq!(
+            plan_upkeep(
+                &daily,
+                std::slice::from_ref(&made),
+                &recorded,
+                Saratov,
+                now()
+            ),
+            vec![Upkeep::Adopt {
+                series_id: "daily".into(),
+                day: day(2026, 10, 1),
+                fingerprint: made.shape.fingerprint(),
+            }]
+        );
+        let mut changed = made;
+        changed.shape.name = "Дейлик с Мишей".into();
+        assert!(plan_upkeep(&daily, &[changed], &recorded, Saratov, now()).is_empty());
     }
 
     // Saturday 2026-09-19 at 12:00 Saratov is 08:00Z.
