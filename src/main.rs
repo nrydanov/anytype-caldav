@@ -244,6 +244,14 @@ async fn generate(config: Config, apply: bool) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// How far ahead a generator of this kind makes occurrences.
+fn horizon(config: &Config, kind: series::Kind) -> chrono::Duration {
+    match kind {
+        series::Kind::Task => config.series.horizon,
+        series::Kind::Event => config.series.event_horizon,
+    }
+}
+
 async fn generate_kind(
     config: &Config,
     kind: series::Kind,
@@ -277,7 +285,7 @@ async fn generate_kind(
         all.len(),
         instances.len()
     );
-    let until = today + config.series.horizon;
+    let until = today + horizon(config, kind);
     let (planned, warnings) = series::plan_until(&all, &instances, tz, today, until);
     for warning in &warnings {
         println!("  warn    {warning}");
@@ -314,7 +322,7 @@ async fn generate_kind(
                 state,
                 tz,
                 config.series.poll_interval,
-                config.series.horizon,
+                horizon(config, kind),
             );
             let created = generator.check_at(now).await?;
             println!("  created {created}");
@@ -449,9 +457,9 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 durable_state,
                 config.calendar.timezone,
                 config.series.poll_interval,
-                config.series.horizon,
+                horizon(&config, kind),
             ));
-            info!(?kind, poll_interval = ?config.series.poll_interval, horizon_days = config.series.horizon.num_days(), "series generator enabled");
+            info!(?kind, poll_interval = ?config.series.poll_interval, horizon_days = horizon(&config, kind).num_days(), "series generator enabled");
             generator_handles.push(tokio::spawn(generator.run()));
         }
     }

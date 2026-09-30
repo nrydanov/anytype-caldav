@@ -109,6 +109,8 @@ all_day_time = "09:00"
 # poll_interval = "5m"
 # How far ahead occurrences are made. Unset, only the next one is.
 # horizon = "31d"
+# The same for events; `horizon` when unset.
+# event_horizon = "31d"
 
 # CalDAV facade under /dav/, for a CalDAV client. The password
 # comes from CALDAV_PASSWORD, next to the Anytype API key.
