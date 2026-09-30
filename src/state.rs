@@ -67,6 +67,9 @@ pub struct Claim {
     /// none for a claim recorded before fingerprints were kept, or by hand.
     pub fingerprint: Option<String>,
     pub claimed_at: DateTime<Utc>,
+    /// A digest of the meeting's body right after it was made; none when it
+    /// was not read.
+    pub body: Option<String>,
 }
 
 impl StateStore {
@@ -173,6 +176,23 @@ impl StateStore {
         if !has_fingerprint {
             connection
                 .execute_batch("ALTER TABLE generated_instances ADD COLUMN fingerprint TEXT")
+                .map_err(|source| StateError::Open {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+        }
+        // A digest of the meeting's body as made, to tell whether somebody
+        // wrote in it since. Added like `fingerprint`.
+        let has_body = connection
+            .prepare("SELECT 1 FROM pragma_table_info('generated_instances') WHERE name = 'body'")
+            .and_then(|mut statement| statement.exists([]))
+            .map_err(|source| StateError::Open {
+                path: path.display().to_string(),
+                source,
+            })?;
+        if !has_body {
+            connection
+                .execute_batch("ALTER TABLE generated_instances ADD COLUMN body TEXT")
                 .map_err(|source| StateError::Open {
                     path: path.display().to_string(),
                     source,
@@ -335,7 +355,8 @@ impl StateStore {
     pub fn claimed_instances(&self) -> Result<HashMap<(String, NaiveDate), Claim>, StateError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT series_id, occurrence_day, fingerprint, created_at_ms FROM generated_instances",
+            "SELECT series_id, occurrence_day, fingerprint, created_at_ms, body
+             FROM generated_instances",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -344,6 +365,7 @@ impl StateStore {
                 Claim {
                     fingerprint: row.get(2)?,
                     claimed_at: DateTime::from_timestamp_millis(row.get(3)?).unwrap_or_default(),
+                    body: row.get(4)?,
                 },
             ))
         })?;
@@ -369,6 +391,21 @@ impl StateStore {
             "UPDATE generated_instances SET fingerprint = ?3
              WHERE series_id = ?1 AND occurrence_day = ?2",
             params![series_id, day.to_string(), fingerprint],
+        )?;
+        Ok(())
+    }
+
+    /// Records a digest of the body of the meeting of a claimed occurrence.
+    pub fn record_body(
+        &self,
+        series_id: &str,
+        day: NaiveDate,
+        body: &str,
+    ) -> Result<(), StateError> {
+        self.connection()?.execute(
+            "UPDATE generated_instances SET body = ?3
+             WHERE series_id = ?1 AND occurrence_day = ?2",
+            params![series_id, day.to_string(), body],
         )?;
         Ok(())
     }
@@ -511,7 +548,10 @@ mod tests {
         let key = ("daily".to_string(), day);
         assert_eq!(store.claimed_instances().unwrap()[&key].fingerprint, None);
         store.record_instance("daily", day, "shape").unwrap();
-        assert!(store.instance_claimed("daily", day).unwrap());
+        store.record_body("daily", day, "body").unwrap();
+        let claim = &store.claimed_instances().unwrap()[&key];
+        assert_eq!(claim.fingerprint.as_deref(), Some("shape"));
+        assert_eq!(claim.body.as_deref(), Some("body"));
     }
 
     #[test]

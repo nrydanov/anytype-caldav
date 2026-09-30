@@ -20,7 +20,9 @@
 //! tags or reminders change, the meetings the generator made are rewritten,
 //! and when the series is archived or its rule drops a day, those meetings are
 //! archived. A meeting somebody changed by hand is left as it is; the state
-//! file keeps what the generator last wrote to each meeting to tell. Tasks
+//! file keeps what the generator last wrote to each meeting to tell. The body
+//! of a meeting does not count for a change of its fields, but a meeting
+//! whose body differs from the one it was made with is never archived. Tasks
 //! are not maintained this way.
 //!
 //! An event series' `exdate` leaves days out: no meeting is made for them. A
@@ -500,15 +502,20 @@ pub enum Upkeep<'a> {
         object_id: String,
         planned: Planned<'a>,
     },
-    /// The series is gone, or its rule no longer has this day.
+    /// The series is gone, or its rule no longer has this day. The meeting
+    /// goes only if its body is as it was made, `body` being the digest
+    /// recorded then: notes written in it keep it.
     Archive {
         object_id: String,
         series_id: String,
         day: NaiveDate,
+        body: Option<String>,
     },
     /// A meeting made before fingerprints were kept, exactly as its series
-    /// makes it now: from here on it counts as unchanged.
+    /// makes it now: from here on it counts as unchanged, and its body as it
+    /// is now counts as made.
     Adopt {
+        object_id: String,
         series_id: String,
         day: NaiveDate,
         fingerprint: String,
@@ -568,13 +575,10 @@ pub fn plan_upkeep<'a>(
             continue;
         }
         // Without a claim the meeting was made by hand.
-        let Some(Claim {
-            fingerprint: recorded,
-            ..
-        }) = claims.get(&(instance.series_id.clone(), day))
-        else {
+        let Some(claim) = claims.get(&(instance.series_id.clone(), day)) else {
             continue;
         };
+        let recorded = &claim.fingerprint;
         let current = instance.shape.fingerprint();
         let unchanged = recorded.as_deref() == Some(current.as_str());
         let owner = series.iter().find(|one| one.id == instance.series_id);
@@ -591,6 +595,7 @@ pub fn plan_upkeep<'a>(
                     object_id: instance.object_id.clone(),
                     series_id: instance.series_id.clone(),
                     day,
+                    body: claim.body.clone(),
                 });
                 "archive: the series no longer has this day"
             }
@@ -600,6 +605,7 @@ pub fn plan_upkeep<'a>(
                 if current == expected {
                     if recorded.is_none() {
                         upkeep.push(Upkeep::Adopt {
+                            object_id: instance.object_id.clone(),
                             series_id: one.id.clone(),
                             day,
                             fingerprint: expected,
@@ -925,6 +931,21 @@ impl AnytypeSeries {
         Ok(())
     }
 
+    /// A digest of a meeting's body, which search does not return.
+    pub async fn body(&self, object_id: &str) -> Result<String, SeriesError> {
+        let object = self
+            .client
+            .object(&self.space_id, object_id)
+            .get()
+            .await
+            .inspect_err(|err| {
+                error!(object_id, error = %err, "anytype get event body failed");
+            })?;
+        Ok(crate::feed::etag_for(
+            object.markdown.as_deref().unwrap_or_default(),
+        ))
+    }
+
     /// Adds occurrences to a series' `exdate`, keeping those it has.
     pub async fn exclude(
         &self,
@@ -1098,6 +1119,7 @@ impl SeriesGenerator {
                 Ok(id) => {
                     if self.source.kind() == Kind::Event {
                         self.record(&one);
+                        self.record_body(&one.series.id, one.day, &id).await;
                     }
                     info!(
                         series_id = %one.series.id,
@@ -1173,6 +1195,21 @@ impl SeriesGenerator {
         }
     }
 
+    /// Keeps a claim's digest of its meeting's body as it is now. A failure
+    /// only keeps that meeting from ever being archived, so it is logged.
+    async fn record_body(&self, series_id: &str, day: NaiveDate, object_id: &str) {
+        let recorded = match self.source.body(object_id).await {
+            Ok(digest) => self
+                .state
+                .record_body(series_id, day, &digest)
+                .map_err(|e| e.to_string()),
+            Err(err) => Err(err.to_string()),
+        };
+        if let Err(err) = recorded {
+            warn!(series_id, %day, object_id, error = %err, "cannot record the meeting's body");
+        }
+    }
+
     /// Brings the meetings ahead that nobody changed in line with their
     /// series. One failure is logged and does not stop the rest.
     async fn upkeep(
@@ -1182,8 +1219,8 @@ impl SeriesGenerator {
         now: DateTime<Utc>,
     ) -> Result<(), SeriesError> {
         let claims = self.state.claimed_instances()?;
-        let (mut updated, mut archived, mut adopted, mut excluded, mut failed) =
-            (0usize, 0usize, 0usize, 0usize, 0usize);
+        let (mut updated, mut archived, mut kept, mut adopted, mut excluded, mut failed) =
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
         for one in plan_upkeep(series, instances, &claims, self.tz, now) {
             match one {
                 Upkeep::Update { object_id, planned } => {
@@ -1200,7 +1237,20 @@ impl SeriesGenerator {
                     object_id,
                     series_id,
                     day,
+                    body,
                 } => {
+                    let now_body = match self.source.body(&object_id).await {
+                        Ok(digest) => digest,
+                        Err(_) => {
+                            failed += 1;
+                            continue;
+                        }
+                    };
+                    if body.as_deref() != Some(now_body.as_str()) {
+                        debug!(object_id, series_id, %day, recorded = body.is_some(), "kept a meeting its series no longer has: its body was written in or not recorded");
+                        kept += 1;
+                        continue;
+                    }
                     match self.source.archive(&object_id).await {
                         Ok(()) => {
                             info!(object_id, series_id, %day, "archived a meeting its series no longer has");
@@ -1212,11 +1262,13 @@ impl SeriesGenerator {
                     }
                 }
                 Upkeep::Adopt {
+                    object_id,
                     series_id,
                     day,
                     fingerprint,
                 } => {
                     self.state.record_instance(&series_id, day, &fingerprint)?;
+                    self.record_body(&series_id, day, &object_id).await;
                     adopted += 1;
                 }
                 Upkeep::Exclude {
@@ -1231,11 +1283,14 @@ impl SeriesGenerator {
                 },
             }
         }
+        // A kept meeting is kept again on every pass, so it alone is no news.
         if updated + archived + adopted + excluded + failed > 0 {
             info!(
                 updated,
-                archived, adopted, excluded, failed, "upkeep of meetings finished"
+                archived, kept, adopted, excluded, failed, "upkeep of meetings finished"
             );
+        } else if kept > 0 {
+            debug!(kept, "upkeep of meetings finished");
         }
         Ok(())
     }
@@ -1501,6 +1556,7 @@ mod tests {
                 let claim = Claim {
                     fingerprint: recorded.clone(),
                     claimed_at: DateTime::UNIX_EPOCH,
+                    body: None,
                 };
                 ((instance.series_id.clone(), day), claim)
             })
@@ -1571,6 +1627,7 @@ mod tests {
                 object_id: "meeting-2026-10-01".into(),
                 series_id: "daily".into(),
                 day: day(2026, 10, 1),
+                body: None,
             }]
         );
         // An archived series is not listed at all.
@@ -1616,6 +1673,7 @@ mod tests {
                 now()
             ),
             vec![Upkeep::Adopt {
+                object_id: "meeting-2026-10-01".into(),
                 series_id: "daily".into(),
                 day: day(2026, 10, 1),
                 fingerprint: made.shape.fingerprint(),
