@@ -62,6 +62,10 @@ pub struct Event {
     pub occurrence: Option<AnytypeDate>,
     /// `deadline`, served as an entry of its own (`deadline_entry`).
     pub deadline: Option<AnytypeDate>,
+    /// A `recurring_event` object, whose occurrences are meetings made by the
+    /// series generator: a write from the client never archives one it did
+    /// not delete.
+    pub recurring_event: bool,
 }
 
 /// What the name of a deadline's resource and its UID end with.
@@ -91,6 +95,7 @@ pub fn deadline_entry(event: &Event, language: Language) -> Option<Event> {
         series: None,
         occurrence: None,
         deadline: None,
+        recurring_event: false,
     })
 }
 
@@ -801,9 +806,25 @@ pub fn plan_series_update(
             }
         }
     }
+    // A meeting of a `recurring_event` is a document of its own, and a body
+    // may leave it out for no reason: it goes only when the client deleted
+    // its occurrence, which puts that occurrence in EXDATE.
+    let excluded: Vec<DateTime<Utc>> = incoming
+        .master
+        .exdates
+        .iter()
+        .filter_map(|value| instant_of(value, config))
+        .map(|(_, at)| at)
+        .collect();
     plan.archive = replacements
         .iter()
         .filter(|r| !matched.contains(&r.object_id.as_str()))
+        .filter(|r| {
+            !current.recurring_event
+                || r.occurrence
+                    .as_ref()
+                    .is_some_and(|o| excluded.contains(&o.parsed.with_timezone(&Utc)))
+        })
         .map(|r| r.object_id.clone())
         .collect();
     plan
@@ -853,6 +874,9 @@ pub trait EventStore: Send + Sync {
 pub struct AnytypeEvents {
     client: AnytypeClient,
     space_id: String,
+    /// Serve `recurring_event` objects as series and make a series from the
+    /// client one of them: set when the series generator makes events.
+    series_objects: bool,
 }
 
 fn to_event(object: &Object) -> Event {
@@ -889,6 +913,10 @@ fn to_event(object: &Object) -> Event {
             .and_then(|links| links.into_iter().next()),
         occurrence: date(object, "occurrence"),
         deadline: date(object, "deadline"),
+        recurring_event: object
+            .r#type
+            .as_ref()
+            .is_some_and(|t| t.key == crate::series::EVENT_SERIES_TYPE),
     }
 }
 
@@ -898,7 +926,16 @@ fn transport(err: impl std::fmt::Display) -> SourceError {
 
 impl AnytypeEvents {
     pub fn new(client: AnytypeClient, space_id: String) -> Self {
-        Self { client, space_id }
+        Self {
+            client,
+            space_id,
+            series_objects: false,
+        }
+    }
+
+    pub fn with_series_objects(mut self, on: bool) -> Self {
+        self.series_objects = on;
+        self
     }
     async fn properties_for(
         &self,
@@ -947,10 +984,15 @@ impl AnytypeEvents {
 impl EventStore for AnytypeEvents {
     async fn list(&self) -> Result<Vec<Event>, SourceError> {
         let started = Instant::now();
+        let types = if self.series_objects {
+            vec![EVENT_TYPE, crate::series::EVENT_SERIES_TYPE]
+        } else {
+            vec![EVENT_TYPE]
+        };
         let paged = self
             .client
             .search_in(&self.space_id)
-            .types([EVENT_TYPE])
+            .types(types)
             .execute()
             .await
             .map_err(transport)?;
@@ -999,9 +1041,15 @@ impl EventStore for AnytypeEvents {
     }
 
     async fn create(&self, uid: &str, patch: &EventPatch) -> Result<String, SourceError> {
+        // A series from the client becomes a `recurring_event`, whose
+        // meetings the generator makes.
+        let type_key = match &patch.rrule {
+            Some(Some(_)) if self.series_objects => crate::series::EVENT_SERIES_TYPE,
+            _ => EVENT_TYPE,
+        };
         let mut request = self
             .client
-            .new_object(&self.space_id, EVENT_TYPE)
+            .new_object(&self.space_id, type_key)
             .name(patch.name.clone().unwrap_or_else(|| "(unnamed)".into()))
             .set_text("ical_uid", uid);
         for property in self.properties_for(patch).await? {
@@ -1305,6 +1353,7 @@ mod tests {
             occurrence: None,
 
             deadline: None,
+            recurring_event: false,
         }
     }
 
@@ -1426,6 +1475,38 @@ mod tests {
                 "2026-11-09T09:00:00Z"
             ]
         );
+    }
+
+    #[test]
+    fn a_series_object_keeps_the_meetings_a_body_leaves_out() {
+        let master = Event {
+            rrule: Some("FREQ=DAILY".into()),
+            recurring_event: true,
+            ..event(Some("2026-10-01T10:00:00Z"), None)
+        };
+        let meeting = |id: &str, at: &str| Event {
+            object_id: id.into(),
+            series: Some("ev1".into()),
+            occurrence: AnytypeDate::parse(at),
+            ..event(Some(at), None)
+        };
+        let meetings = [
+            meeting("kept", "2026-10-02T10:00:00Z"),
+            meeting("deleted", "2026-10-03T10:00:00Z"),
+        ];
+        // The body has no overrides; the client deleted the third occurrence.
+        let body = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:u\r\nDTSTART:20261001T100000Z\r\nRRULE:FREQ=DAILY\r\nEXDATE:20261003T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let series = parse_series(body).unwrap();
+        let plan = plan_series_update(&master, &meetings, &series, &config());
+        assert_eq!(plan.archive, vec!["deleted".to_string()]);
+
+        // An event carrying its own rule loses both, as before.
+        let plain = Event {
+            recurring_event: false,
+            ..master
+        };
+        let plan = plan_series_update(&plain, &meetings, &series, &config());
+        assert_eq!(plan.archive.len(), 2);
     }
 
     #[test]

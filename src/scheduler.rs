@@ -710,6 +710,7 @@ mod tests {
             occurrence: None,
 
             deadline: None,
+            recurring_event: false,
         }
     }
 

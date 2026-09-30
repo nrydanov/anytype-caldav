@@ -107,6 +107,9 @@ all_day_time = "09:00"
 # enabled = true
 # events = true
 # poll_interval = "5m"
+# With events = true, a `recurring_event` is served over CalDAV as a series,
+# its meetings as its occurrences, and a series created in the calendar app is
+# stored as a `recurring_event`.
 # How far ahead occurrences are made. Unset, only the next one is.
 # horizon = "31d"
 # The same for events; `horizon` when unset.

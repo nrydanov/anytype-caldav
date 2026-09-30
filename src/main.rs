@@ -412,12 +412,13 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 config.server.request_timeout,
             );
             let scheduler = Arc::new(match (config.caldav.events, config.reminders.enabled) {
-                (true, _) => {
-                    scheduler.with_events(Arc::new(anytype_caldav::events::AnytypeEvents::new(
+                (true, _) => scheduler.with_events(Arc::new(
+                    anytype_caldav::events::AnytypeEvents::new(
                         build_client(&config.anytype)?,
                         config.anytype.space_id.clone(),
-                    )))
-                }
+                    )
+                    .with_series_objects(config.series.events),
+                )),
                 (false, _) => scheduler,
             });
             info!(
@@ -501,10 +502,13 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
             "caldav events collection enabled"
         );
         Some(Arc::new(EventService::new(
-            Arc::new(AnytypeEvents::new(
-                build_client(&config.anytype)?,
-                config.anytype.space_id.clone(),
-            )),
+            Arc::new(
+                AnytypeEvents::new(
+                    build_client(&config.anytype)?,
+                    config.anytype.space_id.clone(),
+                )
+                .with_series_objects(config.series.events),
+            ),
             config.calendar.clone(),
             Utc::now(),
             config.server.min_refresh_interval,

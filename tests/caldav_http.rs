@@ -1180,6 +1180,7 @@ mod writes {
                 occurrence: None,
 
                 deadline: None,
+                recurring_event: false,
             }
         }
 
@@ -1736,6 +1737,76 @@ mod writes {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
             assert_eq!(events.events.lock().unwrap().len(), before);
+        }
+
+        /// A `recurring_event` with a meeting that took place and one ahead.
+        fn with_a_series_object() -> (Router, Arc<Events>) {
+            let (router, events) = with_events();
+            let series = Event {
+                rrule: Some("FREQ=DAILY".into()),
+                recurring_event: true,
+                start: AnytypeDate::parse("2026-01-05T10:00:00Z"),
+                end: AnytypeDate::parse("2026-01-05T11:00:00Z"),
+                ..lecture("daily")
+            };
+            let meeting = |id: &str, at: &str| Event {
+                series: Some("daily".into()),
+                occurrence: AnytypeDate::parse(at),
+                start: AnytypeDate::parse(at),
+                end: None,
+                ..lecture(id)
+            };
+            events.events.lock().unwrap().extend([
+                series,
+                meeting("held", "2026-01-06T10:00:00Z"),
+                meeting("ahead", "2099-01-06T10:00:00Z"),
+            ]);
+            (router, events)
+        }
+
+        #[tokio::test]
+        async fn a_series_object_is_served_with_its_meetings_inside() {
+            let (router, _) = with_a_series_object();
+            let (status, _, ics) =
+                send(&router, "GET", "/dav/calendars/events/daily.ics", None, "").await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(ics.contains("RRULE:FREQ=DAILY"), "{ics}");
+            assert_eq!(ics.matches("RECURRENCE-ID").count(), 2, "{ics}");
+            let (status, _, _) =
+                send(&router, "GET", "/dav/calendars/events/ahead.ics", None, "").await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn deleting_a_series_object_keeps_the_meetings_that_took_place() {
+            let (router, events) = with_a_series_object();
+            let (_, headers, _) =
+                send(&router, "GET", "/dav/calendars/events/daily.ics", None, "").await;
+            let etag = headers[header::ETAG].to_str().unwrap().to_string();
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri("/dav/calendars/events/daily.ics")
+                        .header(header::AUTHORIZATION, auth())
+                        .header("If-Match", etag)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            let left: Vec<String> = events
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| e.object_id.clone())
+                .collect();
+            assert!(left.contains(&"held".to_string()), "{left:?}");
+            assert!(!left.contains(&"ahead".to_string()), "{left:?}");
+            assert!(!left.contains(&"daily".to_string()), "{left:?}");
         }
 
         #[tokio::test]

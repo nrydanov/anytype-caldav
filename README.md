@@ -32,7 +32,9 @@ calendar client's own settings.
 - **Recurring tasks and events**: a `recurring_task` or `recurring_event`
   object holds the rule; the server creates the next occurrence in Anytype.
   Meetings ahead follow a change to their series or its archiving, unless
-  somebody changed them by hand.
+  somebody changed them by hand. With the event generator on, the calendar
+  shows a `recurring_event` as one series, its meetings as its occurrences,
+  and a series made in the calendar becomes a `recurring_event`.
 - **`init`** checks a space against the schema the server needs and adds
   what is missing: properties, the types `event`, `recurring_task` and
   `recurring_event`, the properties each type lists, and the ones shown in a

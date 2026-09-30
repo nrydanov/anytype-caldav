@@ -449,8 +449,21 @@ async fn delete_event(service: &EventService, name: &str, headers: &HeaderMap) -
         warn!(resource = name, %object_id, client_etag = %expected, server_etag = ?current_etag, "caldav event delete: stale etag");
         return precondition_failed("etag mismatch");
     }
+    // The meetings of a `recurring_event` that took place stay, as the
+    // record of them; those ahead go with the series.
+    let now = chrono::Utc::now();
+    let replacements: Vec<&ev::Event> = replacements
+        .iter()
+        .filter(|r| {
+            !current.recurring_event
+                || r.start
+                    .as_ref()
+                    .or(r.occurrence.as_ref())
+                    .is_none_or(|start| start.parsed > now)
+        })
+        .collect();
     info!(resource = name, %object_id, event = %current.name, replacements = replacements.len(), "caldav event delete: archiving event");
-    for replacement in &replacements {
+    for replacement in replacements {
         if let Err(err) = service.source.archive(&replacement.object_id).await {
             service.invalidate();
             return source_failure(&err);
