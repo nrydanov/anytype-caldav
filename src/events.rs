@@ -234,6 +234,24 @@ fn date_property(key: &str, value: CalendarValue, zone: Option<Tz>) -> Property 
     property.done()
 }
 
+/// Whether an event is served with `VALUE=DATE`: its start is at midnight in
+/// `tz` and its end is absent or at midnight too. RFC 5545 §3.6.1 requires
+/// DTSTART and DTEND to share a value type, so an event from 00:00 to 23:45
+/// is a timed one.
+fn is_all_day(event: &Event, tz: Tz) -> bool {
+    let at_midnight = |date: &AnytypeDate| matches!(date.classify(tz), CalendarValue::AllDay(_));
+    event.start.as_ref().is_some_and(at_midnight) && event.end.as_ref().is_none_or(at_midnight)
+}
+
+/// A date of an event in the value type the event is served with.
+fn value_as(date: &AnytypeDate, all_day: bool, tz: Tz) -> CalendarValue {
+    if all_day {
+        date.classify(tz)
+    } else {
+        CalendarValue::Instant(date.parsed.with_timezone(&Utc))
+    }
+}
+
 /// DTSTART and DTEND as a client sees them. `None` without a start: a VEVENT
 /// without DTSTART is not a calendar entry.
 pub fn wire_dates(
@@ -249,8 +267,9 @@ fn zoned_dates(
     zone: Option<Tz>,
 ) -> Option<(DatePerhapsTime, Option<DatePerhapsTime>)> {
     let tz = config.date_only_timezone;
-    let start = event.start.as_ref()?.classify(tz);
-    let end = event.end.as_ref().map(|end| end.classify(tz));
+    let all_day = is_all_day(event, tz);
+    let start = value_as(event.start.as_ref()?, all_day, tz);
+    let end = event.end.as_ref().map(|end| value_as(end, all_day, tz));
     let dtend = match (start, end) {
         // Last day inclusive in Anytype, exclusive on the wire.
         (_, Some(CalendarValue::AllDay(last))) => {
@@ -326,8 +345,14 @@ pub fn render_series(
     if let Some(rule) = &master.rrule {
         first.append_property(Property::new("RRULE", rule.trim()));
         let tz = config.date_only_timezone;
+        // EXDATE and RECURRENCE-ID take the value type of the series' DTSTART.
+        let all_day = is_all_day(master, tz);
         for excluded in &master.exdates {
-            first.append_multi_property(date_property("EXDATE", excluded.classify(tz), zone));
+            first.append_multi_property(date_property(
+                "EXDATE",
+                value_as(excluded, all_day, tz),
+                zone,
+            ));
         }
         let mut replacements: Vec<&&Event> = replacements.iter().collect();
         replacements.sort_by_key(|r| r.occurrence.as_ref().map(|o| o.parsed));
@@ -340,7 +365,7 @@ pub fn render_series(
             };
             vevent.append_property(date_property(
                 "RECURRENCE-ID",
-                occurrence.classify(tz),
+                value_as(occurrence, all_day, tz),
                 zone,
             ));
             components.push(vevent);
@@ -1402,6 +1427,57 @@ mod tests {
         .unwrap();
         assert!(ics.contains("DTSTART;VALUE=DATE:20260920"), "{ics}");
         assert!(ics.contains("DTEND;VALUE=DATE:20260922"), "{ics}");
+    }
+
+    #[test]
+    fn an_event_from_midnight_to_a_time_is_timed() {
+        let ics = render_event(
+            &event(Some("2026-09-30T20:00:00Z"), Some("2026-10-01T19:45:00Z")),
+            &config(),
+            fallback(),
+        )
+        .unwrap();
+        assert!(ics.contains("DTSTART:20260930T200000Z"), "{ics}");
+        assert!(ics.contains("DTEND:20261001T194500Z"), "{ics}");
+    }
+
+    #[test]
+    fn an_event_from_a_time_to_midnight_is_timed() {
+        let ics = render_event(
+            &event(Some("2026-10-01T14:00:00Z"), Some("2026-10-01T20:00:00Z")),
+            &config(),
+            fallback(),
+        )
+        .unwrap();
+        assert!(ics.contains("DTSTART:20261001T140000Z"), "{ics}");
+        assert!(ics.contains("DTEND:20261001T200000Z"), "{ics}");
+    }
+
+    #[test]
+    fn a_series_from_midnight_to_a_time_is_timed_with_its_exdate_and_occurrence() {
+        let mut master = event(Some("2026-09-30T20:00:00Z"), Some("2026-10-01T19:45:00Z"));
+        master.rrule = Some("FREQ=DAILY".into());
+        master.exdates = vec![AnytypeDate::parse("2026-10-01T20:00:00Z").unwrap()];
+        let mut replacement = event(Some("2026-10-03T06:00:00Z"), None);
+        replacement.occurrence = AnytypeDate::parse("2026-10-02T20:00:00Z");
+        let ics = render_series(&master, &[&replacement], &config(), fallback()).unwrap();
+        assert!(
+            ics.contains("DTSTART;TZID=Europe/Saratov:20261001T000000"),
+            "{ics}"
+        );
+        assert!(
+            ics.contains("DTEND;TZID=Europe/Saratov:20261001T234500"),
+            "{ics}"
+        );
+        assert!(
+            ics.contains("EXDATE;TZID=Europe/Saratov:20261002T000000"),
+            "{ics}"
+        );
+        assert!(
+            ics.contains("RECURRENCE-ID;TZID=Europe/Saratov:20261003T000000"),
+            "{ics}"
+        );
+        assert!(!ics.contains("VALUE=DATE"), "{ics}");
     }
 
     #[test]
