@@ -25,6 +25,10 @@
 //! whose body differs from the one it was made with is never archived. Tasks
 //! are not maintained this way.
 //!
+//! A task series with an `end_date` after its `start_date` makes tasks with a
+//! deadline as well: the occurrence plus the length between the two. A series
+//! from a Monday to its Sunday, repeated weekly, makes a task for each week.
+//!
 //! An event series' `exdate` leaves days out: no meeting is made for them. A
 //! meeting deleted by hand joins the `exdate` of its series, so that a
 //! calendar expanding the rule does not show that day again.
@@ -98,7 +102,8 @@ pub struct Series {
     pub priority: Option<String>,
     pub tags: Vec<String>,
     pub reminder_leads: Vec<String>,
-    /// An event series' end on its first day; the length of every meeting.
+    /// A series' end after its first start: the length of every meeting, and
+    /// how long after its occurrence a task is due.
     pub end: Option<AnytypeDate>,
     pub address: Option<String>,
     /// Given to every event the series makes.
@@ -210,7 +215,8 @@ pub fn event_name(series: &Series, day: NaiveDate) -> String {
 }
 
 /// The end of the event made for an occurrence at `occurrence`, as long as the
-/// series' first one. `None` when the series has no end after its start.
+/// series' first one; for a task, its deadline. `None` when the series has no
+/// end after its start.
 pub fn event_end(series: &Series, occurrence: DateTime<Utc>) -> Option<String> {
     let (start, end) = (series.anchor.as_ref()?, series.end.as_ref()?);
     let length = end.parsed.signed_duration_since(start.parsed);
@@ -681,14 +687,17 @@ pub struct AnytypeSeries {
     client: AnytypeClient,
     space_id: String,
     kind: Kind,
+    /// The key of the tasks' deadline property.
+    deadline_key: String,
 }
 
 impl AnytypeSeries {
-    pub fn new(client: AnytypeClient, space_id: String, kind: Kind) -> Self {
+    pub fn new(client: AnytypeClient, space_id: String, kind: Kind, deadline_key: String) -> Self {
         Self {
             client,
             space_id,
             kind,
+            deadline_key,
         }
     }
 
@@ -1003,6 +1012,12 @@ impl AnytypeSeries {
             .set_objects("series", [series.id.clone()])
             .set_date("occurrence", planned.occurrence.clone())
             .set_date("scheduled", planned.occurrence.clone());
+        let at = DateTime::parse_from_rfc3339(&planned.occurrence)
+            .map(|at| at.with_timezone(&Utc))
+            .expect("the planner writes RFC 3339");
+        if let Some(due) = event_end(series, at) {
+            request = request.set_date(&self.deadline_key, due);
+        }
         if let Some(priority) = &series.priority {
             request = request.set_select("priority", priority.clone());
         }

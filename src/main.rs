@@ -5,7 +5,7 @@ use std::{path::PathBuf, sync::Arc};
 use anytype_caldav::{
     accounts::{self, Accounts},
     anytype_source::{AnytypeTaskSource, build_client},
-    config::Config,
+    config::{Config, PropertySelector},
     feed::FeedService,
     http, install,
     push::PushService,
@@ -252,6 +252,16 @@ fn horizon(config: &Config, kind: series::Kind) -> chrono::Duration {
     }
 }
 
+/// The key the generator writes a task's deadline under. Only a key can be
+/// written; with the property selected by id it is `due_date`, the key
+/// write-back uses.
+fn deadline_key(config: &Config) -> String {
+    match &config.properties.deadline {
+        PropertySelector::Key(key) => key.clone(),
+        PropertySelector::Id(_) => "due_date".to_string(),
+    }
+}
+
 async fn generate_kind(
     config: &Config,
     kind: series::Kind,
@@ -261,6 +271,7 @@ async fn generate_kind(
         build_client(&config.anytype)?,
         config.anytype.space_id.clone(),
         kind,
+        deadline_key(config),
     );
     let tz = config.calendar.timezone;
     let now = Utc::now();
@@ -454,6 +465,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     build_client(&config.anytype)?,
                     config.anytype.space_id.clone(),
                     kind,
+                    deadline_key(&config),
                 ),
                 durable_state,
                 config.calendar.timezone,

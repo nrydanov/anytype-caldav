@@ -145,7 +145,14 @@ pub const TYPES: &[TypeSpec] = &[
         name: "Recurring task",
         plural_name: "Recurring tasks",
         layout: TypeLayout::Basic,
-        properties: &["rrule", "start_date", "priority", "tag", "reminder_lead"],
+        properties: &[
+            "rrule",
+            "start_date",
+            "end_date",
+            "priority",
+            "tag",
+            "reminder_lead",
+        ],
         header: &["rrule", "start_date"],
     },
     TypeSpec {
