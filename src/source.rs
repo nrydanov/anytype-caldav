@@ -48,4 +48,8 @@ pub trait TaskWriter: Send + Sync + 'static {
     async fn create_task(&self, uid: &str, patch: &Patch) -> Result<String, SourceError>;
     /// Archives, which Anytype's API calls delete and keeps in the Bin.
     async fn archive_task(&self, object_id: &str) -> Result<(), SourceError>;
+    /// Whether a task's week has a property of its own to be written to.
+    fn keeps_weeks(&self) -> bool {
+        false
+    }
 }

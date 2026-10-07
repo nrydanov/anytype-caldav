@@ -7,7 +7,7 @@
 //!
 //! Pure: no Anytype, no HTTP. Every branch is testable on its own.
 
-use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Days, NaiveDate, NaiveTime, TimeZone, Timelike, Utc, Weekday};
 use chrono_tz::Tz;
 use icalendar::{Calendar, CalendarDateTime, Component, DatePerhapsTime, Todo, TodoStatus};
 
@@ -47,6 +47,8 @@ pub struct Patch {
     /// RFC 3339 UTC, in the shape Anytype stores (date-only = local midnight).
     pub scheduled: Option<Option<String>>,
     pub deadline: Option<Option<String>>,
+    /// The Monday of the week a task is kept by, in place of the two dates.
+    pub week: Option<Option<String>>,
     /// Option names for the tag property; an empty list clears the tags.
     pub tags: Option<Vec<String>>,
     /// Ids for the assignee property, replacing what it holds; an empty list
@@ -63,6 +65,7 @@ impl Patch {
             && self.assignees.is_none()
             && self.scheduled.is_none()
             && self.deadline.is_none()
+            && self.week.is_none()
     }
 }
 
@@ -165,12 +168,34 @@ fn keep_whole_day(value: Moment, property: Option<CalendarValue>, tz: Tz) -> Mom
     }
 }
 
+/// The Monday of a week, when the two dates are that Monday and its Sunday.
+fn whole_week(start: Option<Moment>, due: Option<Moment>) -> Option<NaiveDate> {
+    match (start?, due?) {
+        (Moment::Day(from), Moment::Day(to))
+            if from.weekday() == Weekday::Mon && to == from + Days::new(6) =>
+        {
+            Some(from)
+        }
+        _ => None,
+    }
+}
+
+/// A plan and a deadline for the dates of a task that had none.
+fn plan(start: Option<Moment>, due: Option<Moment>) -> (Option<Moment>, Option<Moment>) {
+    match (start, due) {
+        (Some(start), due) => (Some(start), due),
+        (None, due) => (due, None),
+    }
+}
+
 /// Changes for an existing task, given what the renderer currently sends.
+/// With `weeks`, the writer has a property for a task's week.
 pub fn for_update(
     current: &Task,
     wire: &Wire,
     incoming: &Incoming,
     config: &CalendarConfig,
+    weeks: bool,
 ) -> Patch {
     let tz = config.timezone;
     let date_tz = config.date_only_timezone;
@@ -202,6 +227,29 @@ pub fn for_update(
         value.and_then(|v| to_anytype(keep_whole_day(v, property, tz), date_tz))
     };
 
+    // A whole week is kept in `week`, and the two dates stay empty.
+    if weeks && let Some(monday) = whole_week(new_start, new_due) {
+        if current.week_days(date_tz).map(|(monday, _)| monday) != Some(monday) {
+            patch.week = Some(to_anytype(Moment::Day(monday), date_tz));
+        }
+        if current.scheduled.is_some() {
+            patch.scheduled = Some(None);
+        }
+        if current.deadline.is_some() {
+            patch.deadline = Some(None);
+        }
+        return patch;
+    }
+    // A task kept by its week and given other dates has them written as a new
+    // task's are.
+    if weeks && current.week_days(date_tz).is_some() {
+        let (scheduled, deadline) = plan(new_start, new_due);
+        patch.week = Some(None);
+        patch.scheduled = scheduled.map(|v| to_anytype(v, date_tz));
+        patch.deadline = deadline.map(|v| to_anytype(v, date_tz));
+        return patch;
+    }
+
     // A start appearing where there was none turns the task into a plan with
     // a deadline: the client now holds two dates, and each needs a property.
     if new_start.is_some() && now_start.is_none() {
@@ -230,7 +278,7 @@ pub fn for_update(
 }
 
 /// Fields for a task created in the client.
-pub fn for_create(incoming: &Incoming, config: &CalendarConfig) -> Patch {
+pub fn for_create(incoming: &Incoming, config: &CalendarConfig, weeks: bool) -> Patch {
     let tz = config.timezone;
     let date_tz = config.date_only_timezone;
     let due = incoming.due.as_ref().and_then(|d| moment(d, tz));
@@ -239,9 +287,10 @@ pub fn for_create(incoming: &Incoming, config: &CalendarConfig) -> Patch {
         .as_ref()
         .and_then(|d| moment(d, tz))
         .filter(|start| Some(*start) != due);
-    let (scheduled, deadline) = match (start, due) {
-        (Some(start), due) => (Some(start), due),
-        (None, due) => (due, None),
+    let week = whole_week(start, due).filter(|_| weeks);
+    let (scheduled, deadline) = match week {
+        Some(_) => (None, None),
+        None => plan(start, due),
     };
     Patch {
         name: Some(
@@ -253,6 +302,7 @@ pub fn for_create(incoming: &Incoming, config: &CalendarConfig) -> Patch {
         done: Some(incoming.done),
         scheduled: scheduled.map(|v| to_anytype(v, date_tz)),
         deadline: deadline.map(|v| to_anytype(v, date_tz)),
+        week: week.map(|monday| to_anytype(Moment::Day(monday), date_tz)),
         tags: (!incoming.categories.is_empty()).then(|| incoming.categories.clone()),
         assignees: None,
     }
@@ -310,7 +360,62 @@ mod tests {
 
     fn update(task: &Task, edit: impl Fn(String) -> String) -> Patch {
         let incoming = round_trip(task, edit);
-        for_update(task, &renderer().wire(task), &incoming, &config())
+        for_update(task, &renderer().wire(task), &incoming, &config(), false)
+    }
+
+    /// The same with a property for the week.
+    fn update_with_weeks(task: &Task, edit: impl Fn(String) -> String) -> Patch {
+        let incoming = round_trip(task, edit);
+        for_update(task, &renderer().wire(task), &incoming, &config(), true)
+    }
+
+    // The week of 5 to 11 October 2026; a date-only 5 October is stored as
+    // 4 October 20:00Z.
+    const OCT5: &str = "2026-10-04T20:00:00Z";
+    const OCT11: &str = "2026-10-10T20:00:00Z";
+
+    #[test]
+    fn a_whole_week_is_written_as_the_week_alone() {
+        let body = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:x\r\nSUMMARY:Mail\r\nDTSTART;VALUE=DATE:20261005\r\nDUE;VALUE=DATE:20261011\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let patch = for_create(&parse(body).unwrap(), &config(), true);
+        assert_eq!(patch.week, Some(Some(OCT5.into())));
+        assert_eq!((patch.scheduled, patch.deadline), (None, None));
+
+        // Without a property for the week the two dates are kept.
+        let patch = for_create(&parse(body).unwrap(), &config(), false);
+        assert_eq!(patch.week, None);
+        assert_eq!(patch.scheduled, Some(Some(OCT5.into())));
+        assert_eq!(patch.deadline, Some(Some(OCT11.into())));
+
+        // A task that holds the week as two dates moves to the property.
+        let patch = update_with_weeks(&task(Some(OCT5), Some(OCT11)), |s| s);
+        assert_eq!(patch.week, Some(Some(OCT5.into())));
+        assert_eq!((patch.scheduled, patch.deadline), (Some(None), Some(None)));
+    }
+
+    #[test]
+    fn a_task_kept_by_its_week_follows_the_dates_it_is_given() {
+        // The week is given by its Wednesday.
+        let mut t = task(None, None);
+        t.week = AnytypeDate::parse("2026-10-06T20:00:00Z");
+        assert!(update_with_weeks(&t, |s| s).is_empty());
+
+        // Moved a week later.
+        let patch = update_with_weeks(&t, |s| {
+            s.replace("DATE:20261005", "DATE:20261012")
+                .replace("DATE:20261011", "DATE:20261018")
+        });
+        assert_eq!(patch.week, Some(Some("2026-10-11T20:00:00Z".into())));
+        assert_eq!((patch.scheduled, patch.deadline), (None, None));
+
+        // Given a day: the range is gone, and the day is a plan.
+        let patch = update_with_weeks(&t, |s| {
+            s.replace("DTSTART;VALUE=DATE:20261005\r\n", "")
+                .replace("DATE:20261011", "DATE:20261008")
+        });
+        assert_eq!(patch.week, Some(None));
+        assert_eq!(patch.scheduled, Some(Some("2026-10-07T20:00:00Z".into())));
+        assert_eq!(patch.deadline, None);
     }
 
     // 13 Sep date-only is stored as 12 Sep 20:00Z.
@@ -450,7 +555,7 @@ mod tests {
         let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTODO\r\nUID:abc-123\r\nSUMMARY:Buy milk\r\nDUE;VALUE=DATE:20260920\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
         let incoming = parse(body).unwrap();
         assert_eq!(incoming.uid.as_deref(), Some("abc-123"));
-        let patch = for_create(&incoming, &config());
+        let patch = for_create(&incoming, &config(), false);
         assert_eq!(patch.name.as_deref(), Some("Buy milk"));
         assert_eq!(patch.done, Some(false));
         assert_eq!(patch.scheduled, Some(Some("2026-09-19T20:00:00Z".into())));
@@ -460,7 +565,7 @@ mod tests {
     #[test]
     fn a_new_task_with_start_and_due_is_a_plan_with_a_deadline() {
         let body = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:x\r\nSUMMARY:Essay\r\nDTSTART:20260920T080000Z\r\nDUE:20260925T200000Z\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
-        let patch = for_create(&parse(body).unwrap(), &config());
+        let patch = for_create(&parse(body).unwrap(), &config(), false);
         assert_eq!(patch.scheduled, Some(Some("2026-09-20T08:00:00Z".into())));
         assert_eq!(patch.deadline, Some(Some("2026-09-25T20:00:00Z".into())));
     }
@@ -468,7 +573,7 @@ mod tests {
     #[test]
     fn a_zoned_date_time_is_read_in_its_zone() {
         let body = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:x\r\nDUE;TZID=Europe/Moscow:20260920T120000\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
-        let patch = for_create(&parse(body).unwrap(), &config());
+        let patch = for_create(&parse(body).unwrap(), &config(), false);
         assert_eq!(patch.scheduled, Some(Some("2026-09-20T09:00:00Z".into())));
     }
 

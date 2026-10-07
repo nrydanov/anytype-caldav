@@ -392,6 +392,7 @@ pub(super) async fn put(
         &renderer.wire(&current),
         &incoming,
         renderer.config(),
+        writer.keeps_weeks(),
     );
     if moving {
         info!(resource = name, key, %object_id, from = ?located.served_by, to = ?located.member_id, "caldav put: moving the task to this calendar");
@@ -463,7 +464,11 @@ pub(super) async fn create(
             .body(Body::from("resource name must be derived from the UID"))
             .expect("static response");
     }
-    let mut patch = writeback::for_create(incoming, state.feed.renderer().config());
+    let mut patch = writeback::for_create(
+        incoming,
+        state.feed.renderer().config(),
+        writer.keeps_weeks(),
+    );
     // A task created in a person's calendar is theirs.
     patch.assignees = member_id.map(|id| vec![id]);
     info!(resource = name, %uid, ?patch, "caldav put: creating task");

@@ -259,6 +259,9 @@ impl TaskWriter for AnytypeTaskSource {
         for property in patch_properties(patch) {
             request = request.add_property(property);
         }
+        if let Some(week) = self.week_property(patch).await? {
+            request = request.add_property(week);
+        }
         if let Some(tags) = self.tag_property(patch).await? {
             request = request.add_property(tags);
         }
@@ -288,6 +291,9 @@ impl TaskWriter for AnytypeTaskSource {
         for property in patch_properties(patch) {
             request = request.add_property(property);
         }
+        if let Some(week) = self.week_property(patch).await? {
+            request = request.add_property(week);
+        }
         if let Some(tags) = self.tag_property(patch).await? {
             request = request.add_property(tags);
         }
@@ -315,6 +321,10 @@ impl TaskWriter for AnytypeTaskSource {
             })?;
         info!(object_id, "anytype archive task finished");
         Ok(())
+    }
+
+    fn keeps_weeks(&self) -> bool {
+        self.properties.week.is_some()
     }
 }
 
@@ -348,6 +358,15 @@ impl AnytypeTaskSource {
         let ids =
             crate::events::option_ids(&self.client, &self.config.space_id, &key, names).await?;
         Ok(Some(serde_json::json!({ "key": key, "multi_select": ids })))
+    }
+
+    /// The week property of a patch, by the key the configured selector names.
+    async fn week_property(&self, patch: &Patch) -> Result<Option<serde_json::Value>, SourceError> {
+        let (Some(week), Some(selector)) = (&patch.week, &self.properties.week) else {
+            return Ok(None);
+        };
+        let key = self.property_key(selector, "week").await?;
+        Ok(Some(serde_json::json!({ "key": key, "date": week })))
     }
 
     /// The assignee property of a patch. Unlike a tag there is nothing to
