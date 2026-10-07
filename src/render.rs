@@ -187,11 +187,8 @@ impl VTodoRenderer {
         // write, so it can carry what the calendar has no property for.
         let mut description: Vec<String> = Vec::new();
 
-        let tz = self.config.date_only_timezone;
-        match self.schedule(
-            task.scheduled.as_ref().map(|value| value.classify(tz)),
-            task.deadline.as_ref().map(|value| value.classify(tz)),
-        ) {
+        let (scheduled, deadline) = self.dates(task);
+        match self.schedule(scheduled, deadline) {
             Schedule::Neither => {}
             Schedule::Due(due, _) => {
                 todo.due(due);
@@ -255,6 +252,23 @@ impl VTodoRenderer {
                 .done()
             })
             .collect()
+    }
+
+    /// The task's planned date and deadline. A task kept by its week alone
+    /// has that week's Monday and Sunday for them, which Calino shows in the
+    /// bar of the week.
+    fn dates(&self, task: &Task) -> (Option<CalendarValue>, Option<CalendarValue>) {
+        let tz = self.config.date_only_timezone;
+        if let Some((monday, sunday)) = task.week_days(tz) {
+            return (
+                Some(CalendarValue::AllDay(monday)),
+                Some(CalendarValue::AllDay(sunday)),
+            );
+        }
+        (
+            task.scheduled.as_ref().map(|value| value.classify(tz)),
+            task.deadline.as_ref().map(|value| value.classify(tz)),
+        )
     }
 
     /// Resolves the two source dates into a pair a calendar client will accept.
@@ -349,11 +363,8 @@ impl VTodoRenderer {
 
     /// The dates a client sees for `task`, and where each came from.
     pub fn wire(&self, task: &Task) -> Wire {
-        let tz = self.config.date_only_timezone;
-        match self.schedule(
-            task.scheduled.as_ref().map(|value| value.classify(tz)),
-            task.deadline.as_ref().map(|value| value.classify(tz)),
-        ) {
+        let (scheduled, deadline) = self.dates(task);
+        match self.schedule(scheduled, deadline) {
             Schedule::Neither => Wire {
                 start: None,
                 due: None,
@@ -577,6 +588,24 @@ mod tests {
 
     /// Two all-day values on one day cannot be ordered, and the start would say
     /// nothing the deadline does not.
+    #[test]
+    fn a_week_is_written_as_its_monday_and_sunday() {
+        // 7 October 2026 is a Wednesday.
+        let mut t = task("week", "Разобрать почту");
+        t.week = date("2026-10-07T00:00:00+04:00");
+
+        let ics = renderer().render(&[t.clone()]).unwrap();
+
+        assert!(ics.contains("DTSTART;VALUE=DATE:20261005"), "{ics}");
+        assert!(ics.contains("DUE;VALUE=DATE:20261011"), "{ics}");
+
+        // A date of the task's own is served instead of the week.
+        t.scheduled = date("2026-10-08T00:00:00+04:00");
+        let ics = renderer().render(&[t]).unwrap();
+        assert!(!ics.contains("DTSTART"), "{ics}");
+        assert!(ics.contains("DUE;VALUE=DATE:20261008"), "{ics}");
+    }
+
     #[test]
     fn an_all_day_pair_on_one_day_is_written_as_the_deadline_alone() {
         let mut t = task("sber", "Проверить кредитку Сбера");

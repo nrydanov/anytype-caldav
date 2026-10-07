@@ -3,7 +3,7 @@
 //! Nothing from the Anytype SDK appears here, so the renderer and the feed
 //! service can be tested without a source at all.
 
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, Utc, Weekday};
 use chrono_tz::Tz;
 
 /// A date exactly as Anytype returned it, before any normalization.
@@ -84,6 +84,17 @@ impl Task {
     /// Stable across renames and date edits: a calendar client updates the
     /// existing component instead of creating a duplicate. The suffix keeps
     /// the project's old name: clients already hold these UIDs.
+    /// The Monday and the Sunday of the week `week` names. `None` when the
+    /// task has a date of its own, which then says more than the week does.
+    pub fn week_days(&self, date_only_tz: Tz) -> Option<(NaiveDate, NaiveDate)> {
+        if self.scheduled.is_some() || self.deadline.is_some() {
+            return None;
+        }
+        let day = self.week.as_ref()?.parsed.with_timezone(&date_only_tz);
+        let week = day.date_naive().week(Weekday::Mon);
+        Some((week.first_day(), week.last_day()))
+    }
+
     pub fn uid(&self) -> String {
         match &self.ical_uid {
             Some(uid) => uid.clone(),
