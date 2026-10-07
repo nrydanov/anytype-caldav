@@ -22,6 +22,10 @@ calendar client's own settings.
 - **Tasks** of one type become `VTODO`s: scheduled date, deadline, done, tags as
   `CATEGORIES`, reminders as `VALARM`. Edits made in the client (done, dates,
   name, tags, new tasks, deletion as archive) are written back to Anytype.
+- **A task for some day of a week** is kept by the optional `week` date
+  property alone, so that views on the scheduled date and the deadline do not
+  list it. The calendar gets it with the dates of that week's Monday and
+  Sunday, and a task given those dates in the client is stored the same way.
 - **Events** of type `event` become a second calendar, with recurring series,
   edited and deleted occurrences, and deadlines as entries of their own.
 - **A calendar per person** when tasks have an assignee property. Every person

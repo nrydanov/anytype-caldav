@@ -55,6 +55,8 @@ pub const SCHEMA: &[PropertySpec] = &[
     plain("done", "Done", PropertyFormat::Checkbox),
     plain("due_date", "Due date", PropertyFormat::Date),
     plain("scheduled", "Scheduled", PropertyFormat::Date),
+    // A day of the week a task is meant for, in place of the two dates above.
+    plain("week", "Week", PropertyFormat::Date),
     plain("start_date", "Start date", PropertyFormat::Date),
     plain("end_date", "End date", PropertyFormat::Date),
     plain("address", "Address", PropertyFormat::Text),
@@ -118,12 +120,13 @@ pub const TYPES: &[TypeSpec] = &[
         layout: TypeLayout::Action,
         properties: &[
             "scheduled",
+            "week",
             "reminder_lead",
             "priority",
             "series",
             "occurrence",
         ],
-        header: &["priority", "due_date", "scheduled", "reminder_lead"],
+        header: &["priority", "due_date", "scheduled", "week", "reminder_lead"],
     },
     TypeSpec {
         key: "event",
