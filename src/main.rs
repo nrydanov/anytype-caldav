@@ -262,6 +262,18 @@ fn deadline_key(config: &Config) -> String {
     }
 }
 
+/// Where the generator writes a task's week, when the property is selected by
+/// key; selected by id, or not at all, such a task has the two dates.
+fn week_property(config: &Config) -> Option<series::WeekProperty> {
+    match &config.properties.week {
+        Some(PropertySelector::Key(key)) => Some(series::WeekProperty {
+            key: key.clone(),
+            date_only_tz: config.calendar.date_only_timezone,
+        }),
+        _ => None,
+    }
+}
+
 async fn generate_kind(
     config: &Config,
     kind: series::Kind,
@@ -272,6 +284,7 @@ async fn generate_kind(
         config.anytype.space_id.clone(),
         kind,
         deadline_key(config),
+        week_property(config),
     );
     let tz = config.calendar.timezone;
     let now = Utc::now();
@@ -466,6 +479,7 @@ async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                     config.anytype.space_id.clone(),
                     kind,
                     deadline_key(&config),
+                    week_property(&config),
                 ),
                 durable_state,
                 config.calendar.timezone,

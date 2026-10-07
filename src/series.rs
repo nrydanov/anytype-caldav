@@ -27,7 +27,9 @@
 //!
 //! A task series with an `end_date` after its `start_date` makes tasks with a
 //! deadline as well: the occurrence plus the length between the two. A series
-//! from a Monday to its Sunday, repeated weekly, makes a task for each week.
+//! from a Monday to its Sunday, repeated weekly, makes a task for each week;
+//! where tasks have a property for their week, such a task has the week
+//! there and neither `scheduled` nor a deadline.
 //!
 //! An event series' `exdate` leaves days out: no meeting is made for them. A
 //! meeting deleted by hand joins the `exdate` of its series, so that a
@@ -49,7 +51,7 @@ use anytype::{
     objects::{Icon, Object},
     properties::{PropertyValue, SetProperty},
 };
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Days, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
 use futures::StreamExt;
 use rrule::RRuleSet;
@@ -682,6 +684,27 @@ pub fn plan_upkeep<'a>(
     upkeep
 }
 
+/// Where the week of a task is written.
+#[derive(Debug, Clone)]
+pub struct WeekProperty {
+    pub key: String,
+    /// The zone a date-only value is midnight in.
+    pub date_only_tz: Tz,
+}
+
+/// Whether a task from `at` to `due` takes a whole week: date-only, from a
+/// Monday to its Sunday.
+fn whole_week(at: DateTime<Utc>, due: &str, tz: Tz) -> bool {
+    let Ok(due) = DateTime::parse_from_rfc3339(due) else {
+        return false;
+    };
+    let (from, to) = (at.with_timezone(&tz), due.with_timezone(&tz));
+    from.time() == NaiveTime::MIN
+        && to.time() == NaiveTime::MIN
+        && from.weekday() == Weekday::Mon
+        && to.date_naive() == from.date_naive() + Days::new(6)
+}
+
 /// Reads series and their instances from one space, and creates instances.
 pub struct AnytypeSeries {
     client: AnytypeClient,
@@ -689,15 +712,24 @@ pub struct AnytypeSeries {
     kind: Kind,
     /// The key of the tasks' deadline property.
     deadline_key: String,
+    /// Set when tasks have a property for their week.
+    week: Option<WeekProperty>,
 }
 
 impl AnytypeSeries {
-    pub fn new(client: AnytypeClient, space_id: String, kind: Kind, deadline_key: String) -> Self {
+    pub fn new(
+        client: AnytypeClient,
+        space_id: String,
+        kind: Kind,
+        deadline_key: String,
+        week: Option<WeekProperty>,
+    ) -> Self {
         Self {
             client,
             space_id,
             kind,
             deadline_key,
+            week,
         }
     }
 
@@ -1010,13 +1042,23 @@ impl AnytypeSeries {
             .new_object(&self.space_id, TASK_TYPE)
             .name(series.name.clone())
             .set_objects("series", [series.id.clone()])
-            .set_date("occurrence", planned.occurrence.clone())
-            .set_date("scheduled", planned.occurrence.clone());
+            .set_date("occurrence", planned.occurrence.clone());
         let at = DateTime::parse_from_rfc3339(&planned.occurrence)
             .map(|at| at.with_timezone(&Utc))
             .expect("the planner writes RFC 3339");
-        if let Some(due) = event_end(series, at) {
-            request = request.set_date(&self.deadline_key, due);
+        let due = event_end(series, at);
+        let week = self.week.as_ref().filter(|week| {
+            due.as_deref()
+                .is_some_and(|due| whole_week(at, due, week.date_only_tz))
+        });
+        match week {
+            Some(week) => request = request.set_date(&week.key, planned.occurrence.clone()),
+            None => {
+                request = request.set_date("scheduled", planned.occurrence.clone());
+                if let Some(due) = due {
+                    request = request.set_date(&self.deadline_key, due);
+                }
+            }
         }
         if let Some(priority) = &series.priority {
             request = request.set_select("priority", priority.clone());
@@ -1351,6 +1393,19 @@ mod tests {
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn a_whole_week_is_date_only_from_a_monday_to_its_sunday() {
+        // 5 October 2026 is a Monday; a date-only day is Saratov midnight.
+        let monday = Utc.with_ymd_and_hms(2026, 10, 4, 20, 0, 0).unwrap();
+        assert!(whole_week(monday, "2026-10-10T20:00:00Z", Saratov));
+        // To the Saturday, and to the Sunday at noon.
+        assert!(!whole_week(monday, "2026-10-09T20:00:00Z", Saratov));
+        assert!(!whole_week(monday, "2026-10-11T08:00:00Z", Saratov));
+        // From a Tuesday, six days long.
+        let tuesday = Utc.with_ymd_and_hms(2026, 10, 5, 20, 0, 0).unwrap();
+        assert!(!whole_week(tuesday, "2026-10-11T20:00:00Z", Saratov));
     }
 
     fn at(raw: &str) -> AnytypeDate {
