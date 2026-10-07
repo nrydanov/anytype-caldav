@@ -122,6 +122,7 @@ mod tests {
             name: "Task".into(),
             scheduled: None,
             deadline: None,
+            week: None,
             done: false,
             reminder_leads: Vec::new(),
             tags: Vec::new(),

@@ -45,6 +45,7 @@ fn task(id: &str, name: &str) -> Task {
         name: name.into(),
         scheduled: AnytypeDate::parse("2026-09-20T09:00:00Z"),
         deadline: None,
+        week: None,
         done: false,
         reminder_leads: Vec::new(),
         tags: vec!["Финансы".into()],

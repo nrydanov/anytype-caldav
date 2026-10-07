@@ -271,6 +271,7 @@ struct RawProperties {
     reminder: Option<String>,
     tags: Option<String>,
     assignee: Option<String>,
+    week: Option<String>,
 }
 
 impl Default for RawProperties {
@@ -282,6 +283,7 @@ impl Default for RawProperties {
             reminder: None,
             tags: None,
             assignee: None,
+            week: None,
         }
     }
 }
@@ -516,6 +518,10 @@ pub struct PropertiesConfig {
     /// Optional assignee. Configuring it is what turns on the calendar per
     /// member; without it every task is served from the flat collection only.
     pub assignee: Option<PropertySelector>,
+    /// Optional date of a task meant for some day of a week: any day of that
+    /// week, with `scheduled` and `deadline` left empty. Without it such a
+    /// task is kept as a `scheduled` Monday and a `deadline` Sunday.
+    pub week: Option<PropertySelector>,
 }
 
 #[derive(Debug, Clone)]
@@ -661,6 +667,12 @@ impl Config {
             .as_deref()
             .map(|value| PropertySelector::parse("assignee", value))
             .transpose()?;
+        let week = raw
+            .properties
+            .week
+            .as_deref()
+            .map(|value| PropertySelector::parse("week", value))
+            .transpose()?;
         // Two selectors pointing at one property would silently map one source
         // value onto two calendar fields.
         let mut selectors = vec![
@@ -676,6 +688,9 @@ impl Config {
         }
         if let Some(assignee) = &assignee {
             selectors.push(("assignee", assignee));
+        }
+        if let Some(week) = &week {
+            selectors.push(("week", week));
         }
         for (index, (an, a)) in selectors.iter().enumerate() {
             for (bn, b) in &selectors[index + 1..] {
@@ -874,6 +889,7 @@ impl Config {
                 reminder,
                 tags,
                 assignee,
+                week,
             },
             calendar: CalendarConfig {
                 timezone,
@@ -1176,6 +1192,26 @@ allowed_origins = ["https://calino.io"]
         );
         let err = load(&text).unwrap_err().to_string();
         assert!(err.contains("must be distinct"), "{err}");
+    }
+
+    #[test]
+    fn accepts_an_optional_week_selector() {
+        let text = base().replace(
+            "done = \"key:done\"",
+            "done = \"key:done\"\nweek = \"key:week\"",
+        );
+        let config = load(&text).expect("valid config");
+        assert_eq!(
+            config.properties.week,
+            Some(PropertySelector::Key("week".into()))
+        );
+        assert!(
+            load(&base())
+                .expect("valid config")
+                .properties
+                .week
+                .is_none()
+        );
     }
 
     #[test]

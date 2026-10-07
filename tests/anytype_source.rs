@@ -36,6 +36,7 @@ fn properties() -> PropertiesConfig {
         reminder: None,
         tags: None,
         assignee: None,
+        week: None,
     }
 }
 

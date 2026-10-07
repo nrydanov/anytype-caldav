@@ -292,6 +292,7 @@ mod tests {
             name: "Pay rent".into(),
             scheduled: scheduled.and_then(AnytypeDate::parse),
             deadline: deadline.and_then(AnytypeDate::parse),
+            week: None,
             done: false,
             reminder_leads: vec![],
             tags: vec![],

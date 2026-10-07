@@ -44,6 +44,9 @@ done      = "key:done"
 # space's own `profile` objects; without it every task is served from the flat
 # calendar only.
 # assignee = "key:assignee"
+# Optional. A date property for a task meant for some day of a week: it holds
+# a day of that week, and the task's scheduled date and deadline stay empty.
+# week = "key:week"
 
 [calendar]
 timezone = "Europe/Saratov"

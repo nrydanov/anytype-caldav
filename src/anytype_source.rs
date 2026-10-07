@@ -562,6 +562,10 @@ impl AnytypeTaskSource {
         let scheduled =
             self.read_date(object, &self.properties.scheduled, "scheduled", warnings)?;
         let deadline = self.read_date(object, &self.properties.deadline, "deadline", warnings)?;
+        let week = match &self.properties.week {
+            Some(selector) => self.read_date(object, selector, "week", warnings)?,
+            None => None,
+        };
         let done = self.read_done(object)?;
         let reminder_leads = self.read_reminder_leads(object, warnings)?;
         let tags = self.read_tags(object, warnings)?;
@@ -582,6 +586,7 @@ impl AnytypeTaskSource {
             name,
             scheduled,
             deadline,
+            week,
             done,
             reminder_leads,
             tags,

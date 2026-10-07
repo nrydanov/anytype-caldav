@@ -60,6 +60,8 @@ pub struct Task {
     pub name: String,
     pub scheduled: Option<AnytypeDate>,
     pub deadline: Option<AnytypeDate>,
+    /// A day of the week the task is meant for, when it has no day of its own.
+    pub week: Option<AnytypeDate>,
     pub done: bool,
     /// Lead times chosen on the task itself. Empty means "use the configured
     /// default"; several values mean several reminders.
@@ -207,6 +209,7 @@ mod tests {
             name: "Before".into(),
             scheduled: Some(date("2026-08-29T00:00:00+04:00")),
             deadline: None,
+            week: None,
             done: false,
             reminder_leads: Vec::new(),
             tags: Vec::new(),

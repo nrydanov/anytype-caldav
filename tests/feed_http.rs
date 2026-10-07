@@ -100,6 +100,7 @@ fn task(id: &str, name: &str) -> Task {
         name: name.into(),
         scheduled: AnytypeDate::parse("2026-08-29T00:00:00+04:00"),
         deadline: None,
+        week: None,
         done: false,
         reminder_leads: Vec::new(),
         tags: Vec::new(),
