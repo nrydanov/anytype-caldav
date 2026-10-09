@@ -416,7 +416,7 @@ pub(super) async fn put(
     } else {
         StatusCode::NO_CONTENT
     };
-    written(state, &object_id, code).await
+    written(&object_id, code)
 }
 
 /// The assignees once a task moves from one person's calendar to another's:
@@ -477,27 +477,16 @@ pub(super) async fn create(
         Err(err) => return source_failure(&err),
     };
     state.feed.invalidate();
-    written(state, &object_id, StatusCode::CREATED).await
+    written(&object_id, StatusCode::CREATED)
 }
 
-/// Answers a successful write with the new ETag, read back from Anytype, so
-/// the client does not need a PROPFIND to learn it.
-pub(super) async fn written(state: &AppState, object_id: &str, code: StatusCode) -> Response {
-    let writer = state.writer.as_ref().expect("routed only with a writer");
-    let mut builder = Response::builder().status(code);
-    match writer.get_task(object_id).await {
-        Ok(Some(task)) => {
-            let etag = state.feed.resource_for(&task).etag;
-            info!(%object_id, %etag, status = code.as_u16(), "caldav write done");
-            builder = builder.header(header::ETAG, etag);
-        }
-        other => {
-            // The write happened; only the ETag is unknown. Calino recovers it
-            // with a PROPFIND.
-            warn!(%object_id, result = ?other.map(|t| t.is_some()), "caldav write done but reading it back failed");
-        }
-    }
-    builder.body(Body::empty()).expect("static response")
+/// Answers a successful write without an ETag. What is served afterwards is
+/// rendered from Anytype and never the bytes the client sent, and RFC 4791
+/// §5.3.4 forbids a strong ETag on such a PUT: the client reads the resource
+/// again before it changes it further.
+pub(super) fn written(object_id: &str, code: StatusCode) -> Response {
+    info!(%object_id, status = code.as_u16(), "caldav write done");
+    status(code)
 }
 
 /// In the flat calendar and among the unassigned a DELETE archives the task.

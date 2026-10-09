@@ -889,7 +889,7 @@ mod writes {
 
     /// The whole Calino tick: GET, edit the bytes, PUT with If-Match.
     #[tokio::test]
-    async fn ticking_in_the_client_marks_the_task_done_and_returns_the_new_etag() {
+    async fn ticking_in_the_client_marks_the_task_done_and_answers_without_an_etag() {
         let (router, store) = writable();
         let (etag, ics) = current(&router, "bafyreiaaa").await;
         let ticked = ics
@@ -916,8 +916,9 @@ mod writes {
                 }
             )]
         );
+        // The task is served as Anytype has it, not as it was sent.
+        assert_eq!(new_etag, None);
         let (fresh_etag, fresh) = current(&router, "bafyreiaaa").await;
-        assert_eq!(new_etag.as_deref(), Some(fresh_etag.as_str()));
         assert_ne!(fresh_etag, etag);
         assert!(fresh.contains("STATUS:COMPLETED"), "{fresh}");
     }
@@ -981,7 +982,7 @@ mod writes {
 
         let (status, etag) = put(&router, &path, Some(("If-None-Match", "*")), &body).await;
         assert_eq!(status, StatusCode::CREATED);
-        assert!(etag.is_some());
+        assert_eq!(etag, None);
 
         let created = store.tasks.lock().unwrap().last().cloned().unwrap();
         assert_eq!(created.name, "Buy milk");
@@ -1334,7 +1335,9 @@ mod writes {
             )
             .await;
             assert_eq!(status, StatusCode::NO_CONTENT);
-            assert!(new_etag.is_some_and(|e| e != etag));
+            assert_eq!(new_etag, None);
+            let (served, _) = get_event(&router, "bafyreieee").await;
+            assert_ne!(served, etag);
             let stored = events.events.lock().unwrap()[0].clone();
             assert_eq!(stored.start.unwrap().raw, "2026-09-21T10:00:00Z");
             assert_eq!(stored.end.unwrap().raw, "2026-09-21T11:30:00Z");
@@ -1424,8 +1427,8 @@ mod writes {
             )
             .await;
             assert_eq!(status, StatusCode::CREATED);
-            let (served, _) = get_event(&router, "abc~201").await;
-            assert_eq!(Some(served), etag);
+            assert_eq!(etag, None);
+            get_event(&router, "abc~201").await;
             let stored = events.events.lock().unwrap().last().cloned().unwrap();
             assert_eq!(
                 stored.tags,
@@ -1532,13 +1535,14 @@ mod writes {
             let (router, events) = with_events_in_tasks(true);
             let body = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:sync1\r\nSUMMARY:Sync\r\nDTSTART:20261001T100000Z\r\nDTEND:20261001T110000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
             let path = "/dav/calendars/tasks/sync1.ics";
-            let (status, etag) = put(&router, path, Some(("If-None-Match", "*")), body).await;
+            let (status, _) = put(&router, path, Some(("If-None-Match", "*")), body).await;
             assert_eq!(status, StatusCode::CREATED);
             assert_eq!(events.events.lock().unwrap().last().unwrap().name, "Sync");
+            let (_, headers, _) = send(&router, "GET", path, None, "").await;
+            let etag = headers[header::ETAG].to_str().unwrap().to_string();
 
             let renamed = body.replace("SUMMARY:Sync", "SUMMARY:Sync по ЯП");
-            let (status, _) =
-                put(&router, path, Some(("If-Match", &etag.unwrap())), &renamed).await;
+            let (status, _) = put(&router, path, Some(("If-Match", &etag)), &renamed).await;
             assert!(status.is_success(), "{status}");
             assert_eq!(
                 events.events.lock().unwrap().last().unwrap().name,
@@ -1615,7 +1619,7 @@ mod writes {
             );
             assert_eq!(master.start.as_ref().unwrap().raw, "2026-09-21T09:50:00Z");
             let (served, ics) = get_event(&router, "9f1c0b7e-1d2a-4c55-8a36-5b8e2f4d7c10").await;
-            assert_eq!(Some(served.clone()), etag);
+            assert_eq!(etag, None);
             assert!(
                 ics.contains("DTSTART;TZID=Europe/Saratov:20260921T135000"),
                 "{ics}"
@@ -1645,7 +1649,7 @@ mod writes {
                 "2026-09-28T12:00:00Z"
             );
             let (served, ics) = get_event(&router, "9f1c0b7e-1d2a-4c55-8a36-5b8e2f4d7c10").await;
-            assert_eq!(Some(served.clone()), etag);
+            assert_eq!(etag, None);
             assert!(
                 ics.contains("RECURRENCE-ID;TZID=Europe/Saratov:20260928T135000"),
                 "{ics}"
@@ -1719,10 +1723,10 @@ mod writes {
             let (router, events) = with_events();
             let before = events.events.lock().unwrap().len();
             let body = with_blocks("", MOVED).replace("SEQUENCE:1", "SEQUENCE:0");
-            let (status, etag) =
-                put(&router, SERIES_PATH, Some(("If-None-Match", "*")), &body).await;
+            let (status, _) = put(&router, SERIES_PATH, Some(("If-None-Match", "*")), &body).await;
             assert_eq!(status, StatusCode::CREATED);
             assert_eq!(events.events.lock().unwrap().len(), before + 2);
+            let (etag, _) = get_event(&router, "9f1c0b7e-1d2a-4c55-8a36-5b8e2f4d7c10").await;
             let response = router
                 .clone()
                 .oneshot(
@@ -1730,7 +1734,7 @@ mod writes {
                         .method("DELETE")
                         .uri(SERIES_PATH)
                         .header(header::AUTHORIZATION, auth())
-                        .header("If-Match", etag.unwrap())
+                        .header("If-Match", etag)
                         .body(Body::empty())
                         .unwrap(),
                 )

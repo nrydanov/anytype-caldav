@@ -220,7 +220,7 @@ async fn put_event(
             return source_failure(&err);
         }
     }
-    event_written(service, &object_id, StatusCode::NO_CONTENT).await
+    event_written(&object_id, StatusCode::NO_CONTENT)
 }
 
 /// Master first, then replacements. A failure part-way leaves the resource
@@ -301,27 +301,16 @@ async fn create_event(
         }
     }
     service.invalidate();
-    event_written(service, &object_id, StatusCode::CREATED).await
+    event_written(&object_id, StatusCode::CREATED)
 }
 
-async fn event_written(service: &EventService, object_id: &str, code: StatusCode) -> Response {
-    let mut builder = Response::builder().status(code);
-    match service.read_series(object_id).await {
-        Ok(Some((event, replacements))) => {
-            let refs: Vec<&ev::Event> = replacements.iter().collect();
-            match service.resource(&event, &refs) {
-                Some(resource) => {
-                    info!(%object_id, etag = %resource.etag, status = code.as_u16(), "caldav event write done");
-                    builder = builder.header(header::ETAG, resource.etag);
-                }
-                None => warn!(%object_id, "caldav event write done but the event has no start"),
-            }
-        }
-        other => {
-            warn!(%object_id, result = ?other.map(|e| e.is_some()), "caldav event write done but reading it back failed");
-        }
-    }
-    builder.body(Body::empty()).expect("static response")
+/// Answers a successful write without an ETag. What is served afterwards is
+/// rendered from Anytype and never the bytes the client sent, and RFC 4791
+/// §5.3.4 forbids a strong ETag on such a PUT: the client reads the resource
+/// again before it changes it further.
+fn event_written(object_id: &str, code: StatusCode) -> Response {
+    info!(%object_id, status = code.as_u16(), "caldav event write done");
+    status(code)
 }
 
 /// The event behind a deadline's entry, read afresh, once the client's
@@ -395,14 +384,7 @@ async fn put_deadline(
         return source_failure(&err);
     }
     service.invalidate();
-    let mut builder = Response::builder().status(StatusCode::NO_CONTENT);
-    if let Ok(Some(event)) = service.source.get(&current.object_id).await
-        && let Some(resource) = ev::deadline_entry(&event, service.config.language)
-            .and_then(|e| service.resource(&e, &[]))
-    {
-        builder = builder.header(header::ETAG, resource.etag);
-    }
-    builder.body(Body::empty()).expect("static response")
+    event_written(&current.object_id, StatusCode::NO_CONTENT)
 }
 
 /// Deleting `<name> (дедлайн)` clears the event's deadline; the event stays.
