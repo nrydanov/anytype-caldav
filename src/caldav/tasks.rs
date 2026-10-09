@@ -22,6 +22,7 @@ use super::{
 use crate::{
     feed::{Outcome, Resource, Snapshot, calino_filename, collection_ctag},
     http::AppState,
+    render::made_from_older,
     writeback::{self, WriteError},
 };
 
@@ -384,6 +385,10 @@ pub(super) async fn put(
     {
         warn!(resource = name, %object_id, client_etag = %expected, server_etag = %current_etag, "caldav put: stale etag");
         return precondition_failed("etag mismatch");
+    }
+    if made_from_older(incoming.sequence, current.last_modified) {
+        warn!(resource = name, %object_id, sequence = ?incoming.sequence, modified = ?current.last_modified, "caldav put: body made from an older version");
+        return precondition_failed("body made from an older version");
     }
 
     let renderer = state.feed.renderer();

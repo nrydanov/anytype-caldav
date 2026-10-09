@@ -969,6 +969,24 @@ mod writes {
         assert!(store.patches.lock().unwrap().is_empty());
     }
 
+    /// The ETag is the current one, the body is not: it carries the SEQUENCE
+    /// of the version before the last write.
+    #[tokio::test]
+    async fn a_body_made_from_an_older_version_is_refused_under_the_current_etag() {
+        let (router, store) = writable();
+        let path = "/dav/calendars/tasks/bafyreiaaa.ics";
+        let (etag, old) = current(&router, "bafyreiaaa").await;
+        let ticked = old.replace("STATUS:NEEDS-ACTION", "STATUS:COMPLETED");
+        let (status, _) = put(&router, path, Some(("If-Match", &etag)), &ticked).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (etag, _) = current(&router, "bafyreiaaa").await;
+
+        let (status, _) = put(&router, path, Some(("If-Match", &etag)), &old).await;
+
+        assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(store.patches.lock().unwrap().len(), 1);
+    }
+
     /// Calino creates with If-None-Match: * at `<uid>.ics` and afterwards
     /// addresses the task only by that name.
     #[tokio::test]
@@ -1415,6 +1433,25 @@ mod writes {
             assert_eq!(status, StatusCode::PRECONDITION_FAILED);
         }
 
+        /// What Thunderbird did on snoozing a reminder: the ETag of the event
+        /// as it is now, beside the event as it was before it was moved.
+        #[tokio::test]
+        async fn an_event_made_from_an_older_version_is_refused_under_the_current_etag() {
+            let (router, events) = with_events();
+            let path = "/dav/calendars/events/bafyreieee.ics";
+            let (etag, old) = get_event(&router, "bafyreieee").await;
+            let moved = old.replace("DTSTART:20260920T095000Z", "DTSTART:20260921T095000Z");
+            let (status, _) = put(&router, path, Some(("If-Match", &etag)), &moved).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            let (etag, _) = get_event(&router, "bafyreieee").await;
+
+            let (status, _) = put(&router, path, Some(("If-Match", &etag)), &old).await;
+
+            assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+            let stored = events.events.lock().unwrap()[0].clone();
+            assert_eq!(stored.start.unwrap().raw, "2026-09-21T09:50:00Z");
+        }
+
         #[tokio::test]
         async fn an_event_created_in_the_client_lands_in_anytype_under_its_name() {
             let (router, events) = with_events();
@@ -1590,10 +1627,17 @@ mod writes {
             &body[start..end]
         }
 
-        fn with_blocks(extra_master_lines: &str, replacement: &str) -> String {
+        /// The SEQUENCE of the first component of a served body. Calino sends
+        /// one more with its edit.
+        fn sequence_of(ics: &str) -> u32 {
+            let value = ics.split("SEQUENCE:").nth(1).unwrap();
+            value[..value.find('\r').unwrap()].parse().unwrap()
+        }
+
+        fn with_blocks(sequence: u32, extra_master_lines: &str, replacement: &str) -> String {
             let master = master_block(SERIES).replace(
                 "SEQUENCE:0\r\n",
-                &format!("SEQUENCE:1\r\n{extra_master_lines}"),
+                &format!("SEQUENCE:{sequence}\r\n{extra_master_lines}"),
             );
             format!(
                 "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Calino//EN\r\n{master}{replacement}END:VCALENDAR\r\n"
@@ -1630,7 +1674,7 @@ mod writes {
             );
 
             // Edit only the occurrence of 28 September.
-            let body = with_blocks("", MOVED);
+            let body = with_blocks(sequence_of(&ics) + 1, "", MOVED);
             let (status, etag) =
                 put(&router, SERIES_PATH, Some(("If-Match", &served)), &body).await;
             assert_eq!(status, StatusCode::NO_CONTENT);
@@ -1679,7 +1723,11 @@ mod writes {
 
             // Delete only that occurrence: EXDATE on the master, the
             // replacement leaves the group.
-            let body = with_blocks("EXDATE;TZID=Europe/Saratov:20260928T135000\r\n", "");
+            let body = with_blocks(
+                sequence_of(&ics) + 1,
+                "EXDATE;TZID=Europe/Saratov:20260928T135000\r\n",
+                "",
+            );
             let (status, _) = put(&router, SERIES_PATH, Some(("If-Match", &served)), &body).await;
             assert_eq!(status, StatusCode::NO_CONTENT);
             assert_eq!(count(), before + 1);
@@ -1722,7 +1770,7 @@ mod writes {
         async fn deleting_a_series_archives_its_replaced_occurrences() {
             let (router, events) = with_events();
             let before = events.events.lock().unwrap().len();
-            let body = with_blocks("", MOVED).replace("SEQUENCE:1", "SEQUENCE:0");
+            let body = with_blocks(0, "", MOVED).replace("SEQUENCE:1", "SEQUENCE:0");
             let (status, _) = put(&router, SERIES_PATH, Some(("If-None-Match", "*")), &body).await;
             assert_eq!(status, StatusCode::CREATED);
             assert_eq!(events.events.lock().unwrap().len(), before + 2);

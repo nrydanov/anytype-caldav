@@ -423,6 +423,8 @@ pub struct IncomingEvent {
     pub exdates: Vec<DatePerhapsTime>,
     /// RECURRENCE-ID, on a component replacing one occurrence.
     pub recurrence_id: Option<DatePerhapsTime>,
+    /// SEQUENCE, which tells the version of the object the body was made from.
+    pub sequence: Option<u32>,
 }
 
 /// A PUT body: the master (or a plain event) and the components replacing
@@ -532,6 +534,7 @@ fn incoming(event: &icalendar::Event) -> IncomingEvent {
             .filter(|rule| !rule.is_empty()),
         exdates,
         recurrence_id: event.get_recurrence_id(),
+        sequence: event.get_sequence(),
     }
 }
 

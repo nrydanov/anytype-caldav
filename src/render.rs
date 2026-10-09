@@ -89,6 +89,18 @@ pub fn sequence_for(modified: DateTime<Utc>) -> u32 {
     u32::try_from(modified.timestamp().max(0)).unwrap_or(u32::MAX)
 }
 
+/// Whether a body carrying `sent` as its SEQUENCE was made from a version of
+/// an object older than the one modified at `modified`.
+///
+/// A client sends back the SEQUENCE it was served, or a higher one after its
+/// own edit. A lower one means the body was made from an earlier version of
+/// the object, whatever ETag came beside it: Thunderbird takes `If-Match`
+/// from a cache of ETags and the body from its stored item, and the two can
+/// disagree. A body without SEQUENCE says nothing and is taken as it is.
+pub fn made_from_older(sent: Option<u32>, modified: Option<DateTime<Utc>>) -> bool {
+    matches!((sent, modified), (Some(sent), Some(at)) if sent < sequence_for(at))
+}
+
 pub struct VTodoRenderer {
     config: CalendarConfig,
     reminders: RemindersConfig,

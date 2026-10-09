@@ -27,6 +27,8 @@ pub struct Incoming {
     pub due: Option<DatePerhapsTime>,
     /// CATEGORIES values.
     pub categories: Vec<String>,
+    /// SEQUENCE, which tells the version of the task the body was made from.
+    pub sequence: Option<u32>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -96,6 +98,7 @@ pub fn parse(body: &str) -> Result<Incoming, WriteError> {
         start: todo.get_start(),
         due: todo.get_due(),
         categories: crate::events::categories(todo),
+        sequence: todo.get_sequence(),
     })
 }
 

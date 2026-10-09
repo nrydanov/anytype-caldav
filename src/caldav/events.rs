@@ -17,6 +17,7 @@ use crate::{
     events::{self as ev, EventService, EventWriteError},
     feed::calino_filename,
     http::AppState,
+    render::made_from_older,
     source::SourceError,
 };
 
@@ -209,6 +210,10 @@ async fn put_event(
         warn!(resource = name, %object_id, client_etag = %expected, server_etag = ?current_etag, "caldav event put: stale etag");
         return precondition_failed("etag mismatch");
     }
+    if made_from_older(incoming.master.sequence, current.last_modified) {
+        warn!(resource = name, %object_id, sequence = ?incoming.master.sequence, modified = ?current.last_modified, "caldav event put: body made from an older version");
+        return precondition_failed("body made from an older version");
+    }
     let plan = ev::plan_series_update(&current, &replacements, &incoming, &service.config);
     if plan.is_empty() {
         info!(resource = name, %object_id, "caldav event put: nothing changed");
@@ -360,6 +365,10 @@ async fn put_deadline(
         Err(response) => return *response,
     };
     let deadline = match ev::parse_event(body) {
+        Ok(incoming) if made_from_older(incoming.sequence, current.last_modified) => {
+            warn!(resource = name, object_id = %current.object_id, sequence = ?incoming.sequence, modified = ?current.last_modified, "caldav deadline put: body made from an older version");
+            return precondition_failed("body made from an older version");
+        }
         Ok(incoming) => ev::deadline_from(&incoming, &service.config),
         Err(err) => {
             warn!(resource = name, error = %err, "caldav deadline put: unreadable body");
