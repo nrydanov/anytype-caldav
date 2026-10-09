@@ -14,7 +14,8 @@ use super::events::{event_href, events_route};
 use super::names::named;
 use super::paths::{collection_path, href_for, object_id, tasks_key};
 use super::xml::{
-    Report, collection_props, member_props, multistatus, prop_text, report_kind, response, status,
+    Report, collection_props, member_props, multiget_hrefs, multistatus, report_kind,
+    report_responses, response, status,
 };
 use super::{
     flat_contents, header_text, precondition_failed, source_failure, unavailable, with_snapshot,
@@ -99,6 +100,7 @@ pub(super) async fn tasks_route(
         }
         ("REPORT", true, _) => {
             let kind = report_kind(body);
+            let hrefs = multiget_hrefs(body);
             with_snapshot(state, |snapshot| match kind {
                 Report::SyncCollection => {
                     // Never advertised, so Calino does not send it; a 403
@@ -126,21 +128,12 @@ pub(super) async fn tasks_route(
                         ?kind,
                         "caldav calendar-query for tasks"
                     );
-                    multistatus(
+                    multistatus(report_responses(
+                        hrefs.as_deref(),
                         tasks
                             .chain(merged)
-                            .map(|(id, resource)| {
-                                response(
-                                    &href_for(&key, id),
-                                    &[
-                                        prop_text("d:getetag", &resource.etag),
-                                        prop_text("d:getcontenttype", "text/calendar"),
-                                        prop_text("c:calendar-data", &resource.ics),
-                                    ],
-                                )
-                            })
-                            .collect(),
-                    )
+                            .map(|(id, resource)| (href_for(&key, id), resource)),
+                    ))
                 }
             })
             .await

@@ -6,6 +6,8 @@ use axum::{
     response::Response,
 };
 
+use crate::feed::Resource;
+
 #[derive(Debug, PartialEq)]
 pub(super) enum Report {
     Tasks,
@@ -29,6 +31,70 @@ pub(super) fn report_kind(body: &str) -> Report {
     } else {
         Report::Tasks
     }
+}
+
+/// The hrefs a `calendar-multiget` REPORT names (RFC 4791 §7.9), or `None`
+/// for any other REPORT. Read by its text, as `report_kind` does: a multiget
+/// has no href outside the list of resources it asks for. A href given as a
+/// whole URL is cut down to its path.
+pub(super) fn multiget_hrefs(body: &str) -> Option<Vec<String>> {
+    if !body.contains("calendar-multiget") {
+        return None;
+    }
+    let path = |href: &str| match href.split_once("://") {
+        Some((_, rest)) => rest.find('/').map_or("", |at| &rest[at..]).to_string(),
+        None => href.to_string(),
+    };
+    Some(
+        body.split("href>")
+            .skip(1)
+            .step_by(2)
+            .filter_map(|piece| piece.rsplit_once('<'))
+            .map(|(href, _)| path(unescape(href.trim()).as_str()))
+            .collect(),
+    )
+}
+
+/// The responses of a REPORT over `members`, each a href and its resource.
+/// A multiget is answered with the members it names, in its order, and with
+/// 404 for a href that names none; any other REPORT with every member.
+pub(super) fn report_responses<'a>(
+    hrefs: Option<&[String]>,
+    members: impl Iterator<Item = (String, &'a Resource)>,
+) -> Vec<String> {
+    let data = |href: &str, resource: &Resource| {
+        response(
+            href,
+            &[
+                prop_text("d:getetag", &resource.etag),
+                prop_text("d:getcontenttype", "text/calendar"),
+                prop_text("c:calendar-data", &resource.ics),
+            ],
+        )
+    };
+    let Some(hrefs) = hrefs else {
+        return members
+            .map(|(href, resource)| data(&href, resource))
+            .collect();
+    };
+    let mut found = vec![None; hrefs.len()];
+    for (href, resource) in members {
+        if let Some(at) = hrefs.iter().position(|asked| asked == &href) {
+            found[at] = Some(data(&href, resource));
+        }
+    }
+    hrefs
+        .iter()
+        .zip(found)
+        .map(|(href, found)| {
+            found.unwrap_or_else(|| {
+                format!(
+                    "<d:response><d:href>{}</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>",
+                    escape(href)
+                )
+            })
+        })
+        .collect()
 }
 
 pub(super) fn collection_props(
@@ -153,6 +219,20 @@ mod tests {
         assert_eq!(report_kind("<c:calendar-query/>"), Report::Tasks);
         assert_eq!(report_kind(&event), Report::EventsOnly);
         assert_eq!(report_kind(sync), Report::SyncCollection);
+    }
+
+    /// Thunderbird's body after a PUT (`CalDavRequestHandlers.sys.mjs`).
+    #[test]
+    fn a_multiget_names_the_resources_it_asks_for() {
+        let multiget = r#"<C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav"><D:prop><D:getetag/><C:calendar-data/></D:prop><D:href>/dav/calendars/events/a.ics</D:href><D:href>https://host:8444/dav/calendars/events/b.ics</D:href></C:calendar-multiget>"#;
+        assert_eq!(
+            multiget_hrefs(multiget),
+            Some(vec![
+                "/dav/calendars/events/a.ics".to_string(),
+                "/dav/calendars/events/b.ics".to_string()
+            ])
+        );
+        assert_eq!(multiget_hrefs("<c:calendar-query/>"), None);
     }
 
     #[test]

@@ -279,6 +279,37 @@ async fn the_base_and_the_principal_state_their_resource_type() {
     );
 }
 
+/// What a client sends to read back what it wrote (RFC 4791 §7.9).
+fn multiget(hrefs: &[&str]) -> String {
+    let hrefs: String = hrefs
+        .iter()
+        .map(|href| format!("<d:href>{href}</d:href>"))
+        .collect();
+    format!(
+        r#"<c:calendar-multiget xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop>{hrefs}</c:calendar-multiget>"#
+    )
+}
+
+#[tokio::test]
+async fn a_multiget_serves_the_tasks_it_names_and_404_for_the_rest() {
+    let router = router();
+    let body = multiget(&[
+        "/dav/calendars/tasks/bafyreiaaa.ics",
+        "/dav/calendars/tasks/gone.ics",
+    ]);
+    let (status, _, body) = send(&router, "REPORT", "/dav/calendars/tasks/", None, &body).await;
+    assert_eq!(status, StatusCode::MULTI_STATUS);
+    assert_eq!(body.matches("<d:response>").count(), 2, "{body}");
+    assert_eq!(body.matches("<c:calendar-data>").count(), 1, "{body}");
+    assert!(body.contains("SUMMARY:Pay rent"), "{body}");
+    assert!(
+        body.contains(
+            "<d:href>/dav/calendars/tasks/gone.ics</d:href><d:status>HTTP/1.1 404 Not Found</d:status>"
+        ),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn a_task_query_lists_every_task_with_escaped_data_and_matching_etags() {
     let router = router();

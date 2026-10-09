@@ -10,7 +10,8 @@ use tracing::{debug, info, warn};
 use super::names::named;
 use super::paths::resource_name_in;
 use super::xml::{
-    Report, collection_props, member_props, multistatus, prop_text, report_kind, response, status,
+    Report, collection_props, member_props, multiget_hrefs, multistatus, report_kind,
+    report_responses, response, status,
 };
 use super::{EVENTS, header_text, precondition_failed, source_failure};
 use crate::{
@@ -72,22 +73,13 @@ pub(super) async fn events_route(
                         resources = snapshot.objects.len(),
                         "caldav calendar-query for events"
                     );
-                    multistatus(
+                    multistatus(report_responses(
+                        multiget_hrefs(body).as_deref(),
                         snapshot
                             .objects
                             .iter()
-                            .map(|(name, resource)| {
-                                response(
-                                    &event_href(name),
-                                    &[
-                                        prop_text("d:getetag", &resource.etag),
-                                        prop_text("d:getcontenttype", "text/calendar"),
-                                        prop_text("c:calendar-data", &resource.ics),
-                                    ],
-                                )
-                            })
-                            .collect(),
-                    )
+                            .map(|(name, resource)| (event_href(name), resource)),
+                    ))
                 }
                 Err(err) => source_failure(&err),
             },
