@@ -2169,17 +2169,17 @@ mod writes {
 
         let own = person_path(BOB, "").replace(".ics", "");
         let other = person_path(ALICE, "").replace(".ics", "");
-        let at = |href: &str| body.find(&format!("<d:href>{href}</d:href>")).unwrap();
-        assert!(at(&own) < at(&other), "{body}");
-        // Everything but his own arrives switched off.
-        let hidden = "<cs:calendar-hidden>1</cs:calendar-hidden>";
-        assert_eq!(body.matches(hidden).count(), 2, "{body}");
-        let his = &body[at(&own)..at(&other).max(at(&own))];
-        assert!(!his.contains(hidden), "{his}");
+        let unassigned = "/dav/calendars/tasks-unassigned/";
+        let href = |href: &str| format!("<d:href>{href}</d:href>");
+        let at = |path: &str| body.find(&href(path)).unwrap();
+        assert!(at(&own) < at(unassigned), "{body}");
+        // Alice's calendar is left out.
+        assert!(!body.contains(&href(&other)), "{body}");
 
-        // Nobody in particular gets no flags at all.
+        // Nobody in particular finds everyone's.
         let (_, shared) = send_as(&router, &auth(), "PROPFIND", "/dav/calendars/", "").await;
-        assert!(!shared.contains(hidden), "{shared}");
+        assert!(shared.contains(&href(&own)), "{shared}");
+        assert!(shared.contains(&href(&other)), "{shared}");
     }
 
     /// The piano is Alice's first and Bob's second. Each of them finds it in
@@ -2273,19 +2273,22 @@ mod writes {
     #[tokio::test]
     async fn each_person_names_the_calendars_for_themselves() {
         let (router, _) = grouped();
-        let bobs = format!(
-            "/dav/calendars/tasks-{}/",
-            anytype_caldav::feed::collection_key(BOB)
-        );
-        let body = r#"<propertyupdate xmlns="DAV:"><set><prop><displayname>Боб из команды</displayname></prop></set></propertyupdate>"#;
-        let (status, _) = send_as(&router, &account(ALICE), "PROPPATCH", &bobs, body).await;
+        let unassigned = "/dav/calendars/tasks-unassigned/";
+        let body = r#"<propertyupdate xmlns="DAV:"><set><prop><displayname>Ничьё</displayname></prop></set></propertyupdate>"#;
+        let (status, _) = send_as(&router, &account(ALICE), "PROPPATCH", unassigned, body).await;
         assert_eq!(status, StatusCode::MULTI_STATUS);
 
         let (_, hers) = send_as(&router, &account(ALICE), "PROPFIND", "/dav/calendars/", "").await;
-        assert!(hers.contains("Боб из команды"), "{hers}");
+        assert!(
+            hers.contains("<d:displayname>Ничьё</d:displayname>"),
+            "{hers}"
+        );
         let (_, his) = send_as(&router, &account(BOB), "PROPFIND", "/dav/calendars/", "").await;
-        assert!(!his.contains("Боб из команды"), "{his}");
-        assert!(his.contains("<d:displayname>Боб</d:displayname>"), "{his}");
+        assert!(!his.contains("Ничьё"), "{his}");
+        assert!(
+            his.contains("<d:displayname>Без исполнителя</d:displayname>"),
+            "{his}"
+        );
     }
 
     #[tokio::test]

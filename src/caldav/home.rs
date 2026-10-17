@@ -7,7 +7,7 @@ use super::names::named;
 use super::paths::collection_path;
 use super::settings::settings_collection_props;
 use super::tasks::collection_view;
-use super::xml::{collection_props, multistatus, prop_text, response};
+use super::xml::{collection_props, multistatus, response};
 use super::{EVENTS, SETTINGS, TASKS, flat_contents, source_failure, with_snapshot};
 use crate::http::AppState;
 
@@ -65,11 +65,10 @@ pub(super) async fn home_set(
                 ),
             ));
         }
-        // A person's own calendar comes first, because Calino makes
-        // the first collection the default one for a new task. The
-        // others arrive switched off: a fork of Calino reads the flag
-        // once, when it first sees the url, and the stock client
-        // ignores it. Nobody in particular gets them all switched on.
+        // A person finds their own calendar and the unassigned one;
+        // other people's are left out. Their own comes first, because
+        // Calino makes the first collection the default one for a new
+        // task. Nobody in particular finds everyone's.
         let own = match &reader {
             Reader::Person(id) => Some(id.as_str()),
             Reader::Shared => None,
@@ -77,10 +76,16 @@ pub(super) async fn home_set(
         let is_own = |collection: &crate::feed::Collection| {
             own.is_some() && collection.member_id.as_deref() == own
         };
-        let mut collections: Vec<_> = snapshot.collections.iter().collect();
+        let mut collections: Vec<_> = snapshot
+            .collections
+            .iter()
+            .filter(|(_, collection)| {
+                own.is_none() || collection.member_id.is_none() || is_own(collection)
+            })
+            .collect();
         collections.sort_by_key(|(_, collection)| !is_own(collection));
         responses.extend(collections.into_iter().map(|(key, collection)| {
-            let mut props = collection_props(
+            let props = collection_props(
                 &["VTODO"],
                 &named(
                     state,
@@ -93,11 +98,6 @@ pub(super) async fn home_set(
                     .unwrap_or_default(),
                 writable,
             );
-            if own.is_some() && !is_own(collection) {
-                // An explicit value: the client parses an empty
-                // element into an object, which is truthy.
-                props.push(prop_text("cs:calendar-hidden", "1"));
-            }
             response(&collection_path(key), &props)
         }));
         responses.extend(events);

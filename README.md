@@ -30,7 +30,8 @@ calendar client's own settings.
   edited and deleted occurrences, and deadlines as entries of their own.
 - **A calendar per person** when tasks have an assignee property. Every person
   of the space can get an account of their own; the password is derived from
-  one server secret, so nothing is stored.
+  one server secret, so nothing is stored. Under their own account a person
+  sees their calendar and the unassigned one; the shared login sees everyone's.
 - **Server-side reminders** through Web Push, sent at most once, surviving
   restarts. A person's subscription receives only the reminders of their tasks.
 - **Recurring tasks and events**: a `recurring_task` or `recurring_event`
