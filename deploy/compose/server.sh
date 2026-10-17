@@ -48,9 +48,11 @@ if [ -n "${ACCOUNTS_SECRET:-}" ]; then
     export ANYTYPE_CALDAV__PROPERTIES__ASSIGNEE="${ANYTYPE_CALDAV__PROPERTIES__ASSIGNEE:-key:assignee}"
 fi
 
-# Until the bot is in the space and has loaded it, init fails; it is tried
-# again rather than the container restarted.
-if [ "$#" -eq 0 ]; then
+# init --apply creates whatever it does not find, so on a space the bot has
+# not finished loading it duplicates the schema. It runs only when asked:
+# ANYTYPE_CALDAV_INIT_APPLY=true in .env. Until the bot is in the space, init
+# fails; it is tried again rather than the container restarted.
+if [ "$#" -eq 0 ] && [ "${ANYTYPE_CALDAV_INIT_APPLY:-}" = true ]; then
     until anytype-caldav init --apply; do
         echo "init failed (see above); trying again in 30 s. This passes by itself" \
             "while the owner has yet to let the bot in or the space is still" \

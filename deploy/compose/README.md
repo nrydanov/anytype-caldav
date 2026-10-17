@@ -47,9 +47,16 @@ source (`docker compose up --build`) takes far more memory than running it.
    link, trying again every minute until the request goes through, and hands
    the space's id to the server, together with the API key and the session
    token `init` uses to set type headers over gRPC. If the invite needs
-   approval, the owner approves the bot in Anytype; until then the server
-   tries `init` again every 30 seconds and comes up by itself once the bot is
-   in.
+   approval, the owner approves the bot in Anytype.
+
+   The server prepares the space's schema (`init --apply`) only with
+   `ANYTYPE_CALDAV_INIT_APPLY=true` in `.env`. `init --apply` creates
+   whatever it does not find, and a bot that has just joined does not see
+   the space whole yet, so on a space that already has the schema it would
+   create duplicates. Set it for the first start in a new space; in a space
+   where the schema was made before, leave it out, or set it for one start
+   once the bot has loaded the space and remove it again. With it, the server
+   tries `init` again every 30 seconds until the bot is in.
 
 4. Connect a CalDAV client to `https://<ANYTYPE_CALDAV_DOMAIN>/dav/` with the
    username `anytype` and `CALDAV_PASSWORD`. Without one in `.env`, the server
@@ -62,8 +69,8 @@ Every step can run again without harm: after changing `.env`, run
 `docker compose up -d` again. The bot is created only once and kept in a
 volume, a link joined once is not joined again (a new link is), a fresh API
 key is issued on every
-start, `init --apply` creates only what is missing, and the VAPID key is made
-only when there is none.
+start, and the VAPID key is made only when there is none. `init --apply`
+runs only with `ANYTYPE_CALDAV_INIT_APPLY=true`, as described above.
 
 The kit serves tasks and events, makes the occurrences of recurring series and
 reads the reminder and tag properties `init` creates; `.env` can turn events
