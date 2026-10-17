@@ -1,0 +1,166 @@
+# Changelog
+
+## [0.2.4] - 2026-10-17
+
+### Features
+
+- *(caldav)* List only a person's own calendar and the unassigned one
+
+## [0.2.3] - 2026-10-09
+
+### Features
+
+- *(caldav)* Answer a calendar-multiget with the resources it names
+- *(caldav)* Refuse a PUT whose SEQUENCE is older than the object
+
+### Bug fixes
+
+- *(caldav)* Answer a PUT without an ETag
+
+## [0.2.2] - 2026-10-07
+
+### Features
+
+- *(init)* Create the `week` property and list it on the task type
+- *(series)* Write the week of a task made for a Monday-to-Sunday series
+- *(caldav)* Write a task's whole week to the `week` property
+- *(render)* Serve a task kept by its week from Monday to Sunday
+- *(config)* Read a task's week from an optional `week` property
+
+## [0.2.1] - 2026-10-06
+
+### Features
+
+- *(series)* Set the deadline of a task from its series' end_date
+
+## [0.2.0] - 2026-10-02
+
+### Bug fixes
+
+- *(events)* Serve an event from midnight to a time as a timed one
+
+## [0.2.0-rc.1] - 2026-09-30
+
+### Features
+
+- *(caldav)* Serve a recurring_event as a series with its meetings as occurrences
+- *(series)* Leave out the days in an event series' exdate
+- *(series)* Rewrite or archive the meetings ahead when their series changes
+- *(series)* Let events have a horizon of their own
+
+### Bug fixes
+
+- *(series)* Keep a meeting with notes in its body when its series drops it
+
+## [0.1.3] - 2026-09-19
+
+### Build
+
+- *(compose)* Publish the anytype service as the anytype-bot image
+
+## [0.1.2] - 2026-09-19
+
+### Features
+
+- *(compose)* Serve the Calino fork at the domain's root on request
+
+### Other
+
+- Build each image platform on a runner of its own architecture
+
+## [0.1.1] - 2026-09-19
+
+### Bug fixes
+
+- *(init)* Report only a missing space as not loaded
+- *(compose)* Keep the API reachable and the session token current after creating the bot
+- *(init)* Refuse a space the account has not loaded
+
+### Refactoring
+
+- [**breaking**] Remove /capture
+
+### Build
+
+- *(compose)* Ship the entrypoint in the image, label mounts for SELinux and pin LF endings
+- *(compose)* Show the bot's key on demand and wait for the space instead of restarting
+- *(compose)* Generate the CalDAV password and prefix the kit's variables
+
+## [0.1.0] - 2026-09-19
+
+### Features
+
+- *(init)* Create the types, list their properties and set their headers
+- *(config)* Default the CalDAV username to anytype
+- *(push)* Make the VAPID key on first start when there is none
+- *(anytype)* Serve the account's only space when none is configured
+- Read the secrets from files named by _FILE variables
+- *(config)* Read every setting from the environment
+- Choose the language of notifications and calendar names in the config
+- *(scripts)* Add a tool that sets the properties in a type's header
+- *(calino)* Add the patch that lets Calino take a hidden calendar from the server
+- *(push)* Offer server reminders outside iOS through a service worker
+- *(push)* Send a task's reminders to the subscriptions of its assignees
+- *(caldav)* Serve a calendar per assignee, with an account per person
+- *(events)* Serve an event's deadline as an entry of its own
+- *(series)* Generate events from recurring_event series
+- Put the Anytype app link into task and event descriptions
+- *(capture)* Take a line of text as a task at /capture
+- *(caldav)* Keep the calendar app's own settings in a collection of its own
+- *(caldav)* Write task tags set in a CalDAV client to Anytype
+- *(events)* Serve recurring events with edited and deleted occurrences
+- *(push)* Send reminders to Calino through Declarative Web Push
+- *(events)* Serve Anytype events as a second CalDAV collection
+- *(caldav)* Write task edits from a CalDAV client to Anytype
+- *(caldav)* Serve the tasks read-only over CalDAV
+- Log the decisions of every generator and scheduler pass
+- Write task tags as CATEGORIES
+- *(series)* Generate the next task of each recurring series
+- *(init)* Check a space against the facade's schema and create missing properties
+- Bridge one Anytype space to iCalendar and Web Push
+
+### Bug fixes
+
+- *(anytype)* List the account's spaces instead of picking the only one
+- *(push)* Offer the open push routes only behind a secret feed prefix
+- *(caldav)* Give the CalDAV base and principal a resource type
+- Give task alarms a fixed UID and DTSTAMP
+- *(caldav)* Answer 403 to REPORT outside the task collection
+- *(caldav)* Write SEQUENCE so Calino keeps taking edits made in Anytype
+- *(series)* Use the claims database in the generate command
+- Tell an unset property from a wrong selector
+- Write a planned date as DUE alone
+- Route a planned date into DUE so Calino can place the task
+
+### Documentation
+
+- Name Calino as the client and describe running behind an own proxy
+- Describe the compose deploy and environment settings, drop the calendar app
+- Point the README at what the repository holds and drop the hidden-calendar patch
+- Rewrite the README for a new reader and add the GLWT license
+- Describe the CalDAV options in the example config and the docs
+
+### Refactoring
+
+- *(caldav)* Split the CalDAV facade into a module of files
+- Rename the crate and the binary to anytype-caldav
+
+### Code style
+
+- Format a test assertion that now fits on one line
+
+### Build
+
+- *(compose)* Pull the published image and use everything init prepares
+- *(compose)* Hand the server a session token and a gRPC relay
+- *(compose)* Make the kit work against a self-hosted network
+- *(compose)* Run a headless Anytype in the kit and set it up on start
+- Add a Dockerfile, CI, a compose kit and a systemd unit
+
+### Other
+
+- Remove type_header.py
+- Add a git-cliff config to generate the changelog
+- *(calino)* Remove the push script that nginx injected into Calino
+- Ignore Python caches and the compose kit's local secrets
+
