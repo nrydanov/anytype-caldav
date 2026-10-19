@@ -231,13 +231,18 @@ fn unavailable(category: &str) -> Response {
 }
 
 /// A failed Anytype call. Transport problems are 503 so Calino keeps the change
-/// queued and retries; a schema problem will not heal by retrying.
+/// queued and retries; a schema problem will not heal by retrying, and neither
+/// will a body naming a tag the space does not have.
 fn source_failure(err: &SourceError) -> Response {
     match err {
         SourceError::Transport(_) | SourceError::TooManyObjects(_) => {
             unavailable("anytype unavailable")
         }
         SourceError::Schema(_) => status(StatusCode::INTERNAL_SERVER_ERROR),
+        SourceError::UnknownOption { .. } => Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from(err.to_string()))
+            .expect("static response"),
     }
 }
 

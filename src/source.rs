@@ -19,6 +19,10 @@ pub enum SourceError {
     /// More objects than `max_objects`.
     #[error("{0}")]
     TooManyObjects(String),
+    /// A write names a tag the space does not have. Tags are made in
+    /// Anytype, not by a calendar client.
+    #[error("the {key} property has no option {name:?}")]
+    UnknownOption { key: String, name: String },
 }
 
 impl SourceError {
@@ -29,6 +33,7 @@ impl SourceError {
             Self::Transport(_) => "anytype unavailable",
             Self::Schema(_) => "exporter misconfigured",
             Self::TooManyObjects(_) => "source too large",
+            Self::UnknownOption { .. } => "unknown option",
         }
     }
 }

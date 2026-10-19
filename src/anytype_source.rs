@@ -356,7 +356,8 @@ impl AnytypeTaskSource {
         };
         let key = self.property_key(selector, "tags").await?;
         let ids =
-            crate::events::option_ids(&self.client, &self.config.space_id, &key, names).await?;
+            crate::events::option_ids(&self.client, &self.config.space_id, &key, names, false)
+                .await?;
         Ok(Some(serde_json::json!({ "key": key, "multi_select": ids })))
     }
 

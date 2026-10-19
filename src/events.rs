@@ -983,11 +983,12 @@ impl AnytypeEvents {
             out.push(serde_json::json!({ "key": "address", "text": location.clone().unwrap_or_default() }));
         }
         if let Some(names) = &patch.reminders {
-            let ids = option_ids(&self.client, &self.space_id, "reminder_lead", names).await?;
+            let ids =
+                option_ids(&self.client, &self.space_id, "reminder_lead", names, true).await?;
             out.push(serde_json::json!({ "key": "reminder_lead", "multi_select": ids }));
         }
         if let Some(tags) = &patch.tags {
-            let ids = option_ids(&self.client, &self.space_id, "tag", tags).await?;
+            let ids = option_ids(&self.client, &self.space_id, "tag", tags, false).await?;
             out.push(serde_json::json!({ "key": "tag", "multi_select": ids }));
         }
         if let Some(rule) = &patch.rrule {
@@ -1231,13 +1232,14 @@ impl EventService {
     }
 }
 
-/// Option ids of the select property `key` for `names`, creating the options
-/// that do not exist yet.
+/// Option ids of the select property `key` for `names`. A name with no option
+/// is created when `create_missing`, otherwise the write is refused.
 pub(crate) async fn option_ids(
     client: &AnytypeClient,
     space_id: &str,
     key: &str,
     names: &[String],
+    create_missing: bool,
 ) -> Result<Vec<String>, SourceError> {
     if names.is_empty() {
         return Ok(Vec::new());
@@ -1266,6 +1268,13 @@ pub(crate) async fn option_ids(
     for name in names {
         match options.iter().find(|t| t.name.trim() == name) {
             Some(option) => ids.push(option.id.clone()),
+            None if !create_missing => {
+                warn!(%name, key, "refusing an unknown select option");
+                return Err(SourceError::UnknownOption {
+                    key: key.to_string(),
+                    name: name.clone(),
+                });
+            }
             None => {
                 info!(%name, key, "creating select option");
                 let option = client

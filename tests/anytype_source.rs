@@ -9,7 +9,8 @@ use anytype::test_util::scripted_http::{
 use anytype_caldav::{
     anytype_source::AnytypeTaskSource,
     config::{AnytypeConfig, PropertiesConfig, PropertySelector},
-    source::{SourceError, TaskSource},
+    source::{SourceError, TaskSource, TaskWriter},
+    writeback::Patch,
 };
 use reqwest::StatusCode;
 
@@ -240,6 +241,50 @@ async fn tag_options_become_category_names() {
 
     assert_eq!(batch.tasks[0].tags, vec!["Финансы", "Семья"]);
     assert!(batch.warnings.is_empty(), "{:?}", batch.warnings);
+}
+
+/// Tags are made in Anytype: a name the space has no option for refuses the
+/// write and creates nothing.
+#[tokio::test]
+async fn an_unknown_tag_refuses_the_write() {
+    const TASK: &str = "bafyreicccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const TAG_PROPERTY: &str = "bafyreidddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let media = || {
+        page(
+            r#"{"object":"tag","id":"t-media","key":"media","name":"Медиа","color":"red"}"#,
+            false,
+            1,
+        )
+    };
+    // Listing properties also loads each select property's options.
+    let fixture = ScriptedHttpFixture::start(vec![
+        page(
+            &format!(
+                r#"{{"object":"property","id":"{TAG_PROPERTY}","key":"tag","name":"Tag","format":"multi_select"}}"#
+            ),
+            false,
+            1,
+        ),
+        media(),
+        media(),
+    ])
+    .await
+    .expect("fixture starts");
+    let properties = PropertiesConfig {
+        tags: Some(PropertySelector::Key("tag".into())),
+        ..properties()
+    };
+    let source = source_with(&fixture, 5000, properties).await;
+    let patch = Patch {
+        tags: Some(vec!["Медиа".into(), "Ð\u{9c}ÐµÐ´Ð¸Ð°".into()]),
+        ..Patch::default()
+    };
+
+    let err = source.update_task(TASK, &patch).await.unwrap_err();
+
+    assert!(matches!(err, SourceError::UnknownOption { .. }), "{err:?}");
+    let requests = fixture.finish().await.expect("fixture finishes");
+    assert!(requests.iter().all(|r| r.method() == "GET"), "{requests:?}");
 }
 
 /// One person, one calendar, however a task addresses them: the membership id
